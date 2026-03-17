@@ -1,19 +1,19 @@
 export const sampleSource = `flowchart LR
-  Brief[Product Brief]
-  Review{Review Ready?}
-  Draft[[Spatial Draft]]
-  API[(API Layer)]
-  Docs([Source Mode])
-  Ship((Ship))
+  Brief[产品说明]
+  Review{评审完成?}
+  Draft[[空间草稿]]
+  API[(接口层)]
+  Docs([源码模式])
+  Ship((发布))
 
-  subgraph Team_Editor["Editor Workspace"]
-    Canvas[Canvas Mode]
-    Source[Source Mode]
+  subgraph Team_Editor["编辑器工作区"]
+    Canvas[画布模式]
+    Source[源码模式]
   end
 
   Brief --> Review
-  Review -->|yes| Draft
-  Review -.->|needs edits| Brief
+  Review -->|通过| Draft
+  Review -.->|需修改| Brief
   Draft --> Canvas
   Draft --> Source
   Canvas --> API
