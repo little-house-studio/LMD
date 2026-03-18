@@ -1757,6 +1757,50 @@ export default function App() {
   const showInspector = mode === 'canvas' ? inspectorOpen : true;
   const workspaceClassName = `workspace workspace--${mode}${showSidebar ? ' workspace--sidebar-open' : ''}${showInspector ? ' workspace--inspector-open' : ''}`;
 
+  // External Control API - allows external AI agents to control the editor
+  useEffect(() => {
+    const api = {
+      setSource: (code: string) => {
+        setSourceDraft(code);
+      },
+      getSource: () => sourceDraft,
+      render: async () => {
+        // trigger re-render by updating source draft
+        setSourceDraft((s) => s);
+      },
+      getSvg: () => svg || null,
+    };
+
+    // Expose as global
+    (window as unknown as Record<string, unknown>).MermaidEditor = api;
+
+    // postMessage interface
+    const handleMessage = (event: MessageEvent) => {
+      if (!event.data || event.data.type !== 'mermaid-editor') return;
+      const { action, payload } = event.data;
+      let responsePayload: unknown = null;
+      if (action === 'setSource' && typeof payload === 'string') {
+        api.setSource(payload);
+      } else if (action === 'getSource') {
+        responsePayload = api.getSource();
+      } else if (action === 'render') {
+        void api.render();
+      } else if (action === 'getSvg') {
+        responsePayload = api.getSvg();
+      }
+      event.source?.postMessage(
+        { type: 'mermaid-editor-response', action, payload: responsePayload },
+        { targetOrigin: event.origin }
+      );
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => {
+      window.removeEventListener('message', handleMessage);
+      delete (window as unknown as Record<string, unknown>).MermaidEditor;
+    };
+  }, [sourceDraft, svg, setSourceDraft]);
+
   return (
     <div className="app-shell">
       <header className="workbench-bar">
