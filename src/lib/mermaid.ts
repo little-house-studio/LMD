@@ -68,9 +68,20 @@ function sanitizeId(input: string) {
     .replace(/^_+|_+$/g, '') || `node_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function guessSize(label: string) {
-  const width = Math.max(140, Math.min(220, 80 + label.length * 7));
-  const height = label.length > 24 ? 72 : 58;
+export function measureNodeContentSize(content: string) {
+  const lines = content.split(/\r?\n/);
+  const unitsPerLine = lines.map((line) =>
+    Array.from(line).reduce((total, char) => total + (char.charCodeAt(0) > 255 ? 1.8 : 1), 0),
+  );
+  const maxUnits = Math.max(6, ...unitsPerLine);
+  const width = Math.max(132, Math.min(320, 52 + maxUnits * 9));
+  const wrapCapacity = Math.max(8, Math.floor((width - 40) / 9));
+  const wrappedLineCount = Math.max(
+    1,
+    unitsPerLine.reduce((total, units) => total + Math.max(1, Math.ceil(units / wrapCapacity)), 0),
+  );
+  const height = Math.max(58, Math.min(240, 26 + wrappedLineCount * 24));
+
   return { width, height };
 }
 
@@ -325,7 +336,7 @@ export function parseMermaidDocument(
       return existing;
     }
 
-    const size = guessSize(inferred.label);
+    const size = measureNodeContentSize(inferred.label);
     const stored = layout.nodes[inferred.id];
     const nextNode: GraphNode = {
       id: inferred.id,

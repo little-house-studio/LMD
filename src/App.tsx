@@ -15,15 +15,14 @@ import type {
 } from 'react';
 import {
   createDefaultLayout,
+  measureNodeContentSize,
   parseMermaidDocument,
   serializeMermaidDocument,
   syncDocument,
-  toSidecar,
 } from './lib/mermaid';
 import { sampleSource } from './lib/sample';
 import { storageKeys } from './lib/storage';
 import type {
-  Direction,
   EditorMode,
   GraphDocument,
   GraphEdge,
@@ -36,14 +35,8 @@ import type {
   ViewportState,
 } from './lib/types';
 
-type NoticeTone = 'info' | 'warn' | 'error';
-type LeftPanel = 'files' | 'graph' | 'comments';
+type LeftPanel = 'files' | 'graph';
 type WorkspaceTabId = 'diagram' | 'release-notes' | 'sdk';
-
-interface NoticeState {
-  tone: NoticeTone;
-  message: string;
-}
 
 interface Point {
   x: number;
@@ -87,10 +80,52 @@ interface SubgraphFrame {
   collapsed: boolean;
 }
 
+interface GraphTreeItem {
+  id: string;
+  depth: number;
+  kind: 'subgraph' | 'node';
+  label: string;
+  meta: string;
+}
+
+const PINCH_RESPONSE = 1.3;
+const WHEEL_PINCH_DIVISOR = 360;
+
+interface ExplorerItem {
+  id: string;
+  label: string;
+  meta: string;
+  depth: number;
+  kind: 'project' | 'folder' | 'file';
+  path: string;
+  tabId?: WorkspaceTabId;
+  mode?: EditorMode;
+}
+
+interface LocalProjectWritable {
+  write(data: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+interface LocalProjectFileHandle {
+  kind: 'file';
+  name: string;
+  getFile(): Promise<File>;
+  createWritable?(): Promise<LocalProjectWritable>;
+}
+
+interface LocalProjectDirectoryHandle {
+  kind: 'directory';
+  name: string;
+  entries(): AsyncIterableIterator<[string, LocalProjectHandle]>;
+}
+
+type LocalProjectHandle = LocalProjectFileHandle | LocalProjectDirectoryHandle;
+
 type IconName =
+  | 'menu'
   | 'files'
   | 'graph'
-  | 'comments'
   | 'inspect'
   | 'canvas'
   | 'source'
@@ -103,6 +138,7 @@ type IconName =
   | 'reset'
   | 'minus'
   | 'plus'
+  | 'preview'
   | 'chevron-left'
   | 'chevron-right';
 
@@ -128,10 +164,48 @@ const workspaceTabs: Array<{ id: WorkspaceTabId; label: string; detail: string }
   { id: 'sdk', label: 'sdk-v0.1.md', detail: '平台规范' },
 ];
 
+const defaultLocalProjectItems: ExplorerItem[] = [
+  {
+    id: 'local-project',
+    label: 'roadmap-studio',
+    meta: '本地 Git 工程',
+    depth: 0,
+    kind: 'project',
+    path: '/Users/mac/Documents/projects/roadmap-studio',
+  },
+  {
+    id: 'local-docs',
+    label: 'docs',
+    meta: '本地项目目录',
+    depth: 1,
+    kind: 'folder',
+    path: '/Users/mac/Documents/projects/roadmap-studio/docs',
+  },
+  {
+    id: 'local-diagram',
+    label: 'diagram.md',
+    meta: '本地文件 / 可直接编辑',
+    depth: 2,
+    kind: 'file',
+    path: '/Users/mac/Documents/projects/roadmap-studio/docs/diagram.md',
+    tabId: 'diagram',
+    mode: 'canvas',
+  },
+  {
+    id: 'local-release-notes',
+    label: 'release-notes.md',
+    meta: '本地文件 / 文档草稿',
+    depth: 2,
+    kind: 'file',
+    path: '/Users/mac/Documents/projects/roadmap-studio/docs/release-notes.md',
+    tabId: 'release-notes',
+    mode: 'source',
+  },
+];
+
 const leftPanelMeta: Array<{ id: LeftPanel; label: string; icon: IconName }> = [
   { id: 'files', label: '文件', icon: 'files' },
   { id: 'graph', label: '图谱', icon: 'graph' },
-  { id: 'comments', label: '协作', icon: 'comments' },
 ];
 
 const modeMeta: Array<{ id: EditorMode; label: string; icon: IconName }> = [
@@ -139,6 +213,12 @@ const modeMeta: Array<{ id: EditorMode; label: string; icon: IconName }> = [
   { id: 'source', label: '源码', icon: 'source' },
   { id: 'history', label: '历史', icon: 'history' },
 ];
+
+const desktopCommandGroups = [
+  { id: 'resource', label: '资源' },
+  { id: 'edit', label: '编辑' },
+  { id: 'view', label: '视图' },
+] as const;
 
 function WorkbenchIcon({ name, className }: { name: IconName; className?: string }) {
   const props = {
@@ -153,6 +233,12 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
   };
 
   switch (name) {
+    case 'menu':
+      return (
+        <svg {...props}>
+          <path d="M5 7h14M5 12h14M5 17h14" />
+        </svg>
+      );
     case 'files':
       return (
         <svg {...props}>
@@ -167,12 +253,6 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
           <circle cx="18" cy="6" r="2.2" />
           <circle cx="12" cy="17" r="2.2" />
           <path d="M8 8.2l2.5 6M16 7.8l-2.6 6M8.2 7.1h7.6" />
-        </svg>
-      );
-    case 'comments':
-      return (
-        <svg {...props}>
-          <path d="M5 6h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H11l-4 3v-3H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z" />
         </svg>
       );
     case 'inspect':
@@ -256,6 +336,13 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
       return (
         <svg {...props}>
           <path d="M12 6v12M6 12h12" />
+        </svg>
+      );
+    case 'preview':
+      return (
+        <svg {...props}>
+          <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" />
+          <circle cx="12" cy="12" r="2.8" />
         </svg>
       );
     case 'chevron-left':
@@ -450,19 +537,125 @@ function buildNode(
   position: Point,
   subgraphId: string | null,
 ): GraphNode {
+  const size = measureNodeContentSize(label);
   return {
     id,
     label,
     shape: 'rect',
     x: position.x,
     y: position.y,
-    width: Math.max(140, Math.min(220, 84 + label.length * 6)),
-    height: 58,
+    width: size.width,
+    height: size.height,
     fill: '#fff8ef',
     stroke: '#24404f',
     textColor: '#12212c',
     subgraphId,
   };
+}
+
+function resizeNodeToContent(node: GraphNode, content: string) {
+  const size = measureNodeContentSize(content);
+
+  return {
+    ...node,
+    label: content,
+    width: size.width,
+    height: size.height,
+  };
+}
+
+function getNodeCenter(node: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>) {
+  return {
+    x: node.x + node.width / 2,
+    y: node.y + node.height / 2,
+  };
+}
+
+function getNodeAnchor(
+  node: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
+  target: Point,
+) {
+  const center = getNodeCenter(node);
+  const dx = target.x - center.x;
+  const dy = target.y - center.y;
+
+  if (Math.abs(dx) > Math.abs(dy) * 1.15) {
+    if (dx >= 0) {
+      return { x: node.x + node.width, y: center.y, dirX: 1, dirY: 0 };
+    }
+
+    return { x: node.x, y: center.y, dirX: -1, dirY: 0 };
+  }
+
+  if (dy >= 0) {
+    return { x: center.x, y: node.y + node.height, dirX: 0, dirY: 1 };
+  }
+
+  return { x: center.x, y: node.y, dirX: 0, dirY: -1 };
+}
+
+function buildEdgeGeometry(
+  fromNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
+  toNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
+) {
+  const stubLength = 26;
+  const endInset = 10;
+  const fromAnchor = getNodeAnchor(fromNode, getNodeCenter(toNode));
+  const toAnchor = getNodeAnchor(toNode, getNodeCenter(fromNode));
+  const start = {
+    x: fromAnchor.x + fromAnchor.dirX * endInset,
+    y: fromAnchor.y + fromAnchor.dirY * endInset,
+  };
+  const end = {
+    x: toAnchor.x + toAnchor.dirX * endInset,
+    y: toAnchor.y + toAnchor.dirY * endInset,
+  };
+  const startOuter = {
+    x: fromAnchor.x + fromAnchor.dirX * stubLength,
+    y: fromAnchor.y + fromAnchor.dirY * stubLength,
+  };
+  const endOuter = {
+    x: toAnchor.x + toAnchor.dirX * stubLength,
+    y: toAnchor.y + toAnchor.dirY * stubLength,
+  };
+  const controlA =
+    fromAnchor.dirX !== 0
+      ? { x: (startOuter.x + endOuter.x) / 2, y: startOuter.y }
+      : { x: startOuter.x, y: (startOuter.y + endOuter.y) / 2 };
+  const controlB =
+    toAnchor.dirX !== 0
+      ? { x: (startOuter.x + endOuter.x) / 2, y: endOuter.y }
+      : { x: endOuter.x, y: (startOuter.y + endOuter.y) / 2 };
+  const mid = {
+    x: (startOuter.x + endOuter.x) / 2,
+    y: (startOuter.y + endOuter.y) / 2,
+  };
+
+  return {
+    path: `M ${start.x} ${start.y} L ${startOuter.x} ${startOuter.y} C ${controlA.x} ${controlA.y}, ${controlB.x} ${controlB.y}, ${endOuter.x} ${endOuter.y} L ${end.x} ${end.y}`,
+    mid,
+  };
+}
+
+function buildPreviewEdgePath(
+  fromNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
+  currentPoint: Point,
+) {
+  const startAnchor = getNodeAnchor(fromNode, currentPoint);
+  const start = {
+    x: startAnchor.x + startAnchor.dirX * 10,
+    y: startAnchor.y + startAnchor.dirY * 10,
+  };
+  const startOuter = {
+    x: startAnchor.x + startAnchor.dirX * 26,
+    y: startAnchor.y + startAnchor.dirY * 26,
+  };
+  const control =
+    startAnchor.dirX !== 0
+      ? { x: (startOuter.x + currentPoint.x) / 2, y: startOuter.y }
+      : { x: startOuter.x, y: (startOuter.y + currentPoint.y) / 2 };
+
+  return `M ${start.x} ${start.y} L ${startOuter.x} ${startOuter.y} Q ${control.x} ${control.y}, ${currentPoint.x} ${currentPoint.y}`;
 }
 
 function selectionContains(selection: SelectionState, id: string) {
@@ -572,6 +765,15 @@ function toMarkdownDocument(source: string) {
   return `\`\`\`mermaid\n${source}\n\`\`\`\n`;
 }
 
+function extractEditableSource(raw: string) {
+  const fencedMatch = raw.match(/```mermaid\s*([\s\S]*?)```/i);
+  if (fencedMatch?.[1]) {
+    return fencedMatch[1].trim();
+  }
+
+  return raw.trim();
+}
+
 function isInsideCollapsedSubgraph(
   node: GraphNode,
   lookup: Map<string, GraphSubgraph>,
@@ -631,6 +833,102 @@ function buildSubgraphFrames(document: GraphDocument, visibleNodes: GraphNode[])
   }
 
   return frames;
+}
+
+function buildGraphTreeItems(
+  subgraphs: GraphSubgraph[],
+  nodes: GraphNode[],
+  lookup: Map<string, GraphSubgraph>,
+  frameMap: Map<string, SubgraphFrame>,
+  searchQuery: string,
+  parentId: string | null = null,
+  depth = 0,
+): GraphTreeItem[] {
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+  const candidates = [
+    ...subgraphs
+      .filter((subgraph) => subgraph.parentId === parentId)
+      .map((subgraph) => ({
+        id: subgraph.id,
+        type: 'subgraph' as const,
+        order:
+          frameMap.get(subgraph.id)?.y ??
+          nodes
+            .filter((node) => belongsToSubgraph(node, subgraph.id, lookup))
+            .reduce((min, node) => Math.min(min, node.y), Number.MAX_SAFE_INTEGER),
+        subgraph,
+      })),
+    ...nodes
+      .filter((node) => node.subgraphId === parentId)
+      .map((node) => ({
+        id: node.id,
+        type: 'node' as const,
+        order: node.y,
+        node,
+      })),
+  ].sort((left, right) => {
+    if (left.order !== right.order) {
+      return left.order - right.order;
+    }
+
+    const leftLabel = left.type === 'subgraph' ? left.subgraph.title : left.node.label;
+    const rightLabel = right.type === 'subgraph' ? right.subgraph.title : right.node.label;
+    return leftLabel.localeCompare(rightLabel);
+  });
+
+  return candidates.flatMap((candidate) => {
+    if (candidate.type === 'subgraph') {
+      const descendants = buildGraphTreeItems(
+        subgraphs,
+        nodes,
+        lookup,
+        frameMap,
+        searchQuery,
+        candidate.subgraph.id,
+        depth + 1,
+      );
+      const count = countNodesInSubgraph(nodes, candidate.subgraph.id, lookup);
+      const meta = candidate.subgraph.collapsed ? `已折叠 · ${count} 项` : `${count} 项`;
+      const matches =
+        normalizedQuery.length === 0 ||
+        candidate.subgraph.id.toLowerCase().includes(normalizedQuery) ||
+        candidate.subgraph.title.toLowerCase().includes(normalizedQuery);
+
+      if (!matches && descendants.length === 0) {
+        return [];
+      }
+
+      return [
+        {
+          id: candidate.subgraph.id,
+          depth,
+          kind: 'subgraph' as const,
+          label: candidate.subgraph.title,
+          meta,
+        },
+        ...descendants,
+      ];
+    }
+
+    const matches =
+      normalizedQuery.length === 0 ||
+      candidate.node.id.toLowerCase().includes(normalizedQuery) ||
+      candidate.node.label.toLowerCase().includes(normalizedQuery);
+
+    if (!matches) {
+      return [];
+    }
+
+    return [
+      {
+        id: candidate.node.id,
+        depth,
+        kind: 'node' as const,
+        label: candidate.node.label,
+        meta: candidate.node.id,
+      },
+    ];
+  });
 }
 
 function MermaidPreview({ source }: { source: string }) {
@@ -708,19 +1006,21 @@ function MermaidPreview({ source }: { source: string }) {
 export default function App() {
   const [initialWorkspace] = useState(() => loadWorkspace());
   const [documentState, setDocumentState] = useState<GraphDocument>(initialWorkspace.document);
+  const [isMobileViewport, setIsMobileViewport] = useState(() => window.innerWidth <= 820);
+  const [isConstrainedDevice, setIsConstrainedDevice] = useState(false);
   const [mode, setMode] = useState<EditorMode>('canvas');
   const [leftPanel, setLeftPanel] = useState<LeftPanel>('files');
   const [activeFileTab, setActiveFileTab] = useState<WorkspaceTabId>('diagram');
+  const [activeWorkspaceSource, setActiveWorkspaceSource] = useState<'cloud' | 'local'>('cloud');
+  const [localExplorerItems, setLocalExplorerItems] = useState<ExplorerItem[]>(defaultLocalProjectItems);
+  const [activeLocalFileId, setActiveLocalFileId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [mobileSourcePreviewOpen, setMobileSourcePreviewOpen] = useState(false);
   const [canvasHovered, setCanvasHovered] = useState(false);
   const [selection, setSelection] = useState<SelectionState>({ kind: 'none', ids: [] });
   const [history, setHistory] = useState<HistoryEntry[]>(initialWorkspace.history);
   const [sourceDraft, setSourceDraft] = useState(initialWorkspace.document.source);
-  const [notice, setNotice] = useState<NoticeState | null>({
-    tone: 'info',
-    message: '画布模式和源码模式已经同时打通，所有变更都会通过同一份图模型保持同步。',
-  });
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved');
   const [searchQuery, setSearchQuery] = useState('');
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
@@ -732,7 +1032,14 @@ export default function App() {
   const [connectingState, setConnectingState] = useState<ConnectingState | null>(null);
   const [spacePressed, setSpacePressed] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const localFileHandlesRef = useRef<Record<string, LocalProjectFileHandle>>({});
   const gestureStateRef = useRef<GestureState | null>(null);
+  const backgroundHoldRef = useRef<number | null>(null);
+  const pendingBackgroundRef = useRef<{
+    clientX: number;
+    clientY: number;
+    point: Point;
+  } | null>(null);
   const deferredSource = useDeferredValue(sourceDraft);
   const sourceParseError = useMemo(() => {
     try {
@@ -744,6 +1051,7 @@ export default function App() {
   }, [deferredSource, documentState.layout]);
 
   const subgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
+  const fullSubgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
   const visibleNodes = documentState.nodes.filter(
     (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
   );
@@ -752,80 +1060,91 @@ export default function App() {
     (edge) => visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to),
   );
   const subgraphFrames = buildSubgraphFrames(documentState, visibleNodes);
-  const filteredNodes = documentState.nodes.filter((node) => {
-    if (!searchQuery.trim()) {
-      return true;
-    }
-
-    const query = searchQuery.toLowerCase();
-    return (
-      node.id.toLowerCase().includes(query) ||
-      node.label.toLowerCase().includes(query)
-    );
-  });
-  const filteredSubgraphs = documentState.subgraphs.filter((subgraph) => {
-    if (!searchQuery.trim()) {
-      return true;
-    }
-
-    return subgraph.title.toLowerCase().includes(searchQuery.toLowerCase());
-  });
+  const allSubgraphFrames = buildSubgraphFrames(documentState, documentState.nodes);
+  const allSubgraphFrameMap = useMemo(
+    () => new Map(allSubgraphFrames.map((frame) => [frame.id, frame])),
+    [allSubgraphFrames],
+  );
+  const graphTreeItems = useMemo(
+    () =>
+      buildGraphTreeItems(
+        documentState.subgraphs,
+        documentState.nodes,
+        fullSubgraphLookup,
+        allSubgraphFrameMap,
+        searchQuery,
+      ),
+    [allSubgraphFrameMap, documentState.nodes, documentState.subgraphs, fullSubgraphLookup, searchQuery],
+  );
   const activeTab = workspaceTabs.find((tab) => tab.id === activeFileTab) ?? workspaceTabs[0];
-  const activityFeed = history.slice(0, 6);
-  const explorerItems = useMemo(
+  const cloudExplorerItems = useMemo<ExplorerItem[]>(
     () => [
       {
-        id: 'project',
-        label: '产品图谱平台',
-        meta: '云端工作区',
+        id: 'cloud-project',
+        label: 'product-graph-platform',
+        meta: '云端 Git 工程',
         depth: 0,
-        kind: 'project' as const,
+        kind: 'project',
+        path: 'cloud://projects/product-graph-platform',
       },
       {
-        id: 'folder-planning',
-        label: '规划',
-        meta: `${documentState.subgraphs.length} 个分组`,
+        id: 'cloud-docs',
+        label: 'docs',
+        meta: '云端路径 / 已跟踪',
         depth: 1,
-        kind: 'folder' as const,
+        kind: 'folder',
+        path: 'cloud://projects/product-graph-platform/docs',
       },
       {
-        id: 'file-diagram',
+        id: 'cloud-diagram',
         label: 'diagram.md',
-        meta: '共享实时文件',
+        meta: `${documentState.nodes.length} 节点 / ${documentState.edges.length} 连线`,
         depth: 2,
-        kind: 'file' as const,
+        kind: 'file',
+        path: 'cloud://projects/product-graph-platform/docs/diagram.md',
+        tabId: 'diagram',
+        mode: 'canvas',
       },
       {
-        id: 'block-main',
-        label: '主 Mermaid 区块',
-        meta: `${documentState.nodes.length} 个节点 / ${documentState.edges.length} 条连线`,
-        depth: 3,
-        kind: 'block' as const,
+        id: 'cloud-release-notes',
+        label: 'release-notes.md',
+        meta: '云端文档 / 评审说明',
+        depth: 2,
+        kind: 'file',
+        path: 'cloud://projects/product-graph-platform/docs/release-notes.md',
+        tabId: 'release-notes',
+        mode: 'source',
       },
       {
-        id: 'sidecar-layout',
-        label: 'diagram.layout.json',
-        meta: '工作区布局 sidecar',
-        depth: 3,
-        kind: 'sidecar' as const,
-      },
-      {
-        id: 'folder-ai',
-        label: '自动化',
-        meta: 'SDK 与提示词',
+        id: 'cloud-sdk-folder',
+        label: 'sdk',
+        meta: '扩展接口目录',
         depth: 1,
-        kind: 'folder' as const,
+        kind: 'folder',
+        path: 'cloud://projects/product-graph-platform/sdk',
       },
       {
-        id: 'file-sdk',
+        id: 'cloud-sdk',
         label: 'sdk-v0.1.md',
-        meta: '扩展接口约定',
+        meta: '云端文档 / SDK 规范',
         depth: 2,
-        kind: 'file' as const,
+        kind: 'file',
+        path: 'cloud://projects/product-graph-platform/sdk/sdk-v0.1.md',
+        tabId: 'sdk',
+        mode: 'source',
       },
     ],
-    [documentState.edges.length, documentState.nodes.length, documentState.subgraphs.length],
+    [documentState.edges.length, documentState.nodes.length],
   );
+  const activeCloudPath = useMemo(() => {
+    const activeItem = cloudExplorerItems.find((item) => item.tabId === activeFileTab);
+    return activeItem?.path ?? 'cloud://projects/product-graph-platform/docs/diagram.md';
+  }, [activeFileTab, cloudExplorerItems]);
+  const activeLocalPath = useMemo(() => {
+    const activeItem = localExplorerItems.find((item) => item.tabId === activeFileTab);
+    return activeItem?.path ?? '/Users/mac/Documents/projects/roadmap-studio/docs/diagram.md';
+  }, [activeFileTab, localExplorerItems]);
+  const activeProjectPath = activeWorkspaceSource === 'cloud' ? activeCloudPath : activeLocalPath;
 
   const commitDocument = useCallback((
     updater: (current: GraphDocument) => GraphDocument,
@@ -837,7 +1156,6 @@ export default function App() {
     setDocumentState(nextDocument);
     setSourceDraft(nextDocument.source);
     setHistory((current) => [createHistoryEntry(title, detail), ...current].slice(0, 40));
-    setNotice({ tone: 'info', message: detail });
   }, [documentState]);
 
   const selectSingle = useCallback((kind: SelectionState['kind'], id: string) => {
@@ -848,12 +1166,28 @@ export default function App() {
     setSelection({ kind: 'none', ids: [] });
   }, []);
 
+  const clearPendingBackgroundInteraction = useCallback(() => {
+    if (backgroundHoldRef.current !== null) {
+      window.clearTimeout(backgroundHoldRef.current);
+      backgroundHoldRef.current = null;
+    }
+    pendingBackgroundRef.current = null;
+  }, []);
+
   const toggleLeftPanel = useCallback((nextPanel: LeftPanel) => {
+    setInspectorOpen(false);
+    setMobileSourcePreviewOpen(false);
     setLeftPanel((current) => {
       const samePanel = current === nextPanel;
       setSidebarOpen((isOpen) => (samePanel ? !isOpen : true));
       return samePanel ? current : nextPanel;
     });
+  }, []);
+
+  const toggleInspector = useCallback(() => {
+    setSidebarOpen(false);
+    setMobileSourcePreviewOpen(false);
+    setInspectorOpen((current) => !current);
   }, []);
 
   const updateViewport = useCallback(
@@ -912,6 +1246,110 @@ export default function App() {
     [updateViewport],
   );
 
+  const focusViewportOnRect = useCallback(
+    (
+      rect: { x: number; y: number; width: number; height: number } | null,
+      anchorY = 0.5,
+    ) => {
+      if (!rect) {
+        return;
+      }
+
+      const bounds = canvasRef.current?.getBoundingClientRect();
+      if (!bounds) {
+        return;
+      }
+
+      updateViewport((viewport) => {
+        const centerX = rect.x + rect.width / 2;
+        const centerY = rect.y + rect.height / 2;
+        const targetX = bounds.width / 2;
+        const targetY = bounds.height * anchorY;
+
+        return {
+          ...viewport,
+          x: targetX - centerX * viewport.zoom,
+          y: targetY - centerY * viewport.zoom,
+        };
+      });
+    },
+    [updateViewport],
+  );
+
+  const focusSelectionInViewport = useCallback(() => {
+    if (mode !== 'canvas') {
+      return;
+    }
+
+    const anchorY = isMobileViewport ? 0.28 : 0.5;
+
+    if (selection.kind === 'node' && selection.ids.length === 1) {
+      const node = documentState.nodes.find((entry) => entry.id === selection.ids[0]) ?? null;
+      if (node) {
+        focusViewportOnRect(node, anchorY);
+      }
+      return;
+    }
+
+    if (selection.kind === 'subgraph' && selection.ids.length === 1) {
+      focusViewportOnRect(allSubgraphFrameMap.get(selection.ids[0]) ?? null, anchorY);
+      return;
+    }
+
+    if (selection.kind === 'edge' && selection.ids.length === 1) {
+      const edge = documentState.edges.find((entry) => entry.id === selection.ids[0]) ?? null;
+      if (!edge) {
+        return;
+      }
+
+      const fromNode = documentState.nodes.find((entry) => entry.id === edge.from) ?? null;
+      const toNode = documentState.nodes.find((entry) => entry.id === edge.to) ?? null;
+      if (!fromNode || !toNode) {
+        return;
+      }
+
+      const fromCenter = {
+        x: fromNode.x + fromNode.width / 2,
+        y: fromNode.y + fromNode.height / 2,
+      };
+      const toCenter = {
+        x: toNode.x + toNode.width / 2,
+        y: toNode.y + toNode.height / 2,
+      };
+
+      focusViewportOnRect(
+        {
+          x: Math.min(fromCenter.x, toCenter.x) - 56,
+          y: Math.min(fromCenter.y, toCenter.y) - 44,
+          width: Math.max(120, Math.abs(fromCenter.x - toCenter.x) + 112),
+          height: Math.max(80, Math.abs(fromCenter.y - toCenter.y) + 88),
+        },
+        anchorY,
+      );
+    }
+  }, [
+    allSubgraphFrameMap,
+    documentState.edges,
+    documentState.nodes,
+    focusViewportOnRect,
+    isMobileViewport,
+    mode,
+    selection,
+  ]);
+
+  const handleMobileInspectorToggle = useCallback(() => {
+    if (mode === 'source') {
+      setMobileSourcePreviewOpen((current) => !current);
+      return;
+    }
+
+    if (!inspectorOpen) {
+      focusSelectionInViewport();
+    }
+
+    toggleInspector();
+  }, [focusSelectionInViewport, inspectorOpen, mode, toggleInspector]);
+
   function updateSelectedNode<K extends keyof GraphNode>(key: K, value: GraphNode[K]) {
     if (selection.kind !== 'node' || selection.ids.length === 0) {
       return;
@@ -923,10 +1361,12 @@ export default function App() {
         ...current,
         nodes: current.nodes.map((node) =>
           ids.has(node.id)
-            ? {
-                ...node,
-                [key]: value,
-              }
+            ? key === 'label'
+              ? resizeNodeToContent(node, String(value))
+              : {
+                  ...node,
+                  [key]: value,
+                }
             : node,
         ),
       }),
@@ -988,7 +1428,7 @@ export default function App() {
     const id = nextNodeId(documentState.nodes);
     const selectionSubgraph =
       selection.kind === 'subgraph' && selection.ids.length === 1 ? selection.ids[0] : null;
-    const newNode = buildNode(id, `新建 ${id}`, point, selectionSubgraph);
+    const newNode = buildNode(id, '新建内容', point, selectionSubgraph);
 
     commitDocument(
       (current) => ({
@@ -1078,9 +1518,8 @@ export default function App() {
         ]);
         nodeIdMap.set(node.id, nextId);
         return {
-          ...node,
+          ...resizeNodeToContent(node, `${node.label} 副本`),
           id: nextId,
-          label: `${node.label} 副本`,
           x: node.x + 40,
           y: node.y + 40,
         };
@@ -1113,10 +1552,6 @@ export default function App() {
 
   const wrapSelectionInSubgraph = useCallback(() => {
     if (selection.kind !== 'node' || selection.ids.length < 2) {
-      setNotice({
-        tone: 'warn',
-        message: '请至少选中两个节点后再创建分组。',
-      });
       return;
     }
 
@@ -1162,40 +1597,200 @@ export default function App() {
       toMarkdownDocument(documentState.source),
       'text/markdown;charset=utf-8',
     );
-    setNotice({ tone: 'info', message: '已导出标准 Markdown 与 Mermaid 源码。' });
   }, [documentState.source]);
-
-  const exportSidecar = useCallback(() => {
-    downloadFile(
-      'diagram.layout.json',
-      JSON.stringify(toSidecar(documentState), null, 2),
-      'application/json;charset=utf-8',
-    );
-    setNotice({ tone: 'info', message: '已导出布局 sidecar。' });
-  }, [documentState]);
 
   const copySource = useCallback(() => {
     navigator.clipboard
       .writeText(documentState.source)
-      .then(() => {
-        setNotice({ tone: 'info', message: '已将 Mermaid 源码复制到剪贴板。' });
-      })
-      .catch(() => {
-        setNotice({ tone: 'error', message: '当前设备无法复制源码。' });
-      });
+      .catch(() => {});
   }, [documentState.source]);
 
   const goToMode = useCallback((nextMode: EditorMode) => {
     if (mode === 'source' && nextMode !== 'source' && sourceParseError) {
-      setNotice({
-        tone: 'error',
-        message: '源码模式里还有未解决的问题，请先修复或回退草稿，再返回画布。',
-      });
       return;
     }
 
     setMode(nextMode);
   }, [mode, sourceParseError]);
+
+  const openLocalProjectFile = useCallback(async (item: ExplorerItem) => {
+    const handle = localFileHandlesRef.current[item.id];
+    if (!handle) {
+      return;
+    }
+
+    try {
+      const file = await handle.getFile();
+      const content = await file.text();
+      const source = extractEditableSource(content);
+      setActiveWorkspaceSource('local');
+      setActiveLocalFileId(item.id);
+      setActiveFileTab(item.tabId ?? 'diagram');
+      if (item.mode) {
+        goToMode(item.mode);
+      }
+      setSourceDraft(source);
+      if (isMobileViewport) {
+        setSidebarOpen(false);
+      }
+    } catch {
+      setSaveStatus('error');
+    }
+  }, [goToMode, isMobileViewport]);
+
+  const openLocalProjectDirectory = useCallback(async () => {
+    const pickerWindow = window as Window & {
+      showDirectoryPicker?: () => Promise<LocalProjectDirectoryHandle>;
+    };
+
+    if (!pickerWindow.showDirectoryPicker) {
+      return;
+    }
+
+    try {
+      const root = await pickerWindow.showDirectoryPicker();
+      const nextItems: ExplorerItem[] = [
+        {
+          id: 'local-project',
+          label: root.name,
+          meta: '本地 Git 工程',
+          depth: 0,
+          kind: 'project',
+          path: `local://${root.name}`,
+        },
+      ];
+      const nextHandles: Record<string, LocalProjectFileHandle> = {};
+      let fileIndex = 0;
+
+      const walk = async (directory: LocalProjectDirectoryHandle, depth: number, basePath: string) => {
+        const entries: Array<[string, LocalProjectHandle]> = [];
+        for await (const entry of directory.entries()) {
+          entries.push(entry);
+        }
+
+        entries.sort((left, right) => {
+          if (left[1].kind !== right[1].kind) {
+            return left[1].kind === 'directory' ? -1 : 1;
+          }
+          return left[0].localeCompare(right[0]);
+        });
+
+        for (const [name, handle] of entries) {
+          const nextPath = `${basePath}/${name}`;
+          if (handle.kind === 'directory') {
+            nextItems.push({
+              id: `local-folder-${nextItems.length}`,
+              label: name,
+              meta: '本地目录',
+              depth,
+              kind: 'folder',
+              path: nextPath,
+            });
+            await walk(handle, depth + 1, nextPath);
+            continue;
+          }
+
+          if (!/\.(md|mmd)$/i.test(name)) {
+            continue;
+          }
+
+          const id = `local-file-${fileIndex++}`;
+          nextHandles[id] = handle;
+          nextItems.push({
+            id,
+            label: name,
+            meta: '本地文件 / 直接编辑',
+            depth,
+            kind: 'file',
+            path: nextPath,
+            tabId: 'diagram',
+            mode: 'canvas',
+          });
+        }
+      };
+
+      await walk(root, 1, `local://${root.name}`);
+      setLocalExplorerItems(nextItems);
+      localFileHandlesRef.current = nextHandles;
+      setActiveWorkspaceSource('local');
+      setLeftPanel('files');
+      setSidebarOpen(true);
+
+      const firstFile = nextItems.find((item) => item.kind === 'file');
+      if (firstFile) {
+        await openLocalProjectFile(firstFile);
+      }
+    } catch {
+      setSaveStatus('error');
+    }
+  }, [openLocalProjectFile]);
+
+  const openExplorerItem = useCallback((item: ExplorerItem) => {
+    if (item.id.startsWith('local-file-') && localFileHandlesRef.current[item.id]) {
+      void openLocalProjectFile(item);
+      return;
+    }
+
+    setActiveWorkspaceSource(item.id.startsWith('local') ? 'local' : 'cloud');
+    setActiveLocalFileId(item.id.startsWith('local') && item.kind === 'file' ? item.id : null);
+
+    if (item.tabId) {
+      setActiveFileTab(item.tabId);
+    }
+
+    if (item.mode) {
+      goToMode(item.mode);
+    }
+
+    if (isMobileViewport && item.kind === 'file') {
+      setSidebarOpen(false);
+    }
+  }, [goToMode, isMobileViewport, openLocalProjectFile]);
+
+  const createNodeInViewportCenter = useCallback(() => {
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    const viewport = documentState.layout.viewport;
+    const point = bounds
+      ? {
+          x: (bounds.width / 2 - viewport.x) / viewport.zoom - 72,
+          y: (bounds.height / 2 - viewport.y) / viewport.zoom - 30,
+        }
+      : { x: 220, y: 160 };
+
+    goToMode('canvas');
+    createNodeAt(point);
+  }, [createNodeAt, documentState.layout.viewport, goToMode]);
+
+  useEffect(() => {
+    function syncViewportMode() {
+      setIsMobileViewport(window.innerWidth <= 820);
+    }
+
+    syncViewportMode();
+    window.addEventListener('resize', syncViewportMode);
+    return () => {
+      window.removeEventListener('resize', syncViewportMode);
+    };
+  }, []);
+
+  useEffect(() => {
+    const navigatorWithMemory = navigator as Navigator & { deviceMemory?: number };
+    const hardwareConcurrency = navigator.hardwareConcurrency ?? 8;
+    const deviceMemory = navigatorWithMemory.deviceMemory ?? 8;
+    setIsConstrainedDevice(hardwareConcurrency <= 4 || deviceMemory <= 4);
+  }, []);
+
+  useEffect(() => {
+    if (!isMobileViewport) {
+      setMobileSourcePreviewOpen(false);
+    }
+  }, [isMobileViewport]);
+
+  useEffect(() => {
+    if (mode !== 'source') {
+      setMobileSourcePreviewOpen(false);
+    }
+  }, [mode]);
 
   useEffect(() => {
     if (deferredSource === documentState.source) {
@@ -1215,37 +1810,53 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     const timeout = window.setTimeout(() => {
-      try {
-        localStorage.setItem(storageKeys.source, documentState.source);
-        localStorage.setItem(storageKeys.sidecar, JSON.stringify(documentState.layout));
-        localStorage.setItem(storageKeys.history, JSON.stringify(history));
-        if (!cancelled) {
-          setSaveStatus('saved');
+      void (async () => {
+        try {
+          localStorage.setItem(storageKeys.source, documentState.source);
+          localStorage.setItem(storageKeys.sidecar, JSON.stringify(documentState.layout));
+          localStorage.setItem(storageKeys.history, JSON.stringify(history));
+
+          if (activeWorkspaceSource === 'local' && activeLocalFileId) {
+            const handle = localFileHandlesRef.current[activeLocalFileId];
+            if (handle?.createWritable) {
+              const writable = await handle.createWritable();
+              await writable.write(toMarkdownDocument(documentState.source));
+              await writable.close();
+            }
+          }
+
+          if (!cancelled) {
+            setSaveStatus('saved');
+          }
+        } catch {
+          if (!cancelled) {
+            setSaveStatus('error');
+          }
         }
-      } catch {
-        if (!cancelled) {
-          setSaveStatus('error');
-        }
-      }
-    }, 140);
+      })();
+    }, 320);
 
     return () => {
       cancelled = true;
       window.clearTimeout(timeout);
     };
-  }, [documentState.layout, documentState.source, history]);
+  }, [activeLocalFileId, activeWorkspaceSource, documentState.layout, documentState.source, history]);
 
   useEffect(() => {
     if (mode !== 'canvas') {
-      setSidebarOpen(true);
-      setInspectorOpen(true);
+      setSidebarOpen(!isMobileViewport);
+      setInspectorOpen(!isMobileViewport);
       return;
     }
 
-    if (selection.kind !== 'none') {
+    if (!isMobileViewport && selection.kind !== 'none') {
       setInspectorOpen(true);
     }
-  }, [mode, selection.kind]);
+  }, [isMobileViewport, mode, selection.kind]);
+
+  useEffect(() => () => {
+    clearPendingBackgroundInteraction();
+  }, [clearPendingBackgroundInteraction]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1282,7 +1893,11 @@ export default function App() {
       gestureStateRef.current = { scale: nextScale };
       const clientX = gestureEvent.clientX ?? gestureEvent.pageX ?? window.innerWidth / 2;
       const clientY = gestureEvent.clientY ?? gestureEvent.pageY ?? window.innerHeight / 2;
-      zoomViewportAtPoint(clientX, clientY, nextScale / previousScale);
+      zoomViewportAtPoint(
+        clientX,
+        clientY,
+        Math.pow(nextScale / previousScale, PINCH_RESPONSE),
+      );
     }
 
     function handleGestureEnd(event: Event) {
@@ -1419,6 +2034,21 @@ export default function App() {
         return;
       }
 
+      const pendingBackground = pendingBackgroundRef.current;
+      if (pendingBackground) {
+        const delta = Math.hypot(
+          event.clientX - pendingBackground.clientX,
+          event.clientY - pendingBackground.clientY,
+        );
+        if (delta > 8) {
+          clearPendingBackgroundInteraction();
+          setPanState({
+            origin: { x: event.clientX, y: event.clientY },
+            initialViewport: { ...documentState.layout.viewport },
+          });
+        }
+      }
+
       const bounds = canvas.getBoundingClientRect();
       const viewport = documentState.layout.viewport;
       const x = (event.clientX - bounds.left - viewport.x) / viewport.zoom;
@@ -1474,28 +2104,33 @@ export default function App() {
     }
 
     function onPointerUp(event: PointerEvent) {
+      clearPendingBackgroundInteraction();
+
       if (dragState) {
         const deltaX = dragState.current.x - dragState.origin.x;
         const deltaY = dragState.current.y - dragState.origin.y;
+        const movedDistance = Math.hypot(deltaX, deltaY);
 
-        commitDocument(
-          (current) => ({
-            ...current,
-            nodes: current.nodes.map((node) => {
-              const initial = dragState.initialPositions[node.id];
-              if (!initial) {
-                return node;
-              }
-              return {
-                ...node,
-                x: Math.round(initial.x + deltaX),
-                y: Math.round(initial.y + deltaY),
-              };
+        if (movedDistance > 3) {
+          commitDocument(
+            (current) => ({
+              ...current,
+              nodes: current.nodes.map((node) => {
+                const initial = dragState.initialPositions[node.id];
+                if (!initial) {
+                  return node;
+                }
+                return {
+                  ...node,
+                  x: Math.round(initial.x + deltaX),
+                  y: Math.round(initial.y + deltaY),
+                };
+              }),
             }),
-          }),
-          '已移动节点',
-          `已在画布中移动 ${dragState.ids.length} 个节点。`,
-        );
+            '已移动节点',
+            `已在画布中移动 ${dragState.ids.length} 个节点。`,
+          );
+        }
         setDragState(null);
       }
 
@@ -1507,10 +2142,16 @@ export default function App() {
       }
 
       if (panState) {
+        const delta = Math.hypot(
+          event.clientX - panState.origin.x,
+          event.clientY - panState.origin.y,
+        );
+        if (delta > 4) {
           setHistory((current) => [
-          createHistoryEntry('视口已移动', '已调整画布视口位置。'),
-          ...current,
-        ].slice(0, 40));
+            createHistoryEntry('视口已移动', '已调整画布视口位置。'),
+            ...current,
+          ].slice(0, 40));
+        }
         setPanState(null);
       }
 
@@ -1551,15 +2192,26 @@ export default function App() {
       }
     }
 
+    function onPointerCancel() {
+      clearPendingBackgroundInteraction();
+      setDragState(null);
+      setBoxState(null);
+      setPanState(null);
+      setConnectingState(null);
+    }
+
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerCancel);
 
     return () => {
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerCancel);
     };
   }, [
     boxState,
+    clearPendingBackgroundInteraction,
     commitDocument,
     connectingState,
     createNodeAt,
@@ -1584,7 +2236,7 @@ export default function App() {
       zoomViewportAtPoint(
         event.clientX,
         event.clientY,
-        Math.exp((-event.deltaY * deltaScale) / 520),
+        Math.exp((-event.deltaY * deltaScale) / WHEEL_PINCH_DIVISOR),
       );
       return;
     }
@@ -1624,6 +2276,23 @@ export default function App() {
     }
 
     clearSelection();
+    if (isMobileViewport || event.pointerType === 'touch') {
+      clearPendingBackgroundInteraction();
+      pendingBackgroundRef.current = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+        point,
+      };
+      backgroundHoldRef.current = window.setTimeout(() => {
+        setBoxState({
+          origin: point,
+          current: point,
+        });
+        clearPendingBackgroundInteraction();
+      }, 220);
+      return;
+    }
+
     setBoxState({
       origin: point,
       current: point,
@@ -1721,10 +2390,7 @@ export default function App() {
         ...current,
         nodes: current.nodes.map((node) =>
           node.id === nodeId
-            ? {
-                ...node,
-                label: editingLabel.trim() || node.id,
-              }
+            ? resizeNodeToContent(node, editingLabel.trim() || '未命名内容')
             : node,
         ),
       }),
@@ -1753,9 +2419,14 @@ export default function App() {
       : `已选中 ${selection.ids.length} 个${selectionKindLabel(selection.kind)}`;
   const activeModeLabel =
     mode === 'canvas' ? '画布模式' : mode === 'source' ? '源码模式' : '历史模式';
-  const showSidebar = mode === 'canvas' ? sidebarOpen : true;
-  const showInspector = mode === 'canvas' ? inspectorOpen : true;
-  const workspaceClassName = `workspace workspace--${mode}${showSidebar ? ' workspace--sidebar-open' : ''}${showInspector ? ' workspace--inspector-open' : ''}`;
+  const canGroupSelection = selection.kind === 'node' && selection.ids.length >= 2;
+  const supportsLocalProjectPicker =
+    typeof (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function';
+  const showSidebar = mode === 'canvas' ? sidebarOpen : isMobileViewport ? sidebarOpen : true;
+  const showInspector = mode === 'canvas' ? inspectorOpen : isMobileViewport ? inspectorOpen : true;
+  const workspaceClassName = `workspace workspace--${mode}${isMobileViewport ? ' workspace--mobile' : ''}${showSidebar ? ' workspace--sidebar-open' : ''}${showInspector ? ' workspace--inspector-open' : ''}`;
+  const appShellClassName = `app-shell${isMobileViewport ? ' app-shell--mobile' : ''}${isConstrainedDevice ? ' app-shell--constrained' : ''}`;
+  const mobileOverlayOpen = isMobileViewport && (showSidebar || showInspector || mobileSourcePreviewOpen);
 
   // External Control API - allows external AI agents to control the editor
   useEffect(() => {
@@ -1768,7 +2439,10 @@ export default function App() {
         // trigger re-render by updating source draft
         setSourceDraft((s) => s);
       },
-      getSvg: () => svg || null,
+      getSvg: () => {
+        const preview = document.querySelector('.mermaid-preview svg');
+        return preview instanceof SVGSVGElement ? preview.outerHTML : null;
+      },
     };
 
     // Expose as global
@@ -1799,41 +2473,155 @@ export default function App() {
       window.removeEventListener('message', handleMessage);
       delete (window as unknown as Record<string, unknown>).MermaidEditor;
     };
-  }, [sourceDraft, svg, setSourceDraft]);
+  }, [sourceDraft]);
 
   return (
-    <div className="app-shell">
+    <div className={appShellClassName}>
       <header className="workbench-bar">
         <div className="workbench-brand">
-          <div className="topbar__mark">LTHS</div>
-          <div className="workbench-brand__copy">
-            <p className="eyebrow">云端 Mermaid 工作台</p>
-            <h1>产品图谱平台</h1>
-          </div>
+          {isMobileViewport ? (
+            <button
+              aria-label="打开资源面板"
+              className="icon-button workbench-mobile-trigger"
+              onClick={() => toggleLeftPanel('files')}
+              type="button"
+            >
+              <WorkbenchIcon name="menu" />
+            </button>
+          ) : null}
+          {isMobileViewport ? (
+            <>
+              <div className="topbar__mark">LTHS</div>
+              <div className="workbench-brand__copy">
+                <p className="eyebrow">{activeWorkspaceSource === 'cloud' ? '云端文件' : '本地文件'}</p>
+                <h1>{activeTab.label}</h1>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="topbar__mark">LTHS</div>
+              <div className="workbench-brand__copy">
+                <p className="eyebrow">{activeWorkspaceSource === 'cloud' ? '云端工程' : '本地工程'}</p>
+                <h1>{activeTab.label}</h1>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="workbench-tabs" aria-label="已打开文件">
-          {workspaceTabs.map((tab) => (
-            <button
-              key={tab.id}
-              className={tab.id === activeFileTab ? 'workbench-tab is-active' : 'workbench-tab'}
-              onClick={() => {
-                setActiveFileTab(tab.id);
-                if (tab.id === 'diagram') {
-                  setMode('canvas');
-                } else {
-                  setNotice({
-                    tone: 'info',
-                    message: `当前原型只把 ${tab.label} 作为工作台标签展示，真正实时编辑的仍然是 diagram.md。`,
-                  });
-                }
-              }}
-              type="button"
-            >
-              <strong>{tab.label}</strong>
-              <span>{tab.detail}</span>
-            </button>
-          ))}
+          {isMobileViewport ? (
+            workspaceTabs.map((tab) => (
+              <button
+                key={tab.id}
+                className={tab.id === activeFileTab ? 'workbench-tab is-active' : 'workbench-tab'}
+                onClick={() => {
+                  setActiveFileTab(tab.id);
+                  setMode(tab.id === 'diagram' ? 'canvas' : 'source');
+                }}
+                type="button"
+              >
+                <strong>{tab.label}</strong>
+                <span>{tab.detail}</span>
+              </button>
+            ))
+          ) : (
+            <div className="desktop-commandbar" role="toolbar" aria-label="顶部命令栏">
+              <div className="desktop-command-group">
+                <span className="desktop-command-group__label">{desktopCommandGroups[0].label}</span>
+                <button
+                  className={showSidebar && leftPanel === 'files' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  onClick={() => toggleLeftPanel('files')}
+                  type="button"
+                >
+                  文件
+                </button>
+                <button
+                  className={showSidebar && leftPanel === 'graph' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  onClick={() => toggleLeftPanel('graph')}
+                  type="button"
+                >
+                  图谱
+                </button>
+                <button className="desktop-command-button" onClick={exportMarkdown} type="button">
+                  导出
+                </button>
+                <button
+                  className={supportsLocalProjectPicker ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  onClick={() => {
+                    void openLocalProjectDirectory();
+                  }}
+                  type="button"
+                >
+                  打开本地
+                </button>
+              </div>
+
+              <div className="desktop-command-group">
+                <span className="desktop-command-group__label">{desktopCommandGroups[1].label}</span>
+                <button className="desktop-command-button" onClick={createNodeInViewportCenter} type="button">
+                  新建节点
+                </button>
+                <button
+                  className={selection.kind === 'node' && selection.ids.length > 0 ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  onClick={duplicateSelection}
+                  type="button"
+                >
+                  复制
+                </button>
+                <button
+                  className={canGroupSelection ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  onClick={wrapSelectionInSubgraph}
+                  type="button"
+                >
+                  分组
+                </button>
+                <button
+                  className={selection.kind !== 'none' ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  onClick={deleteSelection}
+                  type="button"
+                >
+                  删除
+                </button>
+              </div>
+
+              <div className="desktop-command-group">
+                <span className="desktop-command-group__label">{desktopCommandGroups[2].label}</span>
+                <button
+                  className={mode === 'canvas' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  onClick={() => goToMode('canvas')}
+                  type="button"
+                >
+                  画布
+                </button>
+                <button
+                  className={mode === 'source' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  onClick={() => goToMode('source')}
+                  type="button"
+                >
+                  源码
+                </button>
+                <button
+                  className={showInspector ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  onClick={toggleInspector}
+                  type="button"
+                >
+                  属性
+                </button>
+                <button
+                  className={selection.kind !== 'none' ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  onClick={focusSelectionInViewport}
+                  type="button"
+                >
+                  聚焦
+                </button>
+              </div>
+
+              <div className="desktop-path-chip">
+                <strong>{activeWorkspaceSource === 'cloud' ? '云端路径' : '本地路径'}</strong>
+                <span>{activeProjectPath}</span>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="workbench-bar__actions">
@@ -1844,12 +2632,10 @@ export default function App() {
                 className="presence-avatar has-tooltip"
                 data-tooltip={`${collaborator.name} · ${collaborator.role}`}
                 key={collaborator.id}
-                onClick={() =>
-                  setNotice({
-                    tone: 'info',
-                    message: `${collaborator.name} 当前聚焦在${collaborator.role}工作流。`,
-                  })
-                }
+                onClick={() => {
+                  setSidebarOpen(false);
+                  setInspectorOpen(true);
+                }}
                 type="button"
               >
                 <span
@@ -1862,76 +2648,98 @@ export default function App() {
           </div>
 
           <div
-            aria-label={saveStatus === 'saving' ? '正在同步缓存' : saveStatus === 'error' ? '同步异常' : '云端缓存就绪'}
+            aria-label={
+              saveStatus === 'saving'
+                ? activeWorkspaceSource === 'cloud'
+                  ? '正在同步云端'
+                  : '正在写入本地'
+                : saveStatus === 'error'
+                  ? '保存异常'
+                  : activeWorkspaceSource === 'cloud'
+                    ? '云端同步就绪'
+                    : '本地项目已连接'
+            }
             className={`status-pill status-pill--${saveStatus}`}
-            data-tooltip={saveStatus === 'saving' ? '正在同步缓存' : saveStatus === 'error' ? '同步异常' : '云端缓存就绪'}
+            data-tooltip={
+              saveStatus === 'saving'
+                ? activeWorkspaceSource === 'cloud'
+                  ? '正在同步云端'
+                  : '正在写入本地'
+                : saveStatus === 'error'
+                  ? '保存异常'
+                  : activeWorkspaceSource === 'cloud'
+                    ? '云端同步就绪'
+                    : '本地项目已连接'
+            }
           >
             <span className="status-pill__dot" />
             {saveStatus === 'saving'
-              ? '正在同步缓存'
+              ? activeWorkspaceSource === 'cloud'
+                ? '正在同步云端'
+                : '正在写入本地'
               : saveStatus === 'error'
-                ? '同步异常'
-                : '云端缓存就绪'}
+                ? '保存异常'
+                : activeWorkspaceSource === 'cloud'
+                  ? '云端同步就绪'
+                  : '本地项目已连接'}
           </div>
 
           <div className="workbench-icon-row" role="toolbar" aria-label="工作台控制">
-            <div className="mode-switch" role="tablist" aria-label="工作区模式">
-              {modeMeta.map((entry) => (
+            {isMobileViewport ? (
+              <div className="mode-switch" role="tablist" aria-label="工作区模式">
+                {modeMeta.map((entry) => (
+                  <button
+                    aria-label={entry.label}
+                    className={entry.id === mode ? 'mode-pill has-tooltip is-active' : 'mode-pill has-tooltip'}
+                    data-tooltip={entry.label}
+                    key={entry.id}
+                    onClick={() => goToMode(entry.id)}
+                    type="button"
+                  >
+                    <WorkbenchIcon name={entry.icon} />
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <>
                 <button
-                  aria-label={entry.label}
-                  className={entry.id === mode ? 'mode-pill has-tooltip is-active' : 'mode-pill has-tooltip'}
-                  data-tooltip={entry.label}
-                  key={entry.id}
-                  onClick={() => goToMode(entry.id)}
+                  aria-label="复制 Mermaid 源码"
+                  className="icon-button has-tooltip"
+                  data-tooltip="复制 Mermaid"
+                  onClick={copySource}
                   type="button"
                 >
-                  <WorkbenchIcon name={entry.icon} />
+                  <WorkbenchIcon name="copy" />
                 </button>
-              ))}
-            </div>
-
-            <button
-              aria-label={showInspector ? '收起属性面板' : '展开属性面板'}
-              className={showInspector ? 'icon-button has-tooltip is-active' : 'icon-button has-tooltip'}
-              data-tooltip={showInspector ? '收起属性' : '展开属性'}
-              onClick={() => setInspectorOpen((current) => !current)}
-              type="button"
-            >
-              <WorkbenchIcon name="inspect" />
-            </button>
-
-            <button
-              aria-label="复制 Mermaid 源码"
-              className="icon-button has-tooltip"
-              data-tooltip="复制 Mermaid"
-              onClick={copySource}
-              type="button"
-            >
-              <WorkbenchIcon name="copy" />
-            </button>
-            <button
-              aria-label="导出标准 Markdown"
-              className="icon-button icon-button--primary has-tooltip"
-              data-tooltip="分享 / 导出"
-              onClick={exportMarkdown}
-              type="button"
-            >
-              <WorkbenchIcon name="share" />
-            </button>
+                <button
+                  aria-label="导出标准 Markdown"
+                  className="icon-button icon-button--primary has-tooltip"
+                  data-tooltip="导出 Markdown"
+                  onClick={exportMarkdown}
+                  type="button"
+                >
+                  <WorkbenchIcon name="share" />
+                </button>
+              </>
+            )}
           </div>
         </div>
       </header>
 
-      {notice ? (
-        <div className={`notice notice--${notice.tone}`}>
-          <span>{notice.message}</span>
-          <button onClick={() => setNotice(null)} type="button">
-            关闭
-          </button>
-        </div>
-      ) : null}
-
       <main className={workspaceClassName}>
+        {mobileOverlayOpen ? (
+          <button
+            aria-label="关闭当前面板"
+            className="mobile-overlay-backdrop"
+            onClick={() => {
+              setSidebarOpen(false);
+              setInspectorOpen(false);
+              setMobileSourcePreviewOpen(false);
+            }}
+            type="button"
+          />
+        ) : null}
+
         <nav className="nav-rail" aria-label="工作台导航">
           {leftPanelMeta.map((item) => (
             <button
@@ -1943,31 +2751,43 @@ export default function App() {
               type="button"
             >
               <WorkbenchIcon name={item.icon} />
+              <span className="nav-rail__label">{item.label}</span>
             </button>
           ))}
         </nav>
 
         <aside className={`sidebar${showSidebar ? ' is-open' : ''}`}>
+          {isMobileViewport ? (
+            <div className="mobile-sheet-handle" aria-hidden="true" />
+          ) : null}
+          {isMobileViewport ? (
+            <div className="mobile-panel-tabs" role="tablist" aria-label="移动资源面板">
+              {leftPanelMeta.map((item) => (
+                <button
+                  aria-label={item.label}
+                  className={leftPanel === item.id ? 'mobile-panel-tab is-active' : 'mobile-panel-tab'}
+                  key={item.id}
+                  onClick={() => setLeftPanel(item.id)}
+                  type="button"
+                >
+                  <WorkbenchIcon name={item.icon} />
+                  <span>{item.label}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
           <section className="sidebar-card sidebar-card--header">
             <div>
               <p className="eyebrow">
-                {leftPanel === 'files'
-                  ? '项目资源'
-                  : leftPanel === 'graph'
-                    ? '图谱导航'
-                    : '协作状态'}
+                {leftPanel === 'files' ? '项目资源' : '图谱导航'}
               </p>
               <h2>
-                {leftPanel === 'files'
-                  ? '云端文件'
-                  : leftPanel === 'graph'
-                    ? '图谱导航'
-                    : '实时动态'}
+                {leftPanel === 'files' ? '文件面板' : '图谱导航'}
               </h2>
             </div>
             <div className="panel-header-actions">
               <span className="panel-badge">
-                {leftPanel === 'files' ? 'Linux 存储' : leftPanel === 'graph' ? '联动画布' : '3 人在线'}
+                {leftPanel === 'files' ? '云端 + 本地' : '联动画布'}
               </span>
               <button
                 aria-label="收起左侧面板"
@@ -1981,35 +2801,36 @@ export default function App() {
             </div>
           </section>
 
+          {!isMobileViewport ? (
+            <section className="sidebar-card sidebar-card--search">
+              <div className="sidebar-card__header">
+                <h2>搜索框</h2>
+                <span>定位</span>
+              </div>
+              <label className="field">
+                <input
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="查找节点、分组、源码"
+                />
+              </label>
+            </section>
+          ) : null}
+
           {leftPanel === 'files' ? (
             <>
               <section className="sidebar-card">
                 <div className="sidebar-card__header">
-                  <h2>工作区</h2>
-                  <span>{activeTab.label}</span>
+                  <h2>云端</h2>
+                  <span>Git 主线</span>
                 </div>
-                <p className="sidebar-copy">
-                  项目文件以服务器为准，本地浏览器只保留短期缓存，sidecar 只负责记录工作区布局状态。
-                </p>
+                <p className="sidebar-copy">{activeCloudPath}</p>
                 <div className="explorer-list">
-                  {explorerItems.map((item) => (
+                  {cloudExplorerItems.map((item) => (
                     <button
                       key={item.id}
-                      className={item.id === 'file-diagram' || item.id === 'block-main' ? 'explorer-item is-active' : 'explorer-item'}
-                      onClick={() => {
-                        if (item.id === 'file-diagram') {
-                          setMode('source');
-                          setSidebarOpen(false);
-                        } else if (item.id === 'block-main') {
-                          setMode('canvas');
-                          setSidebarOpen(false);
-                        } else if (item.id === 'sidecar-layout') {
-                          setNotice({
-                            tone: 'info',
-                            message: '布局 sidecar 只在本工作区内部使用，不会改写导出的 Mermaid 或 Markdown。',
-                          });
-                        }
-                      }}
+                      className={item.tabId === activeFileTab && activeWorkspaceSource === 'cloud' ? 'explorer-item is-active' : 'explorer-item'}
+                      onClick={() => openExplorerItem(item)}
                       style={{ paddingLeft: `${16 + item.depth * 18}px` }}
                       type="button"
                     >
@@ -2023,24 +2844,36 @@ export default function App() {
                 </div>
               </section>
 
-              <section className="sidebar-card sidebar-card--muted">
+              <section className="sidebar-card">
                 <div className="sidebar-card__header">
-                  <h2>项目规则</h2>
-                  <span>Mermaid 兼容</span>
+                  <h2>本地</h2>
+                  <button
+                    className={supportsLocalProjectPicker ? 'ghost-button' : 'ghost-button is-disabled'}
+                    onClick={() => {
+                      void openLocalProjectDirectory();
+                    }}
+                    type="button"
+                  >
+                    打开本地工程
+                  </button>
                 </div>
-                <div className="stack-list">
-                  <div className="info-row">
-                    <strong>真相源</strong>
-                    <span>云端项目中的 Markdown 文件</span>
-                  </div>
-                  <div className="info-row">
-                    <strong>布局状态</strong>
-                    <span>独立 sidecar，绝不写进 Mermaid</span>
-                  </div>
-                  <div className="info-row">
-                    <strong>同步模型</strong>
-                    <span>画布和源码共享同一份图文档</span>
-                  </div>
+                <p className="sidebar-copy">{activeLocalPath}</p>
+                <div className="explorer-list">
+                  {localExplorerItems.map((item) => (
+                    <button
+                      className={item.tabId === activeFileTab && activeWorkspaceSource === 'local' ? 'explorer-item is-active' : 'explorer-item'}
+                      key={item.id}
+                      onClick={() => openExplorerItem(item)}
+                      style={{ paddingLeft: `${12 + item.depth * 16}px` }}
+                      type="button"
+                    >
+                      <span className={`explorer-item__marker explorer-item__marker--${item.kind}`} />
+                      <span className="explorer-item__body">
+                        <strong>{item.label}</strong>
+                        <small>{item.meta}</small>
+                      </span>
+                    </button>
+                  ))}
                 </div>
               </section>
             </>
@@ -2050,111 +2883,77 @@ export default function App() {
             <>
               <section className="sidebar-card">
                 <p className="sidebar-copy">
-                  搜索节点、分组和源码区块。点击结果后会保持当前文档焦点，并把选中项定位回画布。
+                  图谱按树形层级展示分组与节点。点击任一项后会把当前焦点定位回主舞台。
                 </p>
                 <label className="field">
                   <span>搜索</span>
                   <input
                     value={searchQuery}
                     onChange={(event) => setSearchQuery(event.target.value)}
-                    placeholder="查找节点或分组"
+                    placeholder="查找图层、节点、分组"
                   />
                 </label>
               </section>
 
               <section className="sidebar-card">
                 <div className="sidebar-card__header">
-                  <h2>分组</h2>
-                  <span>{documentState.subgraphs.length}</span>
+                  <h2>图层树</h2>
+                  <span>{graphTreeItems.length}</span>
                 </div>
-                <div className="project-list">
-                  {filteredSubgraphs.map((subgraph) => (
-                    <button
-                      key={subgraph.id}
-                      className={selection.kind === 'subgraph' && selectionContains(selection, subgraph.id) ? 'project-item is-active' : 'project-item'}
-                      onClick={() => {
-                        setSelection({ kind: 'subgraph', ids: [subgraph.id] });
-                        setMode('canvas');
-                        setSidebarOpen(false);
-                      }}
-                      type="button"
-                    >
-                      <span>{subgraph.title}</span>
-                      <small>{subgraph.collapsed ? '已折叠' : '已展开'}</small>
-                    </button>
-                  ))}
-                </div>
-              </section>
+                <div className="graph-tree">
+                  {graphTreeItems.map((item) => {
+                    const isSelected =
+                      (item.kind === 'subgraph' &&
+                        selection.kind === 'subgraph' &&
+                        selectionContains(selection, item.id)) ||
+                      (item.kind === 'node' &&
+                        selection.kind === 'node' &&
+                        selectionContains(selection, item.id));
 
-              <section className="sidebar-card">
-                <div className="sidebar-card__header">
-                  <h2>节点</h2>
-                  <span>{filteredNodes.length}</span>
-                </div>
-                <div className="project-list">
-                  {filteredNodes.map((node) => (
-                    <button
-                      key={node.id}
-                      className={selection.kind === 'node' && selectionContains(selection, node.id) ? 'project-item is-active' : 'project-item'}
-                      onClick={() => {
-                        setSelection({ kind: 'node', ids: [node.id] });
-                        setMode('canvas');
-                        setSidebarOpen(false);
-                      }}
-                      type="button"
-                    >
-                      <span>{node.label}</span>
-                      <small>{node.id}</small>
-                    </button>
-                  ))}
+                    return (
+                      <button
+                        key={`${item.kind}-${item.id}`}
+                        className={isSelected ? 'graph-tree__item is-active' : 'graph-tree__item'}
+                        onClick={() => {
+                          setSelection({ kind: item.kind, ids: [item.id] });
+                          setMode('canvas');
+                          setSidebarOpen(false);
+                        }}
+                        style={{ paddingLeft: `${10 + item.depth * 16}px` }}
+                        type="button"
+                      >
+                        <span className={`graph-tree__marker graph-tree__marker--${item.kind}`} />
+                        <span className="graph-tree__body">
+                          <strong>{item.label}</strong>
+                          <small>{item.meta}</small>
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
               </section>
             </>
           ) : null}
 
-          {leftPanel === 'comments' ? (
-            <>
-              <section className="sidebar-card">
-                <div className="sidebar-card__header">
-                  <h2>在线协作者</h2>
-                  <span>{collaboratorPresets.length}</span>
-                </div>
-                <div className="presence-list">
-                  {collaboratorPresets.map((collaborator) => (
-                    <div className="presence-list__item" key={collaborator.id}>
-                      <span
-                        className="presence-list__swatch"
-                        style={{ background: collaborator.color }}
-                      />
-                      <div>
-                        <strong>{collaborator.name}</strong>
-                        <span>正在编辑{collaborator.role}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-
-              <section className="sidebar-card sidebar-card--muted">
-                <div className="sidebar-card__header">
-                  <h2>最近动态</h2>
-                  <span>实时流</span>
-                </div>
-                <div className="activity-feed">
-                  {activityFeed.map((entry) => (
-                    <article className="activity-item" key={entry.id}>
-                      <strong>{entry.title}</strong>
-                      <span>{entry.detail}</span>
-                      <small>{formatTime(entry.at)}</small>
-                    </article>
-                  ))}
-                </div>
-              </section>
-            </>
-          ) : null}
         </aside>
 
         <section className={`workspace-main workspace-main--${mode}`}>
+          {!isMobileViewport ? (
+            <div className="desktop-mode-strip" role="tablist" aria-label="桌面模式切换">
+              {modeMeta.map((entry) => (
+                <button
+                  aria-label={entry.label}
+                  className={entry.id === mode ? 'desktop-mode-pill is-active' : 'desktop-mode-pill'}
+                  key={entry.id}
+                  onClick={() => goToMode(entry.id)}
+                  type="button"
+                >
+                  {entry.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
+
           {mode === 'canvas' ? (
             <div className="canvas-mode">
               <div className="canvas-status-strip" aria-label="画布状态">
@@ -2168,6 +2967,9 @@ export default function App() {
                 onMouseEnter={() => setCanvasHovered(true)}
                 onMouseLeave={() => setCanvasHovered(false)}
                 onDoubleClick={(event) => {
+                  if (isMobileViewport) {
+                    return;
+                  }
                   const target = event.target as HTMLElement;
                   if (target.closest('.graph-node, .subgraph-frame')) {
                     return;
@@ -2245,18 +3047,24 @@ export default function App() {
 
                       const from = visiblePosition(fromNode);
                       const to = visiblePosition(toNode);
-                      const startX = from.x + fromNode.width;
-                      const startY = from.y + fromNode.height / 2;
-                      const endX = to.x;
-                      const endY = to.y + toNode.height / 2;
-                      const midX = (startX + endX) / 2;
-                      const midY = (startY + endY) / 2;
+                      const geometry = buildEdgeGeometry(
+                        {
+                          ...fromNode,
+                          x: from.x,
+                          y: from.y,
+                        },
+                        {
+                          ...toNode,
+                          x: to.x,
+                          y: to.y,
+                        },
+                      );
 
                       return (
                         <g key={edge.id}>
                           <path
                             className={`edge-path edge-path--${edge.type}${selection.kind === 'edge' && selectionContains(selection, edge.id) ? ' is-selected' : ''}`}
-                            d={`M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`}
+                            d={geometry.path}
                             markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-solid)'}
                             onClick={(event) => {
                               event.stopPropagation();
@@ -2264,7 +3072,7 @@ export default function App() {
                             }}
                           />
                           {edge.label ? (
-                            <text className="edge-label" x={midX} y={midY - 10}>
+                            <text className="edge-label" x={geometry.mid.x} y={geometry.mid.y - 10}>
                               {edge.label}
                             </text>
                           ) : null}
@@ -2275,7 +3083,22 @@ export default function App() {
                     {connectingState ? (
                       <path
                         className="edge-path edge-path--preview"
-                        d={`M ${connectingState.origin.x} ${connectingState.origin.y} C ${(connectingState.origin.x + connectingState.current.x) / 2} ${connectingState.origin.y}, ${(connectingState.origin.x + connectingState.current.x) / 2} ${connectingState.current.y}, ${connectingState.current.x} ${connectingState.current.y}`}
+                        d={(() => {
+                          const originNode = visibleNodes.find((node) => node.id === connectingState.fromId);
+                          if (!originNode) {
+                            return '';
+                          }
+
+                          const position = visiblePosition(originNode);
+                          return buildPreviewEdgePath(
+                            {
+                              ...originNode,
+                              x: position.x,
+                              y: position.y,
+                            },
+                            connectingState.current,
+                          );
+                        })()}
                         markerEnd="url(#arrow-solid)"
                       />
                     ) : null}
@@ -2291,6 +3114,9 @@ export default function App() {
                         className={`graph-node graph-node--${node.shape}${selected ? ' is-selected' : ''}${hoveredNodeId === node.id ? ' is-hovered' : ''}`}
                         data-node-id={node.id}
                         onDoubleClick={(event) => {
+                          if (isMobileViewport) {
+                            return;
+                          }
                           event.stopPropagation();
                           startInlineEdit(node);
                         }}
@@ -2308,18 +3134,6 @@ export default function App() {
                         }}
                         tabIndex={0}
                       >
-                        <div className="graph-node__header">
-                          <span className="graph-node__id">{node.id}</span>
-                          <button
-                            aria-label={`从 ${node.label} 创建连线`}
-                            className="graph-node__connector"
-                            onPointerDown={(event) => beginConnection(event, node)}
-                            type="button"
-                          >
-                            +
-                          </button>
-                        </div>
-
                         {editingNodeId === node.id ? (
                           <textarea
                             autoFocus
@@ -2341,8 +3155,17 @@ export default function App() {
                             value={editingLabel}
                           />
                         ) : (
-                          <div className="graph-node__label">{node.label}</div>
+                          <div className="graph-node__content">{node.label}</div>
                         )}
+
+                        <button
+                          aria-label={`从当前节点创建连线`}
+                          className="graph-node__connector"
+                          onPointerDown={(event) => beginConnection(event, node)}
+                          type="button"
+                        >
+                          +
+                        </button>
                       </div>
                     );
                   })}
@@ -2373,7 +3196,6 @@ export default function App() {
                     aria-label="选择"
                     className="tool-dock__button has-tooltip is-active"
                     data-tooltip="选择"
-                    onClick={() => setNotice({ tone: 'info', message: '选择仍然是默认工具。拖拽空白处可框选，拖拽节点即可移动。' })}
                     type="button"
                   >
                     <WorkbenchIcon name="cursor" />
@@ -2395,8 +3217,9 @@ export default function App() {
                   </button>
                   <button
                     aria-label="创建分组"
-                    className="tool-dock__button has-tooltip"
+                    className={canGroupSelection ? 'tool-dock__button has-tooltip' : 'tool-dock__button has-tooltip is-disabled'}
                     data-tooltip="创建分组"
+                    disabled={!canGroupSelection}
                     onClick={wrapSelectionInSubgraph}
                     type="button"
                   >
@@ -2462,13 +3285,24 @@ export default function App() {
                     <p className="eyebrow">Markdown + Mermaid</p>
                     <h2>源码编辑器</h2>
                   </div>
-                  <button
-                    className="ghost-button"
-                    onClick={() => setSourceDraft(documentState.source)}
-                    type="button"
-                  >
-                    回退到有效图
-                  </button>
+                  <div className="source-pane__actions">
+                    <button
+                      className="ghost-button"
+                      onClick={() => setSourceDraft(documentState.source)}
+                      type="button"
+                    >
+                      回退到有效图
+                    </button>
+                    {isMobileViewport ? (
+                      <button
+                        className="solid-button"
+                        onClick={() => setMobileSourcePreviewOpen((current) => !current)}
+                        type="button"
+                      >
+                        {mobileSourcePreviewOpen ? '收起预览' : '查看预览'}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
 
                 <textarea
@@ -2494,15 +3328,17 @@ export default function App() {
                 </div>
               </section>
 
-              <section className="preview-pane">
-                <div className="pane-header">
-                  <div>
-                    <p className="eyebrow">实时预览</p>
-                    <h2>标准 Mermaid 渲染</h2>
+              {!isMobileViewport ? (
+                <section className="preview-pane">
+                  <div className="pane-header">
+                    <div>
+                      <p className="eyebrow">实时预览</p>
+                      <h2>标准 Mermaid 渲染</h2>
+                    </div>
                   </div>
-                </div>
-                <MermaidPreview source={sourceDraft} />
-              </section>
+                  <MermaidPreview source={sourceDraft} />
+                </section>
+              ) : null}
             </div>
           ) : null}
 
@@ -2531,81 +3367,21 @@ export default function App() {
         </section>
 
         <aside className={`inspector${showInspector ? ' is-open' : ''}`}>
-          <section className="sidebar-card">
-            <div className="sidebar-card__header">
-              <h2>会话</h2>
-              <div className="panel-header-actions">
-                <span>{activeTab.label}</span>
-                <button
-                  aria-label="收起属性面板"
-                  className="panel-icon-button has-tooltip"
-                  data-tooltip="收起属性"
-                  onClick={() => setInspectorOpen(false)}
-                  type="button"
-                >
-                  <WorkbenchIcon name="chevron-right" />
-                </button>
-              </div>
-            </div>
-            <div className="stack-list">
-              <div className="info-row">
-                <strong>云端项目</strong>
-                <span>产品图谱平台 / 规划</span>
-              </div>
-              <div className="info-row">
-                <strong>当前模式</strong>
-                <span>{mode === 'canvas' ? '画布' : mode === 'source' ? '源码' : '历史'}</span>
-              </div>
-              <div className="info-row">
-                <strong>存储拆分</strong>
-                <span>标准 Markdown + 独立布局 sidecar</span>
-              </div>
-            </div>
-          </section>
-
-          <section className="sidebar-card">
-            <h2>文档</h2>
-            <label className="field">
-              <span>方向</span>
-              <select
-                onChange={(event) =>
-                  commitDocument(
-                    (current) => ({
-                      ...current,
-                      direction: event.target.value as Direction,
-                    }),
-                    '已更新方向',
-                    `已将流向改为 ${event.target.value}。`,
-                  )
-                }
-                value={documentState.direction}
-              >
-                <option value="LR">LR</option>
-                <option value="RL">RL</option>
-                <option value="TD">TD</option>
-                <option value="BT">BT</option>
-              </select>
-            </label>
-
-            <div className="stats-grid">
-              <div>
-                <strong>{documentState.nodes.length}</strong>
-                <span>节点</span>
-              </div>
-              <div>
-                <strong>{documentState.edges.length}</strong>
-                <span>连线</span>
-              </div>
-              <div>
-                <strong>{documentState.subgraphs.length}</strong>
-                <span>分组</span>
-              </div>
-              <div>
-                <strong>{documentState.unsupportedLines.length}</strong>
-                <span>仅源码</span>
-              </div>
-            </div>
-          </section>
+          {isMobileViewport ? (
+            <div className="mobile-sheet-handle" aria-hidden="true" />
+          ) : null}
+          <div className="inspector-heading">
+            <span>{selectedNode ? '节点属性' : selectedEdge ? '连线属性' : selectedSubgraph ? '分组属性' : '属性'}</span>
+            <button
+              aria-label="收起属性面板"
+              className="panel-icon-button has-tooltip"
+              data-tooltip="收起属性"
+              onClick={() => setInspectorOpen(false)}
+              type="button"
+            >
+              <WorkbenchIcon name="chevron-right" />
+            </button>
+          </div>
 
           {selectedNode ? (
             <section className="sidebar-card">
@@ -2614,9 +3390,10 @@ export default function App() {
                 <span>{selectedNode.id}</span>
               </div>
               <label className="field">
-                <span>标签</span>
-                <input
+                <span>内容</span>
+                <textarea
                   onChange={(event) => updateSelectedNode('label', event.target.value)}
+                  rows={4}
                   value={selectedNode.label}
                 />
               </label>
@@ -2714,29 +3491,70 @@ export default function App() {
             </section>
           ) : null}
 
-          <section className="sidebar-card sidebar-card--muted">
-            <h2>AI 动作</h2>
-            <div className="ai-list">
-              <button className="ai-card" type="button">
-                <strong>节点重命名</strong>
-                <span>生成稳定的命令批次，让命名规则保持一致。</span>
-              </button>
-              <button className="ai-card" type="button">
-                <strong>总结图谱</strong>
-                <span>把当前区块整理成发布说明或评审摘要。</span>
-              </button>
-              <button className="ai-card" type="button">
-                <strong>兼容性检查</strong>
-                <span>检查当前区块是否仍然保持在标准 Mermaid 的兼容范围内。</span>
-              </button>
-            </div>
-            <div className="inspector-actions">
-              <button className="ghost-button" onClick={exportSidecar} type="button">
-                导出 Sidecar
-              </button>
-            </div>
-          </section>
+          {!selectedNode && !selectedEdge && !selectedSubgraph ? (
+            <section className="sidebar-card inspector-empty">
+              <h2>未选中对象</h2>
+              <p>选择一个节点、连线或分组后，这里只显示当前对象的属性。</p>
+            </section>
+          ) : null}
         </aside>
+
+        {isMobileViewport && mode === 'source' ? (
+          <section className={`mobile-source-preview-sheet${mobileSourcePreviewOpen ? ' is-open' : ''}`}>
+            <div className="mobile-sheet-handle" aria-hidden="true" />
+            <div className="pane-header">
+              <div>
+                <p className="eyebrow">实时预览</p>
+                <h2>标准 Mermaid 渲染</h2>
+              </div>
+              <button
+                aria-label="收起预览"
+                className="panel-icon-button"
+                onClick={() => setMobileSourcePreviewOpen(false)}
+                type="button"
+              >
+                <WorkbenchIcon name="chevron-right" />
+              </button>
+            </div>
+            <MermaidPreview source={sourceDraft} />
+          </section>
+        ) : null}
+
+        {isMobileViewport ? (
+          <div className="mobile-bottom-bar" role="toolbar" aria-label="安卓竖屏工作台控制">
+            <button
+              aria-label="打开资源面板"
+              className={showSidebar && leftPanel === 'files' ? 'mobile-bottom-bar__button is-active' : 'mobile-bottom-bar__button'}
+              onClick={() => toggleLeftPanel('files')}
+              type="button"
+            >
+              <WorkbenchIcon name="files" />
+            </button>
+
+            <div className="mobile-bottom-bar__modes" role="tablist" aria-label="模式切换">
+              {modeMeta.map((entry) => (
+                <button
+                  aria-label={entry.label}
+                  className={entry.id === mode ? 'mobile-mode-pill is-active' : 'mobile-mode-pill'}
+                  key={entry.id}
+                  onClick={() => goToMode(entry.id)}
+                  type="button"
+                >
+                  <WorkbenchIcon name={entry.icon} />
+                </button>
+              ))}
+            </div>
+
+            <button
+              aria-label={mode === 'source' ? '打开预览' : '打开属性'}
+              className={showInspector || mobileSourcePreviewOpen ? 'mobile-bottom-bar__button is-active' : 'mobile-bottom-bar__button'}
+              onClick={handleMobileInspectorToggle}
+              type="button"
+            >
+              <WorkbenchIcon name={mode === 'source' ? 'preview' : 'inspect'} />
+            </button>
+          </div>
+        ) : null}
       </main>
     </div>
   );
