@@ -1,5 +1,4 @@
 import {
-  startTransition,
   useCallback,
   useDeferredValue,
   useEffect,
@@ -15,7 +14,9 @@ import type {
 } from 'react';
 import {
   createDefaultLayout,
+  defaultEdgeStyle,
   measureNodeContentSize,
+  normalizeEdgeStyle,
   parseMermaidDocument,
   serializeMermaidDocument,
   syncDocument,
@@ -23,6 +24,7 @@ import {
 import { sampleSource } from './lib/sample';
 import { storageKeys } from './lib/storage';
 import type {
+  Direction,
   EditorMode,
   GraphDocument,
   GraphEdge,
@@ -43,7 +45,20 @@ interface Point {
   y: number;
 }
 
+interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface EdgeEndpointBox extends Rect {
+  id: string;
+  kind: 'node' | 'subgraph';
+}
+
 interface DragState {
+  kind: 'node' | 'subgraph';
   origin: Point;
   current: Point;
   ids: string[];
@@ -64,6 +79,8 @@ interface ConnectingState {
   fromId: string;
   origin: Point;
   current: Point;
+  edgeType: GraphEdge['type'];
+  handleSide: 'left' | 'right';
 }
 
 interface GestureState {
@@ -78,6 +95,9 @@ interface SubgraphFrame {
   height: number;
   depth: number;
   collapsed: boolean;
+  headerHeight: number;
+  memberCount: number;
+  summaryLabels: string[];
 }
 
 interface GraphTreeItem {
@@ -90,6 +110,14 @@ interface GraphTreeItem {
 
 const PINCH_RESPONSE = 1.3;
 const WHEEL_PINCH_DIVISOR = 360;
+const SUBGRAPH_HEADER_HEIGHT = 42;
+const SUBGRAPH_MIN_WIDTH = 284;
+const SUBGRAPH_MIN_HEIGHT = 176;
+const SUBGRAPH_COLLAPSED_HEIGHT = 88;
+const SUBGRAPH_COLLAPSED_MIN_WIDTH = 220;
+const SUBGRAPH_HORIZONTAL_PADDING = 28;
+const SUBGRAPH_TOP_PADDING = 18;
+const SUBGRAPH_BOTTOM_PADDING = 24;
 
 interface ExplorerItem {
   id: string;
@@ -122,6 +150,26 @@ interface LocalProjectDirectoryHandle {
 
 type LocalProjectHandle = LocalProjectFileHandle | LocalProjectDirectoryHandle;
 
+interface NodeInspectorDraft {
+  label: string;
+  shape: NodeShape;
+  fill: string;
+  stroke: string;
+  textColor: string;
+}
+
+interface EdgeInspectorDraft {
+  label: string;
+  type: GraphEdge['type'];
+  strokeColor: string;
+  strokeWidthInput: string;
+}
+
+interface SubgraphInspectorDraft {
+  title: string;
+  collapsed: boolean;
+}
+
 type IconName =
   | 'menu'
   | 'files'
@@ -140,7 +188,10 @@ type IconName =
   | 'plus'
   | 'preview'
   | 'chevron-left'
-  | 'chevron-right';
+  | 'chevron-right'
+  | 'link-start'
+  | 'link-end'
+  | 'trash';
 
 const shapeOptions: Array<{ label: string; value: NodeShape }> = [
   { label: '矩形', value: 'rect' },
@@ -151,6 +202,19 @@ const shapeOptions: Array<{ label: string; value: NodeShape }> = [
   { label: '数据库', value: 'database' },
   { label: '子程序', value: 'subroutine' },
 ];
+
+const nodeStylePresets = [
+  { id: 'sunrise', label: '晨曦', fill: '#fff5dd', stroke: '#d97706', textColor: '#7c2d12' },
+  { id: 'ocean', label: '海岸', fill: '#e0f2fe', stroke: '#0284c7', textColor: '#0f172a' },
+  { id: 'mint', label: '薄荷', fill: '#dcfce7', stroke: '#16a34a', textColor: '#14532d' },
+  { id: 'rose', label: '玫瑰', fill: '#ffe4e6', stroke: '#e11d48', textColor: '#881337' },
+  { id: 'violet', label: '暮紫', fill: '#ede9fe', stroke: '#7c3aed', textColor: '#4c1d95' },
+  { id: 'slate', label: '石墨', fill: '#e2e8f0', stroke: '#475569', textColor: '#0f172a' },
+  { id: 'ember', label: '炽焰', fill: '#ffedd5', stroke: '#ea580c', textColor: '#7c2d12' },
+  { id: 'teal', label: '湖青', fill: '#ccfbf1', stroke: '#0f766e', textColor: '#134e4a' },
+  { id: 'gold', label: '琥珀', fill: '#fef3c7', stroke: '#ca8a04', textColor: '#713f12' },
+  { id: 'night', label: '夜幕', fill: '#1f2937', stroke: '#93c5fd', textColor: '#f8fafc' },
+] as const;
 
 const collaboratorPresets = [
   { id: 'lin', name: 'Lin', role: '画布', color: '#f97316' },
@@ -357,6 +421,29 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
           <path d="M10 6l6 6-6 6" />
         </svg>
       );
+    case 'link-start':
+      return (
+        <svg {...props}>
+          <path d="M20 12H8" />
+          <path d="M12 8l-4 4 4 4" />
+        </svg>
+      );
+    case 'link-end':
+      return (
+        <svg {...props}>
+          <path d="M4 12h12" />
+          <path d="M12 8l4 4-4 4" />
+        </svg>
+      );
+    case 'trash':
+      return (
+        <svg {...props}>
+          <path d="M5 7h14" />
+          <path d="M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7" />
+          <path d="M7 7l.8 11.2A2 2 0 0 0 9.8 20h4.4a2 2 0 0 0 2-1.8L17 7" />
+          <path d="M10 11v5M14 11v5" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -367,10 +454,30 @@ function isTypingTarget(target: EventTarget | null) {
     return false;
   }
 
+  if (target.isContentEditable || target.tagName === 'TEXTAREA') {
+    return true;
+  }
+
+  if (target.tagName !== 'INPUT') {
+    return false;
+  }
+
+  const input = target as HTMLInputElement;
+  const textLikeTypes = new Set([
+    '',
+    'text',
+    'search',
+    'url',
+    'tel',
+    'email',
+    'password',
+    'number',
+  ]);
+
   return (
-    target.tagName === 'INPUT' ||
-    target.tagName === 'TEXTAREA' ||
-    target.isContentEditable
+    !input.readOnly &&
+    !input.disabled &&
+    textLikeTypes.has(input.type)
   );
 }
 
@@ -452,6 +559,7 @@ function localizeLegacyHistoryEntry(entry: HistoryEntry): HistoryEntry {
 }
 
 function materializeDocument(candidate: GraphDocument): GraphDocument {
+  const normalizedEdges = candidate.edges.map(normalizeEdgeStyle);
   const layout: LayoutSidecar = {
     version: candidate.layout.version,
     viewport: { ...candidate.layout.viewport },
@@ -477,13 +585,14 @@ function materializeDocument(candidate: GraphDocument): GraphDocument {
   const source = serializeMermaidDocument(
     candidate.direction,
     candidate.nodes,
-    candidate.edges,
+    normalizedEdges,
     candidate.subgraphs,
     candidate.unsupportedLines,
   );
 
   return {
     ...candidate,
+    edges: normalizedEdges,
     layout,
     source,
   };
@@ -564,6 +673,219 @@ function resizeNodeToContent(node: GraphNode, content: string) {
   };
 }
 
+function getShortcutNodePlacement(
+  node: GraphNode,
+  direction: Direction,
+  relation: 'linked' | 'sibling',
+) {
+  const gapX = 96;
+  const gapY = 84;
+
+  if (relation === 'linked') {
+    switch (direction) {
+      case 'LR':
+        return { x: node.x + node.width + gapX, y: node.y };
+      case 'RL':
+        return { x: node.x - node.width - gapX, y: node.y };
+      case 'BT':
+        return { x: node.x, y: node.y - node.height - gapY };
+      case 'TD':
+      default:
+        return { x: node.x, y: node.y + node.height + gapY };
+    }
+  }
+
+  switch (direction) {
+    case 'LR':
+    case 'RL':
+      return { x: node.x, y: node.y + node.height + gapY };
+    case 'BT':
+    case 'TD':
+    default:
+      return { x: node.x + node.width + gapX, y: node.y };
+  }
+}
+
+function sideFromAnchor(anchor: { dirX: number; dirY: number }) {
+  if (anchor.dirX > 0) {
+    return 'right';
+  }
+  if (anchor.dirX < 0) {
+    return 'left';
+  }
+  if (anchor.dirY > 0) {
+    return 'bottom';
+  }
+  return 'top';
+}
+
+function normalFromAnchor(anchor: { dirX: number; dirY: number }) {
+  return anchor.dirX !== 0 ? { x: 0, y: 1 } : { x: 1, y: 0 };
+}
+
+function cubicPoint(start: Point, controlA: Point, controlB: Point, end: Point, t: number) {
+  const mt = 1 - t;
+  return {
+    x:
+      mt ** 3 * start.x +
+      3 * mt ** 2 * t * controlA.x +
+      3 * mt * t ** 2 * controlB.x +
+      t ** 3 * end.x,
+    y:
+      mt ** 3 * start.y +
+      3 * mt ** 2 * t * controlA.y +
+      3 * mt * t ** 2 * controlB.y +
+      t ** 3 * end.y,
+  };
+}
+
+function expandRect(rect: Rect, padding: number): Rect {
+  return {
+    x: rect.x - padding,
+    y: rect.y - padding,
+    width: rect.width + padding * 2,
+    height: rect.height + padding * 2,
+  };
+}
+
+function rectsIntersect(left: Rect, right: Rect) {
+  return !(
+    left.x + left.width <= right.x ||
+    left.x >= right.x + right.width ||
+    left.y + left.height <= right.y ||
+    left.y >= right.y + right.height
+  );
+}
+
+function normalizeVector(vector: Point) {
+  const length = Math.hypot(vector.x, vector.y);
+  if (length < 0.001) {
+    return { x: 1, y: 0 };
+  }
+
+  return {
+    x: vector.x / length,
+    y: vector.y / length,
+  };
+}
+
+function withAlpha(color: string, alpha: number) {
+  const normalizedAlpha = clamp(alpha, 0, 1);
+  const hex = color.trim();
+  const shortMatch = hex.match(/^#([\da-f]{3})$/i);
+  if (shortMatch) {
+    const [r, g, b] = shortMatch[1].split('').map((value) => Number.parseInt(value + value, 16));
+    return `rgba(${r}, ${g}, ${b}, ${normalizedAlpha})`;
+  }
+
+  const longMatch = hex.match(/^#([\da-f]{6})$/i);
+  if (longMatch) {
+    const raw = longMatch[1];
+    const r = Number.parseInt(raw.slice(0, 2), 16);
+    const g = Number.parseInt(raw.slice(2, 4), 16);
+    const b = Number.parseInt(raw.slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${normalizedAlpha})`;
+  }
+
+  if (hex.startsWith('rgb(')) {
+    return hex.replace(/^rgb\((.+)\)$/i, `rgba($1, ${normalizedAlpha})`);
+  }
+
+  if (hex.startsWith('rgba(')) {
+    return hex.replace(/^rgba\((.+),\s*[\d.]+\)$/i, `rgba($1, ${normalizedAlpha})`);
+  }
+
+  return color;
+}
+
+function getNodeRectAt(
+  node: Pick<GraphNode, 'width' | 'height'>,
+  point: Point,
+): Rect {
+  return {
+    x: point.x,
+    y: point.y,
+    width: node.width,
+    height: node.height,
+  };
+}
+
+function getSubgraphAncestryIds(
+  subgraphId: string | null | undefined,
+  lookup: Map<string, GraphSubgraph>,
+) {
+  const ids = new Set<string>();
+  let current = subgraphId ?? null;
+
+  while (current) {
+    ids.add(current);
+    current = lookup.get(current)?.parentId ?? null;
+  }
+
+  return ids;
+}
+
+function buildEdgeEndpointOffsetMap(edges: GraphEdge[], endpoints: EdgeEndpointBox[]) {
+  const endpointMap = new Map(endpoints.map((endpoint) => [endpoint.id, endpoint]));
+  const groups = new Map<string, Array<{ edgeId: string; end: 'from' | 'to'; angle: number }>>();
+  const offsets = new Map<string, { from: number; to: number }>();
+
+  for (const edge of edges) {
+    const fromEndpoint = endpointMap.get(edge.from);
+    const toEndpoint = endpointMap.get(edge.to);
+    if (!fromEndpoint || !toEndpoint) {
+      continue;
+    }
+
+    const fromCenter = getNodeCenter(fromEndpoint);
+    const toCenter = getNodeCenter(toEndpoint);
+    const fromAnchor = getNodeAnchor(fromEndpoint, toCenter);
+    const toAnchor = getNodeAnchor(toEndpoint, fromCenter);
+    const fromKey = `${edge.from}:${sideFromAnchor(fromAnchor)}`;
+    const toKey = `${edge.to}:${sideFromAnchor(toAnchor)}`;
+    const fromAngle = Math.atan2(toCenter.y - fromCenter.y, toCenter.x - fromCenter.x);
+    const toAngle = Math.atan2(fromCenter.y - toCenter.y, fromCenter.x - toCenter.x);
+
+    groups.set(fromKey, [...(groups.get(fromKey) ?? []), { edgeId: edge.id, end: 'from', angle: fromAngle }]);
+    groups.set(toKey, [...(groups.get(toKey) ?? []), { edgeId: edge.id, end: 'to', angle: toAngle }]);
+    offsets.set(edge.id, { from: 0, to: 0 });
+  }
+
+  groups.forEach((entries) => {
+    const sorted = [...entries].sort((left, right) => left.angle - right.angle);
+    sorted.forEach((entry, index) => {
+      const current = offsets.get(entry.edgeId);
+      if (!current) {
+        return;
+      }
+
+      const nextOffset = (index - (sorted.length - 1) / 2) * 12;
+      current[entry.end] = nextOffset;
+      offsets.set(entry.edgeId, current);
+    });
+  });
+
+  return offsets;
+}
+
+function buildSelectionBounds(nodes: GraphNode[]) {
+  if (nodes.length === 0) {
+    return null;
+  }
+
+  const minX = Math.min(...nodes.map((node) => node.x));
+  const minY = Math.min(...nodes.map((node) => node.y));
+  const maxX = Math.max(...nodes.map((node) => node.x + node.width));
+  const maxY = Math.max(...nodes.map((node) => node.y + node.height));
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
 function getNodeCenter(node: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>) {
   return {
     x: node.x + node.width / 2,
@@ -597,65 +919,215 @@ function getNodeAnchor(
 function buildEdgeGeometry(
   fromNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
   toNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
+  laneOffset = 0,
+  endpointOffsets: { from: number; to: number } = { from: 0, to: 0 },
 ) {
-  const stubLength = 26;
   const endInset = 10;
   const fromAnchor = getNodeAnchor(fromNode, getNodeCenter(toNode));
   const toAnchor = getNodeAnchor(toNode, getNodeCenter(fromNode));
+  const fromCenter = getNodeCenter(fromNode);
+  const toCenter = getNodeCenter(toNode);
+  const deltaX = toCenter.x - fromCenter.x;
+  const deltaY = toCenter.y - fromCenter.y;
+  const distance = Math.max(1, Math.hypot(deltaX, deltaY));
+  const centerNormal = {
+    x: -deltaY / distance,
+    y: deltaX / distance,
+  };
+  const fromNormal = normalFromAnchor(fromAnchor);
+  const toNormal = normalFromAnchor(toAnchor);
+  const handleLength = Math.max(32, Math.min(78, distance * 0.28));
   const start = {
-    x: fromAnchor.x + fromAnchor.dirX * endInset,
-    y: fromAnchor.y + fromAnchor.dirY * endInset,
+    x: fromAnchor.x + fromAnchor.dirX * endInset + fromNormal.x * endpointOffsets.from,
+    y: fromAnchor.y + fromAnchor.dirY * endInset + fromNormal.y * endpointOffsets.from,
   };
   const end = {
-    x: toAnchor.x + toAnchor.dirX * endInset,
-    y: toAnchor.y + toAnchor.dirY * endInset,
+    x: toAnchor.x + toAnchor.dirX * endInset + toNormal.x * endpointOffsets.to,
+    y: toAnchor.y + toAnchor.dirY * endInset + toNormal.y * endpointOffsets.to,
   };
-  const startOuter = {
-    x: fromAnchor.x + fromAnchor.dirX * stubLength,
-    y: fromAnchor.y + fromAnchor.dirY * stubLength,
+  const laneInfluence = laneOffset * 0.52;
+  const controlA = {
+    x:
+      start.x +
+      fromAnchor.dirX * handleLength +
+      fromNormal.x * endpointOffsets.from * 0.48 +
+      centerNormal.x * laneInfluence,
+    y:
+      start.y +
+      fromAnchor.dirY * handleLength +
+      fromNormal.y * endpointOffsets.from * 0.48 +
+      centerNormal.y * laneInfluence,
   };
-  const endOuter = {
-    x: toAnchor.x + toAnchor.dirX * stubLength,
-    y: toAnchor.y + toAnchor.dirY * stubLength,
+  const controlB = {
+    x:
+      end.x +
+      toAnchor.dirX * handleLength +
+      toNormal.x * endpointOffsets.to * 0.48 +
+      centerNormal.x * laneInfluence,
+    y:
+      end.y +
+      toAnchor.dirY * handleLength +
+      toNormal.y * endpointOffsets.to * 0.48 +
+      centerNormal.y * laneInfluence,
   };
-  const controlA =
-    fromAnchor.dirX !== 0
-      ? { x: (startOuter.x + endOuter.x) / 2, y: startOuter.y }
-      : { x: startOuter.x, y: (startOuter.y + endOuter.y) / 2 };
-  const controlB =
-    toAnchor.dirX !== 0
-      ? { x: (startOuter.x + endOuter.x) / 2, y: endOuter.y }
-      : { x: endOuter.x, y: (startOuter.y + endOuter.y) / 2 };
-  const mid = {
-    x: (startOuter.x + endOuter.x) / 2,
-    y: (startOuter.y + endOuter.y) / 2,
-  };
+  const mid = cubicPoint(start, controlA, controlB, end, 0.5);
+  const label = cubicPoint(start, controlA, controlB, end, 0.68);
 
   return {
-    path: `M ${start.x} ${start.y} L ${startOuter.x} ${startOuter.y} C ${controlA.x} ${controlA.y}, ${controlB.x} ${controlB.y}, ${endOuter.x} ${endOuter.y} L ${end.x} ${end.y}`,
+    path: `M ${start.x} ${start.y} C ${controlA.x} ${controlA.y}, ${controlB.x} ${controlB.y}, ${end.x} ${end.y}`,
     mid,
+    label,
+    start,
+    controlA,
+    controlB,
+    end,
   };
 }
 
-function buildPreviewEdgePath(
-  fromNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
-  currentPoint: Point,
+function buildEdgeLaneMap(edges: GraphEdge[]) {
+  const groups = new Map<string, GraphEdge[]>();
+
+  edges.forEach((edge) => {
+    const key = [edge.from, edge.to].sort().join('::');
+    const current = groups.get(key) ?? [];
+    current.push(edge);
+    groups.set(key, current);
+  });
+
+  const laneMap = new Map<string, number>();
+  groups.forEach((group) => {
+    const sorted = [...group].sort((left, right) =>
+      `${left.from}:${left.to}:${left.id}`.localeCompare(`${right.from}:${right.to}:${right.id}`),
+    );
+    const hasReciprocal = sorted.some((edge) =>
+      sorted.some((candidate) =>
+        candidate.id !== edge.id &&
+        candidate.from === edge.to &&
+        candidate.to === edge.from,
+      ),
+    );
+    const spacing = hasReciprocal ? 34 : 22;
+    sorted.forEach((edge, index) => {
+      laneMap.set(edge.id, (index - (sorted.length - 1) / 2) * spacing);
+    });
+  });
+
+  return laneMap;
+}
+
+function sampleCubic(
+  start: Point,
+  controlA: Point,
+  controlB: Point,
+  end: Point,
+  steps = 14,
 ) {
-  const startAnchor = getNodeAnchor(fromNode, currentPoint);
+  const points: Point[] = [];
+  for (let index = 0; index <= steps; index += 1) {
+    const t = index / steps;
+    const mt = 1 - t;
+    points.push({
+      x:
+        mt ** 3 * start.x +
+        3 * mt ** 2 * t * controlA.x +
+        3 * mt * t ** 2 * controlB.x +
+        t ** 3 * end.x,
+      y:
+        mt ** 3 * start.y +
+        3 * mt ** 2 * t * controlA.y +
+        3 * mt * t ** 2 * controlB.y +
+        t ** 3 * end.y,
+    });
+  }
+  return points;
+}
+
+function pointInRect(point: Point, rect: { x: number; y: number; width: number; height: number }, padding = 0) {
+  return (
+    point.x >= rect.x - padding &&
+    point.x <= rect.x + rect.width + padding &&
+    point.y >= rect.y - padding &&
+    point.y <= rect.y + rect.height + padding
+  );
+}
+
+function edgeIntersectsRect(
+  rect: { x: number; y: number; width: number; height: number },
+  geometry: ReturnType<typeof buildEdgeGeometry>,
+) {
+  const cubicPoints = sampleCubic(geometry.start, geometry.controlA, geometry.controlB, geometry.end);
+  const samples = [geometry.start, ...cubicPoints, geometry.end];
+  return samples.some((point) => pointInRect(point, rect, 10));
+}
+
+function buildPreviewEdgePath(
+  fromNode: Pick<EdgeEndpointBox, 'x' | 'y' | 'width' | 'height'>,
+  currentPoint: Point,
+  handleSide?: 'left' | 'right',
+) {
+  const center = getNodeCenter(fromNode);
+  const startAnchor = handleSide
+    ? {
+      x: handleSide === 'left' ? fromNode.x : fromNode.x + fromNode.width,
+      y: center.y,
+      dirX: handleSide === 'left' ? -1 : 1,
+      dirY: 0,
+    }
+    : getNodeAnchor(fromNode, currentPoint);
+  const deltaX = currentPoint.x - startAnchor.x;
+  const deltaY = currentPoint.y - startAnchor.y;
+  const distance = Math.max(1, Math.hypot(deltaX, deltaY));
+  const handleLength = Math.max(26, Math.min(72, distance * 0.3));
   const start = {
     x: startAnchor.x + startAnchor.dirX * 10,
     y: startAnchor.y + startAnchor.dirY * 10,
   };
-  const startOuter = {
-    x: startAnchor.x + startAnchor.dirX * 26,
-    y: startAnchor.y + startAnchor.dirY * 26,
+  const controlA = {
+    x: start.x + startAnchor.dirX * handleLength,
+    y: start.y + startAnchor.dirY * handleLength,
   };
-  const control =
-    startAnchor.dirX !== 0
-      ? { x: (startOuter.x + currentPoint.x) / 2, y: startOuter.y }
-      : { x: startOuter.x, y: (startOuter.y + currentPoint.y) / 2 };
+  const controlB = {
+    x: currentPoint.x - deltaX * 0.22,
+    y: currentPoint.y - deltaY * 0.22,
+  };
 
-  return `M ${start.x} ${start.y} L ${startOuter.x} ${startOuter.y} Q ${control.x} ${control.y}, ${currentPoint.x} ${currentPoint.y}`;
+  return `M ${start.x} ${start.y} C ${controlA.x} ${controlA.y}, ${controlB.x} ${controlB.y}, ${currentPoint.x} ${currentPoint.y}`;
+}
+
+function duplicateNodesWithEdges(document: GraphDocument, sourceIds: string[], offset: Point) {
+  const ids = new Set(sourceIds);
+  const nodeIdMap = new Map<string, string>();
+  const duplicatedNodes = document.nodes
+    .filter((node) => ids.has(node.id))
+    .map((node) => {
+      const nextId = nextNodeId([
+        ...document.nodes,
+        ...Array.from(nodeIdMap.values()).map((id) =>
+          buildNode(id, id, { x: 0, y: 0 }, null),
+        ),
+      ]);
+      nodeIdMap.set(node.id, nextId);
+      return {
+        ...resizeNodeToContent(node, `${node.label} 副本`),
+        id: nextId,
+        x: node.x + offset.x,
+        y: node.y + offset.y,
+      };
+    });
+
+  const duplicatedEdges = document.edges
+    .filter((edge) => ids.has(edge.from) && ids.has(edge.to))
+    .map((edge) => ({
+      ...edge,
+      id: crypto.randomUUID(),
+      from: nodeIdMap.get(edge.from) ?? edge.from,
+      to: nodeIdMap.get(edge.to) ?? edge.to,
+    }));
+
+  return {
+    duplicatedNodes,
+    duplicatedEdges,
+  };
 }
 
 function selectionContains(selection: SelectionState, id: string) {
@@ -669,6 +1141,25 @@ function rectFromPoints(left: Point, right: Point) {
     width: Math.abs(left.x - right.x),
     height: Math.abs(left.y - right.y),
   };
+}
+
+function handleNativeSelectAllShortcut(
+  event:
+    | React.KeyboardEvent<HTMLTextAreaElement>
+    | React.KeyboardEvent<HTMLInputElement>,
+) {
+  if (!((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a')) {
+    return false;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  const target = event.currentTarget;
+  window.requestAnimationFrame(() => {
+    target.selectionStart = 0;
+    target.selectionEnd = target.value.length;
+  });
+  return true;
 }
 
 function intersects(rect: { x: number; y: number; width: number; height: number }, node: GraphNode) {
@@ -761,6 +1252,125 @@ function countNodesInSubgraph(
   return nodes.filter((node) => belongsToSubgraph(node, subgraphId, lookup)).length;
 }
 
+function getTopVisibleCollapsedAncestorId(
+  subgraphId: string | null | undefined,
+  lookup: Map<string, GraphSubgraph>,
+) {
+  let current = subgraphId ?? null;
+  let visibleCollapsed: string | null = null;
+
+  while (current) {
+    const owner = lookup.get(current);
+    if (!owner) {
+      break;
+    }
+
+    if (owner.collapsed) {
+      visibleCollapsed = owner.id;
+    }
+
+    current = owner.parentId;
+  }
+
+  return visibleCollapsed;
+}
+
+function isSubgraphHiddenByCollapsedAncestor(
+  subgraph: GraphSubgraph,
+  lookup: Map<string, GraphSubgraph>,
+) {
+  let current = subgraph.parentId;
+  while (current) {
+    const owner = lookup.get(current);
+    if (!owner) {
+      return false;
+    }
+
+    if (owner.collapsed) {
+      return true;
+    }
+
+    current = owner.parentId;
+  }
+
+  return false;
+}
+
+function estimateCollapsedSummaryLayout(labels: string[]) {
+  const maxWidth = 220;
+  let rowWidth = 0;
+  let maxRowWidth = 0;
+  let rows = labels.length > 0 ? 1 : 0;
+
+  labels.forEach((label) => {
+    const normalized = label.trim().split(/\r?\n/)[0] ?? '';
+    const units = Array.from(normalized).reduce((total, char) => total + (char.charCodeAt(0) > 255 ? 1.9 : 1), 0);
+    const chipWidth = clamp(44 + units * 8, 74, 156);
+    if (rowWidth > 0 && rowWidth + chipWidth + 8 > maxWidth) {
+      rows += 1;
+      maxRowWidth = Math.max(maxRowWidth, rowWidth);
+      rowWidth = chipWidth;
+    } else {
+      rowWidth = rowWidth === 0 ? chipWidth : rowWidth + chipWidth + 8;
+    }
+  });
+
+  maxRowWidth = Math.max(maxRowWidth, rowWidth, 164);
+
+  return {
+    rows,
+    width: clamp(maxRowWidth + 28, SUBGRAPH_COLLAPSED_MIN_WIDTH, 276),
+    height: SUBGRAPH_HEADER_HEIGHT + 18 + rows * 28 + (rows > 0 ? 18 : 8),
+  };
+}
+
+function resolveVisibleEndpointId(
+  endpointId: string,
+  nodes: GraphNode[],
+  subgraphs: GraphSubgraph[],
+) {
+  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+  const subgraphLookup = new Map(subgraphs.map((subgraph) => [subgraph.id, subgraph]));
+  const node = nodeMap.get(endpointId);
+  if (node) {
+    return getTopVisibleCollapsedAncestorId(node.subgraphId, subgraphLookup) ?? node.id;
+  }
+
+  const subgraph = subgraphLookup.get(endpointId);
+  if (subgraph) {
+    return getTopVisibleCollapsedAncestorId(subgraph.id, subgraphLookup) ?? subgraph.id;
+  }
+
+  return endpointId;
+}
+
+function collectNodeIdsForSubgraph(
+  subgraphId: string,
+  nodes: GraphNode[],
+  lookup: Map<string, GraphSubgraph>,
+) {
+  return nodes
+    .filter((node) => belongsToSubgraph(node, subgraphId, lookup))
+    .map((node) => node.id);
+}
+
+function removeSubgraphs(current: GraphDocument, rootIds: string[]) {
+  const deletedSubgraphIds = collectDescendantSubgraphIds(rootIds, current.subgraphs);
+
+  return {
+    ...current,
+    subgraphs: current.subgraphs.filter((subgraph) => !deletedSubgraphIds.has(subgraph.id)),
+    edges: current.edges.filter(
+      (edge) => !deletedSubgraphIds.has(edge.from) && !deletedSubgraphIds.has(edge.to),
+    ),
+    nodes: current.nodes.map((node) =>
+      deletedSubgraphIds.has(node.subgraphId ?? '')
+        ? { ...node, subgraphId: null }
+        : node,
+    ),
+  };
+}
+
 function toMarkdownDocument(source: string) {
   return `\`\`\`mermaid\n${source}\n\`\`\`\n`;
 }
@@ -806,33 +1416,352 @@ function getSubgraphDepth(subgraph: GraphSubgraph, lookup: Map<string, GraphSubg
   return depth;
 }
 
-function buildSubgraphFrames(document: GraphDocument, visibleNodes: GraphNode[]) {
+function buildSubgraphFrames(document: GraphDocument, nodes: GraphNode[]) {
   const frames: SubgraphFrame[] = [];
   const lookup = getVisibleSubgraphIds(document.subgraphs);
 
   for (const subgraph of document.subgraphs) {
-    const members = visibleNodes.filter((node) => belongsToSubgraph(node, subgraph.id, lookup));
-    if (members.length === 0) {
+    if (isSubgraphHiddenByCollapsedAncestor(subgraph, lookup)) {
       continue;
     }
 
-    const minX = Math.min(...members.map((node) => node.x)) - 36;
-    const minY = Math.min(...members.map((node) => node.y)) - 48;
-    const maxX = Math.max(...members.map((node) => node.x + node.width)) + 36;
-    const maxY = Math.max(...members.map((node) => node.y + node.height)) + 36;
+    const members = nodes.filter((node) => belongsToSubgraph(node, subgraph.id, lookup));
+    const memberCount = members.length;
+    const summaryLabels = members
+      .map((node) => node.label.trim())
+      .filter(Boolean)
+      .slice(0, 5);
+    if (memberCount === 0) {
+      const offset = getSubgraphDepth(subgraph, lookup) * 28;
+      frames.push({
+        id: subgraph.id,
+        x: 160 + offset,
+        y: 120 + offset,
+        width: subgraph.collapsed ? SUBGRAPH_COLLAPSED_MIN_WIDTH : SUBGRAPH_MIN_WIDTH,
+        height: subgraph.collapsed ? SUBGRAPH_COLLAPSED_HEIGHT : SUBGRAPH_MIN_HEIGHT,
+        depth: getSubgraphDepth(subgraph, lookup),
+        collapsed: subgraph.collapsed,
+        headerHeight: SUBGRAPH_HEADER_HEIGHT,
+        memberCount,
+        summaryLabels,
+      });
+      continue;
+    }
+
+    const minX = Math.min(...members.map((node) => node.x)) - SUBGRAPH_HORIZONTAL_PADDING;
+    const minY = Math.min(...members.map((node) => node.y)) - SUBGRAPH_TOP_PADDING - SUBGRAPH_HEADER_HEIGHT;
+    const maxX = Math.max(...members.map((node) => node.x + node.width)) + SUBGRAPH_HORIZONTAL_PADDING;
+    const maxY = Math.max(...members.map((node) => node.y + node.height)) + SUBGRAPH_BOTTOM_PADDING;
+    const collapsedSummary = estimateCollapsedSummaryLayout(summaryLabels);
 
     frames.push({
       id: subgraph.id,
       x: minX,
       y: minY,
-      width: Math.max(260, maxX - minX),
-      height: subgraph.collapsed ? 112 : Math.max(160, maxY - minY),
+      width: subgraph.collapsed
+        ? collapsedSummary.width
+        : Math.max(SUBGRAPH_MIN_WIDTH, maxX - minX),
+      height: subgraph.collapsed
+        ? Math.max(SUBGRAPH_COLLAPSED_HEIGHT, collapsedSummary.height)
+        : Math.max(SUBGRAPH_MIN_HEIGHT, maxY - minY),
       depth: getSubgraphDepth(subgraph, lookup),
       collapsed: subgraph.collapsed,
+      headerHeight: SUBGRAPH_HEADER_HEIGHT,
+      memberCount,
+      summaryLabels,
     });
   }
 
   return frames;
+}
+
+function applyDragPreview(nodes: GraphNode[], dragState: DragState | null) {
+  if (!dragState) {
+    return nodes;
+  }
+
+  const deltaX = dragState.current.x - dragState.origin.x;
+  const deltaY = dragState.current.y - dragState.origin.y;
+
+  return nodes.map((node) => {
+    const initial = dragState.initialPositions[node.id];
+    if (!initial) {
+      return node;
+    }
+
+    return {
+      ...node,
+      x: Math.round(initial.x + deltaX),
+      y: Math.round(initial.y + deltaY),
+    };
+  });
+}
+
+function findSubgraphDropTarget(
+  frames: SubgraphFrame[],
+  point: Point,
+  excludedIds: string[] = [],
+) {
+  const excluded = new Set(excludedIds);
+
+  return [...frames]
+    .filter((frame) => !excluded.has(frame.id))
+    .filter((frame) =>
+      pointInRect(point, {
+        x: frame.x + 10,
+        y: frame.y + frame.headerHeight - 2,
+        width: frame.width - 20,
+        height: Math.max(frame.height - frame.headerHeight + 4, 24),
+      }),
+    )
+    .sort((left, right) => {
+      if (left.depth !== right.depth) {
+        return right.depth - left.depth;
+      }
+
+      return left.width * left.height - right.width * right.height;
+    })[0]?.id ?? null;
+}
+
+function buildCollisionObstacles(
+  document: GraphDocument,
+  nodes: GraphNode[],
+  ignoredNodeIds: Set<string>,
+  excludedSubgraphIds: Set<string>,
+) {
+  const nodeRects = nodes
+    .filter((node) => !ignoredNodeIds.has(node.id))
+    .map((node) => expandRect({ x: node.x, y: node.y, width: node.width, height: node.height }, 20));
+  const subgraphRects = buildSubgraphFrames(document, nodes)
+    .filter((frame) => !excludedSubgraphIds.has(frame.id))
+    .map((frame) => expandRect({ x: frame.x, y: frame.y, width: frame.width, height: frame.height }, 10));
+
+  return [...nodeRects, ...subgraphRects];
+}
+
+function searchFreeRect(
+  desired: Rect,
+  obstacles: Rect[],
+  directionHint: Point,
+  bounds?: Rect | null,
+) {
+  const direction = normalizeVector(directionHint);
+  const perpendicular = { x: -direction.y, y: direction.x };
+
+  const fits = (rect: Rect) => {
+    if (bounds) {
+      const withinBounds =
+        rect.x >= bounds.x &&
+        rect.y >= bounds.y &&
+        rect.x + rect.width <= bounds.x + bounds.width &&
+        rect.y + rect.height <= bounds.y + bounds.height;
+
+      if (!withinBounds) {
+        return false;
+      }
+    }
+
+    return obstacles.every((obstacle) => !rectsIntersect(rect, obstacle));
+  };
+
+  if (fits(desired)) {
+    return desired;
+  }
+
+  for (let step = 1; step <= 64; step += 1) {
+    const travel = step * 18;
+    const fan = Math.ceil(step / 2) * 12;
+    const candidates = [
+      { x: desired.x + direction.x * travel, y: desired.y + direction.y * travel },
+      { x: desired.x + direction.x * travel + perpendicular.x * fan, y: desired.y + direction.y * travel + perpendicular.y * fan },
+      { x: desired.x + direction.x * travel - perpendicular.x * fan, y: desired.y + direction.y * travel - perpendicular.y * fan },
+      { x: desired.x + perpendicular.x * travel, y: desired.y + perpendicular.y * travel },
+      { x: desired.x - perpendicular.x * travel, y: desired.y - perpendicular.y * travel },
+    ];
+
+    for (const candidate of candidates) {
+      const rect = { ...desired, x: Math.round(candidate.x), y: Math.round(candidate.y) };
+      if (fits(rect)) {
+        return rect;
+      }
+    }
+  }
+
+  return desired;
+}
+
+function compactDocumentNodes(document: GraphDocument) {
+  const primaryIsVertical = document.direction === 'TD' || document.direction === 'BT';
+  const clusterThreshold = primaryIsVertical ? 230 : 180;
+  const preferredTrackGap = primaryIsVertical ? 108 : 96;
+  const minTrackGap = primaryIsVertical ? 72 : 64;
+  const preferredPrimaryGap = primaryIsVertical ? 84 : 96;
+  const minPrimaryGap = primaryIsVertical ? 52 : 58;
+  const orderedNodes = [...document.nodes].sort((left, right) => {
+    const leftMinor = primaryIsVertical ? left.x : left.y;
+    const rightMinor = primaryIsVertical ? right.x : right.y;
+    if (leftMinor !== rightMinor) {
+      return leftMinor - rightMinor;
+    }
+
+    const leftPrimary = primaryIsVertical ? left.y : left.x;
+    const rightPrimary = primaryIsVertical ? right.y : right.x;
+    return leftPrimary - rightPrimary;
+  });
+  const tracks: Array<{ axis: number; nodes: GraphNode[] }> = [];
+
+  orderedNodes.forEach((node) => {
+    const axis = primaryIsVertical ? node.x : node.y;
+    const track = tracks.find((entry) => Math.abs(entry.axis - axis) <= clusterThreshold);
+    if (track) {
+      track.nodes.push(node);
+      track.axis = (track.axis * (track.nodes.length - 1) + axis) / track.nodes.length;
+      return;
+    }
+
+    tracks.push({ axis, nodes: [node] });
+  });
+
+  tracks.sort((left, right) => left.axis - right.axis);
+  const nextPositions = new Map<string, Point>();
+  let previousTrackEnd: number | null = null;
+
+  tracks.forEach((track, trackIndex) => {
+    const sortedTrackNodes = [...track.nodes].sort((left, right) => {
+      const leftPrimary = primaryIsVertical ? left.y : left.x;
+      const rightPrimary = primaryIsVertical ? right.y : right.x;
+      return leftPrimary - rightPrimary;
+    });
+    const trackMin = Math.min(...sortedTrackNodes.map((node) => primaryIsVertical ? node.x : node.y));
+    const trackMax = Math.max(...sortedTrackNodes.map((node) => primaryIsVertical ? node.x + node.width : node.y + node.height));
+    let trackShift = 0;
+
+    if (trackIndex > 0 && previousTrackEnd !== null) {
+      const currentGap = trackMin - previousTrackEnd;
+      if (currentGap > preferredTrackGap) {
+        trackShift = -(currentGap - preferredTrackGap);
+      } else if (currentGap < minTrackGap) {
+        trackShift = minTrackGap - currentGap;
+      }
+    }
+
+    let previousPlacedEnd: number | null = null;
+
+    sortedTrackNodes.forEach((node) => {
+      const originalMinor = primaryIsVertical ? node.x : node.y;
+      const originalPrimary = primaryIsVertical ? node.y : node.x;
+      let nextPrimary = originalPrimary;
+
+      if (previousPlacedEnd !== null) {
+        const preferredPrimary = previousPlacedEnd + preferredPrimaryGap;
+        const minimumPrimary = previousPlacedEnd + minPrimaryGap;
+        if (nextPrimary > preferredPrimary) {
+          nextPrimary = preferredPrimary;
+        }
+        if (nextPrimary < minimumPrimary) {
+          nextPrimary = minimumPrimary;
+        }
+      }
+
+      const nextMinor = originalMinor + trackShift;
+      nextPositions.set(
+        node.id,
+        primaryIsVertical
+          ? { x: Math.round(nextMinor), y: Math.round(nextPrimary) }
+          : { x: Math.round(nextPrimary), y: Math.round(nextMinor) },
+      );
+      previousPlacedEnd = nextPrimary + (primaryIsVertical ? node.height : node.width);
+    });
+
+    previousTrackEnd = trackMax + trackShift;
+  });
+
+  return document.nodes.map((node) => {
+    const nextPosition = nextPositions.get(node.id);
+    return nextPosition
+      ? { ...node, x: Math.round(nextPosition.x), y: Math.round(nextPosition.y) }
+      : node;
+  });
+}
+
+function resolveDraggedNodeCollision(
+  document: GraphDocument,
+  movedNodeIds: string[],
+  desiredNodes: GraphNode[],
+  subgraphLookup: Map<string, GraphSubgraph>,
+  targetSubgraphId: string | null,
+) {
+  if (movedNodeIds.length === 0 || desiredNodes.length === 0) {
+    return desiredNodes;
+  }
+
+  const movedSet = new Set(movedNodeIds);
+  const desiredSelectionNodes = desiredNodes.filter((node) => movedSet.has(node.id));
+  const selectionBounds = buildSelectionBounds(desiredSelectionNodes);
+  if (!selectionBounds) {
+    return desiredNodes;
+  }
+
+  const excludedSubgraphIds = new Set<string>();
+  desiredSelectionNodes.forEach((node) => {
+    const ancestry = getSubgraphAncestryIds(node.subgraphId, subgraphLookup);
+    ancestry.forEach((id) => excludedSubgraphIds.add(id));
+  });
+
+  if (targetSubgraphId) {
+    const ancestry = getSubgraphAncestryIds(targetSubgraphId, subgraphLookup);
+    ancestry.forEach((id) => excludedSubgraphIds.add(id));
+  }
+
+  const desiredDocument = {
+    ...document,
+    nodes: desiredNodes,
+  };
+  const obstacles = buildCollisionObstacles(
+    desiredDocument,
+    desiredNodes,
+    movedSet,
+    excludedSubgraphIds,
+  );
+  const previousSelectionNodes = document.nodes.filter((node) => movedSet.has(node.id));
+  const previousBounds = buildSelectionBounds(previousSelectionNodes) ?? selectionBounds;
+  const directionHint = {
+    x: selectionBounds.x - previousBounds.x,
+    y: selectionBounds.y - previousBounds.y,
+  };
+  const targetFrame = targetSubgraphId
+    ? buildSubgraphFrames(desiredDocument, desiredNodes).find((frame) => frame.id === targetSubgraphId) ?? null
+    : null;
+  const bounds = targetFrame
+    ? {
+        x: targetFrame.x + 18,
+        y: targetFrame.y + targetFrame.headerHeight + 10,
+        width: Math.max(80, targetFrame.width - 36),
+        height: Math.max(80, targetFrame.height - targetFrame.headerHeight - 22),
+      }
+    : null;
+  const resolvedRect = searchFreeRect(
+    selectionBounds,
+    obstacles,
+    directionHint,
+    bounds,
+  );
+  const offsetX = resolvedRect.x - selectionBounds.x;
+  const offsetY = resolvedRect.y - selectionBounds.y;
+
+  if (Math.abs(offsetX) < 0.5 && Math.abs(offsetY) < 0.5) {
+    return desiredNodes;
+  }
+
+  return desiredNodes.map((node) =>
+    movedSet.has(node.id)
+      ? {
+          ...node,
+          x: Math.round(node.x + offsetX),
+          y: Math.round(node.y + offsetY),
+        }
+      : node,
+  );
 }
 
 function buildGraphTreeItems(
@@ -1020,19 +1949,46 @@ export default function App() {
   const [canvasHovered, setCanvasHovered] = useState(false);
   const [selection, setSelection] = useState<SelectionState>({ kind: 'none', ids: [] });
   const [history, setHistory] = useState<HistoryEntry[]>(initialWorkspace.history);
+  const [, setUndoStack] = useState<GraphDocument[]>([]);
+  const [, setRedoStack] = useState<GraphDocument[]>([]);
   const [sourceDraft, setSourceDraft] = useState(initialWorkspace.document.source);
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved');
   const [searchQuery, setSearchQuery] = useState('');
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  const [nodeInspectorDraft, setNodeInspectorDraft] = useState<NodeInspectorDraft>({
+    label: '',
+    shape: 'rect',
+    fill: '#fff8ef',
+    stroke: '#24404f',
+    textColor: '#12212c',
+  });
+  const [edgeInspectorDraft, setEdgeInspectorDraft] = useState<EdgeInspectorDraft>({
+    label: '',
+    type: 'solid',
+    strokeColor: defaultEdgeStyle.strokeColor,
+    strokeWidthInput: String(defaultEdgeStyle.strokeWidth),
+  });
+  const [subgraphInspectorDraft, setSubgraphInspectorDraft] = useState<SubgraphInspectorDraft>({
+    title: '',
+    collapsed: false,
+  });
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [editingLabel, setEditingLabel] = useState('');
+  const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
+  const [editingEdgeLabel, setEditingEdgeLabel] = useState('');
+  const [editingSubgraphId, setEditingSubgraphId] = useState<string | null>(null);
+  const [editingSubgraphTitle, setEditingSubgraphTitle] = useState('');
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [dragTargetSubgraphId, setDragTargetSubgraphId] = useState<string | null>(null);
+  const [dragReparentMode, setDragReparentMode] = useState(false);
   const [boxState, setBoxState] = useState<BoxState | null>(null);
   const [panState, setPanState] = useState<PanState | null>(null);
   const [connectingState, setConnectingState] = useState<ConnectingState | null>(null);
   const [spacePressed, setSpacePressed] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
   const localFileHandlesRef = useRef<Record<string, LocalProjectFileHandle>>({});
+  const documentRef = useRef(documentState);
+  const previousModeRef = useRef(mode);
   const gestureStateRef = useRef<GestureState | null>(null);
   const backgroundHoldRef = useRef<number | null>(null);
   const pendingBackgroundRef = useRef<{
@@ -1052,15 +2008,75 @@ export default function App() {
 
   const subgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
   const fullSubgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
-  const visibleNodes = documentState.nodes.filter(
+  const previewNodes = useMemo(
+    () => applyDragPreview(documentState.nodes, dragState),
+    [documentState.nodes, dragState],
+  );
+  const subgraphFrames = useMemo(
+    () => buildSubgraphFrames(documentState, previewNodes),
+    [documentState, previewNodes],
+  );
+  const visibleNodes = previewNodes.filter(
     (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
   );
-  const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
-  const visibleEdges = documentState.edges.filter(
-    (edge) => visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to),
+  const edgeEndpoints = useMemo<EdgeEndpointBox[]>(
+    () => [
+      ...visibleNodes.map((node) => ({
+        id: node.id,
+        kind: 'node' as const,
+        x: node.x,
+        y: node.y,
+        width: node.width,
+        height: node.height,
+      })),
+      ...subgraphFrames.map((frame) => ({
+        id: frame.id,
+        kind: 'subgraph' as const,
+        x: frame.x,
+        y: frame.y,
+        width: frame.width,
+        height: frame.height,
+      })),
+    ],
+    [subgraphFrames, visibleNodes],
   );
-  const subgraphFrames = buildSubgraphFrames(documentState, visibleNodes);
-  const allSubgraphFrames = buildSubgraphFrames(documentState, documentState.nodes);
+  const edgeEndpointMap = useMemo(
+    () => new Map(edgeEndpoints.map((endpoint) => [endpoint.id, endpoint])),
+    [edgeEndpoints],
+  );
+  const visibleEdgeEndpointIds = useMemo(
+    () => new Set(edgeEndpoints.map((endpoint) => endpoint.id)),
+    [edgeEndpoints],
+  );
+  const visibleEdges = useMemo(
+    () => documentState.edges.flatMap((edge) => {
+      const displayFrom = resolveVisibleEndpointId(edge.from, previewNodes, documentState.subgraphs);
+      const displayTo = resolveVisibleEndpointId(edge.to, previewNodes, documentState.subgraphs);
+      if (
+        !visibleEdgeEndpointIds.has(displayFrom) ||
+        !visibleEdgeEndpointIds.has(displayTo) ||
+        displayFrom === displayTo
+      ) {
+        return [];
+      }
+
+      return [{
+        ...edge,
+        from: displayFrom,
+        to: displayTo,
+      }];
+    }),
+    [documentState.edges, documentState.subgraphs, previewNodes, visibleEdgeEndpointIds],
+  );
+  const edgeLaneMap = useMemo(() => buildEdgeLaneMap(visibleEdges), [visibleEdges]);
+  const edgeEndpointOffsetMap = useMemo(
+    () => buildEdgeEndpointOffsetMap(visibleEdges, edgeEndpoints),
+    [edgeEndpoints, visibleEdges],
+  );
+  const allSubgraphFrames = useMemo(
+    () => buildSubgraphFrames(documentState, previewNodes),
+    [documentState, previewNodes],
+  );
   const allSubgraphFrameMap = useMemo(
     () => new Map(allSubgraphFrames.map((frame) => [frame.id, frame])),
     [allSubgraphFrames],
@@ -1145,18 +2161,60 @@ export default function App() {
     return activeItem?.path ?? '/Users/mac/Documents/projects/roadmap-studio/docs/diagram.md';
   }, [activeFileTab, localExplorerItems]);
   const activeProjectPath = activeWorkspaceSource === 'cloud' ? activeCloudPath : activeLocalPath;
+  const applyCommittedDocument = useCallback((
+    nextDocument: GraphDocument,
+    title: string,
+    detail: string,
+    previousDocument: GraphDocument = documentRef.current,
+  ) => {
+    setUndoStack((current) => [...current.slice(-39), structuredClone(previousDocument)]);
+    setRedoStack([]);
+    setSaveStatus('saving');
+    setDocumentState(nextDocument);
+    setSourceDraft(nextDocument.source);
+    setHistory((current) => [createHistoryEntry(title, detail), ...current].slice(0, 40));
+  }, []);
+
+  const restoreDocumentSnapshot = useCallback((
+    snapshot: GraphDocument,
+    title: string,
+    detail: string,
+  ) => {
+    setSaveStatus('saving');
+    setDocumentState(snapshot);
+    setSourceDraft(snapshot.source);
+    setHistory((current) => [createHistoryEntry(title, detail), ...current].slice(0, 40));
+  }, []);
 
   const commitDocument = useCallback((
     updater: (current: GraphDocument) => GraphDocument,
     title: string,
     detail: string,
   ) => {
-    const nextDocument = materializeDocument(updater(structuredClone(documentState)));
-    setSaveStatus('saving');
-    setDocumentState(nextDocument);
-    setSourceDraft(nextDocument.source);
-    setHistory((current) => [createHistoryEntry(title, detail), ...current].slice(0, 40));
-  }, [documentState]);
+    const currentDocument = structuredClone(documentRef.current);
+    const nextDocument = materializeDocument(updater(structuredClone(currentDocument)));
+    applyCommittedDocument(nextDocument, title, detail, currentDocument);
+  }, [applyCommittedDocument]);
+
+  const commitSourceDraft = useCallback(() => {
+    const currentDocument = structuredClone(documentRef.current);
+    if (sourceDraft === currentDocument.source) {
+      return;
+    }
+
+    try {
+      const parsed = parseMermaidDocument(sourceDraft, currentDocument.layout);
+      const nextDocument = syncDocument(parsed, sourceDraft);
+      applyCommittedDocument(
+        nextDocument,
+        '已更新源码',
+        '已在源码模式提交当前修改。',
+        currentDocument,
+      );
+    } catch {
+      setSaveStatus('error');
+    }
+  }, [applyCommittedDocument, sourceDraft]);
 
   const selectSingle = useCallback((kind: SelectionState['kind'], id: string) => {
     setSelection({ kind, ids: [id] });
@@ -1165,6 +2223,54 @@ export default function App() {
   const clearSelection = useCallback(() => {
     setSelection({ kind: 'none', ids: [] });
   }, []);
+
+  const startInlineEdit = useCallback((node: GraphNode) => {
+    setEditingNodeId(node.id);
+    setEditingLabel(node.label);
+    setSelection({ kind: 'node', ids: [node.id] });
+  }, []);
+
+  const commitInlineEdit = useCallback((nodeId: string) => {
+    commitDocument(
+      (current) => ({
+        ...current,
+        nodes: current.nodes.map((node) =>
+          node.id === nodeId
+            ? resizeNodeToContent(node, editingLabel.trim() || '未命名内容')
+            : node,
+        ),
+      }),
+      '已更新节点',
+      `已更新 ${nodeId} 的节点内容。`,
+    );
+
+    setEditingNodeId(null);
+    setEditingLabel('');
+  }, [commitDocument, editingLabel]);
+
+  const startEdgeInlineEdit = useCallback((edge: GraphEdge) => {
+    setEditingEdgeId(edge.id);
+    setEditingEdgeLabel(edge.label);
+    setSelection({ kind: 'edge', ids: [edge.id] });
+  }, []);
+
+  const commitEdgeInlineEdit = useCallback((edgeId: string) => {
+    commitDocument(
+      (current) => ({
+        ...current,
+        edges: current.edges.map((edge) =>
+          edge.id === edgeId
+            ? { ...edge, label: editingEdgeLabel }
+            : edge,
+        ),
+      }),
+      '已更新连线',
+      `已更新 ${edgeId} 的连线标签。`,
+    );
+
+    setEditingEdgeId(null);
+    setEditingEdgeLabel('');
+  }, [commitDocument, editingEdgeLabel]);
 
   const clearPendingBackgroundInteraction = useCallback(() => {
     if (backgroundHoldRef.current !== null) {
@@ -1302,8 +2408,30 @@ export default function App() {
         return;
       }
 
-      const fromNode = documentState.nodes.find((entry) => entry.id === edge.from) ?? null;
-      const toNode = documentState.nodes.find((entry) => entry.id === edge.to) ?? null;
+      const liveFrames = buildSubgraphFrames(documentState, documentState.nodes);
+      const liveEndpoints: EdgeEndpointBox[] = [
+        ...documentState.nodes.map((node) => ({
+          id: node.id,
+          kind: 'node' as const,
+          x: node.x,
+          y: node.y,
+          width: node.width,
+          height: node.height,
+        })),
+        ...liveFrames.map((frame) => ({
+          id: frame.id,
+          kind: 'subgraph' as const,
+          x: frame.x,
+          y: frame.y,
+          width: frame.width,
+          height: frame.height,
+        })),
+      ];
+      const liveEndpointMap = new Map<string, EdgeEndpointBox>(
+        liveEndpoints.map((entry) => [entry.id, entry] as const),
+      );
+      const fromNode = liveEndpointMap.get(edge.from) ?? null;
+      const toNode = liveEndpointMap.get(edge.to) ?? null;
       if (!fromNode || !toNode) {
         return;
       }
@@ -1329,8 +2457,7 @@ export default function App() {
     }
   }, [
     allSubgraphFrameMap,
-    documentState.edges,
-    documentState.nodes,
+    documentState,
     focusViewportOnRect,
     isMobileViewport,
     mode,
@@ -1350,7 +2477,7 @@ export default function App() {
     toggleInspector();
   }, [focusSelectionInViewport, inspectorOpen, mode, toggleInspector]);
 
-  function updateSelectedNode<K extends keyof GraphNode>(key: K, value: GraphNode[K]) {
+  const applyNodeInspectorDraft = useCallback((draft: NodeInspectorDraft = nodeInspectorDraft) => {
     if (selection.kind !== 'node' || selection.ids.length === 0) {
       return;
     }
@@ -1361,22 +2488,26 @@ export default function App() {
         ...current,
         nodes: current.nodes.map((node) =>
           ids.has(node.id)
-            ? key === 'label'
-              ? resizeNodeToContent(node, String(value))
-              : {
-                  ...node,
-                  [key]: value,
-                }
+            ? resizeNodeToContent(
+              {
+                ...node,
+                shape: draft.shape,
+                fill: draft.fill,
+                stroke: draft.stroke,
+                textColor: draft.textColor,
+              },
+              draft.label,
+            )
             : node,
         ),
       }),
       '已更新节点',
       `已更新 ${selection.ids.length} 个节点属性。`,
     );
-  }
+  }, [commitDocument, nodeInspectorDraft, selection.ids, selection.kind]);
 
-  function updateSelectedEdge<K extends keyof GraphEdge>(key: K, value: GraphEdge[K]) {
-    if (selection.kind !== 'edge' || selection.ids.length === 0) {
+  function applyNodeStylePreset(preset: (typeof nodeStylePresets)[number]) {
+    if (selection.kind !== 'node' || selection.ids.length === 0) {
       return;
     }
 
@@ -1384,11 +2515,40 @@ export default function App() {
     commitDocument(
       (current) => ({
         ...current,
+        nodes: current.nodes.map((node) =>
+          ids.has(node.id)
+            ? {
+                ...node,
+                fill: preset.fill,
+                stroke: preset.stroke,
+                textColor: preset.textColor,
+              }
+            : node,
+        ),
+      }),
+      '已更新节点',
+      `已套用 ${preset.label} 样式到 ${selection.ids.length} 个节点。`,
+    );
+  }
+
+  const applyEdgeInspectorDraft = useCallback((draft: EdgeInspectorDraft = edgeInspectorDraft) => {
+    if (selection.kind !== 'edge' || selection.ids.length === 0) {
+      return;
+    }
+
+    const strokeWidth = Number.parseFloat(draft.strokeWidthInput);
+    const ids = new Set(selection.ids);
+    commitDocument(
+      (current) => ({
+        ...current,
         edges: current.edges.map((edge) =>
           ids.has(edge.id)
             ? {
-                ...edge,
-                [key]: value,
+                ...normalizeEdgeStyle(edge),
+                label: draft.label,
+                type: draft.type,
+                strokeColor: draft.strokeColor,
+                strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : defaultEdgeStyle.strokeWidth,
               }
             : edge,
         ),
@@ -1396,12 +2556,9 @@ export default function App() {
       '已更新连线',
       `已更新 ${selection.ids.length} 条连线属性。`,
     );
-  }
+  }, [commitDocument, edgeInspectorDraft, selection.ids, selection.kind]);
 
-  function updateSelectedSubgraph<K extends keyof GraphSubgraph>(
-    key: K,
-    value: GraphSubgraph[K],
-  ) {
+  const applySubgraphInspectorDraft = useCallback((draft: SubgraphInspectorDraft = subgraphInspectorDraft) => {
     if (selection.kind !== 'subgraph' || selection.ids.length === 0) {
       return;
     }
@@ -1414,7 +2571,8 @@ export default function App() {
           ids.has(subgraph.id)
             ? {
                 ...subgraph,
-                [key]: value,
+                title: draft.title,
+                collapsed: draft.collapsed,
               }
             : subgraph,
         ),
@@ -1422,13 +2580,123 @@ export default function App() {
       '已更新分组',
       `已更新 ${selection.ids.length} 个分组设置。`,
     );
-  }
+  }, [commitDocument, selection.ids, selection.kind, subgraphInspectorDraft]);
 
-  const createNodeAt = useCallback((point: Point, sourceNodeId?: string) => {
+  const commitSubgraphTitleEdit = useCallback((subgraphId: string, nextTitle = editingSubgraphTitle) => {
+    const normalizedTitle = nextTitle.trim() || '未命名分组';
+
+    commitDocument(
+      (current) => ({
+        ...current,
+        subgraphs: current.subgraphs.map((subgraph) =>
+          subgraph.id === subgraphId
+            ? { ...subgraph, title: normalizedTitle }
+            : subgraph,
+        ),
+      }),
+      '已更新分组',
+      `已更新 ${subgraphId} 的分组标题。`,
+    );
+
+    setEditingSubgraphId(null);
+    setEditingSubgraphTitle('');
+  }, [commitDocument, editingSubgraphTitle]);
+
+  const startSubgraphTitleEdit = useCallback((subgraph: GraphSubgraph) => {
+    setEditingSubgraphId(subgraph.id);
+    setEditingSubgraphTitle(subgraph.title);
+    setSelection({ kind: 'subgraph', ids: [subgraph.id] });
+  }, []);
+
+  const toggleSubgraphCollapsed = useCallback((subgraphId: string) => {
+    commitDocument(
+      (current) => ({
+        ...current,
+        subgraphs: current.subgraphs.map((subgraph) =>
+          subgraph.id === subgraphId
+            ? { ...subgraph, collapsed: !subgraph.collapsed }
+            : subgraph,
+        ),
+      }),
+      '已更新分组',
+      `已切换 ${subgraphId} 的折叠状态。`,
+    );
+  }, [commitDocument]);
+
+  const deleteSubgraphById = useCallback((subgraphId: string) => {
+    commitDocument(
+      (current) => removeSubgraphs(current, [subgraphId]),
+      '已删除选中内容',
+      `已删除 ${subgraphId} 分组，并释放其内部节点。`,
+    );
+
+    setEditingSubgraphId((current) => (current === subgraphId ? null : current));
+    setEditingSubgraphTitle('');
+    setSelection((current) =>
+      current.kind === 'subgraph' && current.ids.includes(subgraphId)
+        ? { kind: 'none', ids: [] }
+        : current,
+      );
+  }, [commitDocument]);
+
+  const resolveSubgraphAtPoint = useCallback((point: Point) => (
+    findSubgraphDropTarget(allSubgraphFrames, point)
+  ), [allSubgraphFrames]);
+
+  const compactLayout = useCallback(() => {
+    commitDocument(
+      (current) => ({
+        ...current,
+        nodes: compactDocumentNodes(current),
+      }),
+      '已整理布局',
+      '已在当前摆放基础上温和收紧布局。',
+    );
+  }, [commitDocument]);
+
+  const createNodeAt = useCallback((
+    point: Point,
+    sourceNodeId?: string,
+    edgeType: GraphEdge['type'] = 'solid',
+    forcedSubgraphId?: string | null,
+  ) => {
     const id = nextNodeId(documentState.nodes);
     const selectionSubgraph =
       selection.kind === 'subgraph' && selection.ids.length === 1 ? selection.ids[0] : null;
-    const newNode = buildNode(id, '新建内容', point, selectionSubgraph);
+    const targetSubgraphId = forcedSubgraphId === undefined ? selectionSubgraph : forcedSubgraphId;
+    const draftNode = buildNode(id, '新建内容', point, targetSubgraphId);
+    const subgraphExclusions = getSubgraphAncestryIds(targetSubgraphId, fullSubgraphLookup);
+    const targetFrame = targetSubgraphId
+      ? allSubgraphFrameMap.get(targetSubgraphId) ?? null
+      : null;
+    const safeRect = searchFreeRect(
+      getNodeRectAt(draftNode, point),
+      buildCollisionObstacles(
+        documentState,
+        documentState.nodes,
+        new Set<string>(),
+        subgraphExclusions,
+      ),
+      sourceNodeId
+        ? {
+            x: point.x - (documentState.nodes.find((node) => node.id === sourceNodeId)?.x ?? point.x),
+            y: point.y - (documentState.nodes.find((node) => node.id === sourceNodeId)?.y ?? point.y),
+          }
+        : { x: 1, y: 0 },
+      targetFrame
+        ? {
+            x: targetFrame.x + 18,
+            y: targetFrame.y + targetFrame.headerHeight + 10,
+            width: targetFrame.width - 36,
+            height: targetFrame.height - targetFrame.headerHeight - 22,
+          }
+        : null,
+    );
+    const newNode = {
+      ...draftNode,
+      x: safeRect.x,
+      y: safeRect.y,
+    };
 
     commitDocument(
       (current) => ({
@@ -1442,7 +2710,9 @@ export default function App() {
                 from: sourceNodeId,
                 to: id,
                 label: '',
-                type: 'solid',
+                type: edgeType,
+                strokeColor: defaultEdgeStyle.strokeColor,
+                strokeWidth: defaultEdgeStyle.strokeWidth,
               },
             ]
           : current.edges,
@@ -1450,11 +2720,82 @@ export default function App() {
       '已创建节点',
       sourceNodeId
         ? `已创建 ${id}，并从 ${sourceNodeId} 建立连接。`
-        : `已在画布中创建 ${id}。`,
+        : targetSubgraphId
+          ? `已在 ${targetSubgraphId} 中创建 ${id}。`
+          : `已在画布中创建 ${id}。`,
     );
 
     setSelection({ kind: 'node', ids: [id] });
-  }, [commitDocument, documentState.nodes, selection]);
+  }, [allSubgraphFrameMap, commitDocument, documentState, fullSubgraphLookup, selection]);
+
+  const createNodeFromShortcut = useCallback((
+    sourceNode: GraphNode,
+    relation: 'linked' | 'sibling',
+  ) => {
+    const id = nextNodeId(documentState.nodes);
+    const desiredPoint = getShortcutNodePlacement(sourceNode, documentState.direction, relation);
+    const draftNode = buildNode(id, '新建内容', desiredPoint, sourceNode.subgraphId);
+    const subgraphExclusions = getSubgraphAncestryIds(sourceNode.subgraphId, fullSubgraphLookup);
+    const targetFrame = sourceNode.subgraphId
+      ? allSubgraphFrameMap.get(sourceNode.subgraphId) ?? null
+      : null;
+    const safeRect = searchFreeRect(
+      getNodeRectAt(draftNode, desiredPoint),
+      buildCollisionObstacles(
+        documentState,
+        documentState.nodes,
+        new Set<string>(),
+        subgraphExclusions,
+      ),
+      {
+        x: desiredPoint.x - sourceNode.x,
+        y: desiredPoint.y - sourceNode.y,
+      },
+      targetFrame
+        ? {
+            x: targetFrame.x + 18,
+            y: targetFrame.y + targetFrame.headerHeight + 10,
+            width: targetFrame.width - 36,
+            height: targetFrame.height - targetFrame.headerHeight - 22,
+          }
+        : null,
+    );
+    const newNode = {
+      ...draftNode,
+      x: safeRect.x,
+      y: safeRect.y,
+    };
+
+    commitDocument(
+      (current) => ({
+        ...current,
+        nodes: [...current.nodes, newNode],
+        edges:
+          relation === 'linked'
+            ? [
+                ...current.edges,
+                {
+                  id: crypto.randomUUID(),
+                  from: sourceNode.id,
+                  to: id,
+                  label: '',
+                  type: 'solid',
+                  strokeColor: defaultEdgeStyle.strokeColor,
+                  strokeWidth: defaultEdgeStyle.strokeWidth,
+                },
+              ]
+            : current.edges,
+      }),
+      relation === 'linked' ? '已创建节点' : '已创建同级节点',
+      relation === 'linked'
+        ? `已创建 ${id}，并从 ${sourceNode.id} 建立连接。`
+        : `已在 ${sourceNode.id} 同层级创建 ${id}。`,
+    );
+
+    setSelection({ kind: 'node', ids: [id] });
+    setEditingNodeId(id);
+    setEditingLabel(newNode.label);
+  }, [allSubgraphFrameMap, commitDocument, documentState, fullSubgraphLookup]);
 
   const deleteSelection = useCallback(() => {
     if (selection.kind === 'none' || selection.ids.length === 0) {
@@ -1481,17 +2822,7 @@ export default function App() {
           };
         }
 
-        const deletedSubgraphIds = collectDescendantSubgraphIds(selection.ids, current.subgraphs);
-
-        return {
-          ...current,
-          subgraphs: current.subgraphs.filter((subgraph) => !deletedSubgraphIds.has(subgraph.id)),
-          nodes: current.nodes.map((node) =>
-            deletedSubgraphIds.has(node.subgraphId ?? '')
-              ? { ...node, subgraphId: null }
-              : node,
-          ),
-        };
+        return removeSubgraphs(current, selection.ids);
       },
       '已删除选中内容',
       '已从图中移除当前选中的项目。',
@@ -1761,6 +3092,38 @@ export default function App() {
     createNodeAt(point);
   }, [createNodeAt, documentState.layout.viewport, goToMode]);
 
+  const undoDocument = useCallback(() => {
+    setUndoStack((current) => {
+      const previous = current[current.length - 1];
+      if (!previous) {
+        return current;
+      }
+
+      const currentDocument = structuredClone(documentRef.current);
+      setRedoStack((redoCurrent) => [...redoCurrent.slice(-39), currentDocument]);
+      restoreDocumentSnapshot(previous, '已撤回', '已撤回上一笔图形修改。');
+      return current.slice(0, -1);
+    });
+  }, [restoreDocumentSnapshot]);
+
+  const redoDocument = useCallback(() => {
+    setRedoStack((current) => {
+      const next = current[current.length - 1];
+      if (!next) {
+        return current;
+      }
+
+      const currentDocument = structuredClone(documentRef.current);
+      setUndoStack((undoCurrent) => [...undoCurrent.slice(-39), currentDocument]);
+      restoreDocumentSnapshot(next, '已重做', '已恢复刚才撤回的图形修改。');
+      return current.slice(0, -1);
+    });
+  }, [restoreDocumentSnapshot]);
+
+  useEffect(() => {
+    documentRef.current = documentState;
+  }, [documentState]);
+
   useEffect(() => {
     function syncViewportMode() {
       setIsMobileViewport(window.innerWidth <= 820);
@@ -1793,19 +3156,11 @@ export default function App() {
   }, [mode]);
 
   useEffect(() => {
-    if (deferredSource === documentState.source) {
-      return;
+    if (previousModeRef.current === 'source' && mode !== 'source') {
+      commitSourceDraft();
     }
-
-    try {
-      const parsed = parseMermaidDocument(deferredSource, documentState.layout);
-      startTransition(() => {
-        setDocumentState(syncDocument(parsed, deferredSource));
-      });
-    } catch (error) {
-      void error;
-    }
-  }, [deferredSource, documentState.layout, documentState.source]);
+    previousModeRef.current = mode;
+  }, [commitSourceDraft, mode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1920,10 +3275,6 @@ export default function App() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (event.code === 'Space' && !isTypingTarget(event.target)) {
-        setSpacePressed(true);
-      }
-
       if (isTypingTarget(event.target)) {
         return;
       }
@@ -1934,8 +3285,69 @@ export default function App() {
           (canvasRef.current !== null &&
             document.activeElement instanceof Node &&
             canvasRef.current.contains(document.activeElement)));
+      const hasModifier = event.metaKey || event.ctrlKey;
+      const lowerKey = event.key.toLowerCase();
+      const isRedoChord =
+        lowerKey === 'z' &&
+        ((event.metaKey && event.ctrlKey) || event.shiftKey);
+      const isUndoChord =
+        lowerKey === 'z' &&
+        !event.shiftKey &&
+        !(event.metaKey && event.ctrlKey);
 
-      if ((event.metaKey || event.ctrlKey) && canvasHasFocus) {
+      if (hasModifier && isUndoChord) {
+        event.preventDefault();
+        undoDocument();
+        return;
+      }
+
+      if (hasModifier && (isRedoChord || lowerKey === 'y')) {
+        event.preventDefault();
+        redoDocument();
+        return;
+      }
+
+      const selectedNodeForShortcut =
+        selection.kind === 'node' && selection.ids.length === 1
+          ? documentState.nodes.find((node) => node.id === selection.ids[0]) ?? null
+          : null;
+
+      if (
+        canvasHasFocus &&
+        selectedNodeForShortcut &&
+        !editingNodeId &&
+        !editingEdgeId &&
+        event.key === 'Tab'
+      ) {
+        event.preventDefault();
+        createNodeFromShortcut(selectedNodeForShortcut, 'linked');
+        return;
+      }
+
+      if (
+        canvasHasFocus &&
+        selectedNodeForShortcut &&
+        !editingNodeId &&
+        !editingEdgeId &&
+        event.code === 'Space'
+      ) {
+        event.preventDefault();
+        createNodeFromShortcut(selectedNodeForShortcut, 'sibling');
+        return;
+      }
+
+      if (event.code === 'Space' && !isTypingTarget(event.target)) {
+        setSpacePressed(true);
+      }
+
+      if (hasModifier && canvasHasFocus) {
+        if (lowerKey === 'a') {
+          event.preventDefault();
+          const ids = visibleNodes.map((node) => node.id);
+          setSelection(ids.length > 0 ? { kind: 'node', ids } : { kind: 'none', ids: [] });
+          return;
+        }
+
         if (event.key === '=' || event.key === '+') {
           event.preventDefault();
           zoomViewportAtPoint(window.innerWidth / 2, window.innerHeight / 2, 1.12);
@@ -1988,6 +3400,9 @@ export default function App() {
       if (event.key === 'Escape') {
         event.preventDefault();
         setEditingNodeId(null);
+        setEditingLabel('');
+        setEditingEdgeId(null);
+        setEditingEdgeLabel('');
         clearSelection();
         setConnectingState(null);
       }
@@ -1995,6 +3410,34 @@ export default function App() {
       if (event.key === 'Delete' || event.key === 'Backspace') {
         event.preventDefault();
         deleteSelection();
+        return;
+      }
+
+      if (
+        event.key === 'Enter' &&
+        selection.kind === 'node' &&
+        selection.ids.length === 1 &&
+        !editingNodeId
+      ) {
+        const targetNode = documentState.nodes.find((node) => node.id === selection.ids[0]);
+        if (targetNode) {
+          event.preventDefault();
+          startInlineEdit(targetNode);
+        }
+        return;
+      }
+
+      if (
+        event.key === 'Enter' &&
+        selection.kind === 'edge' &&
+        selection.ids.length === 1 &&
+        !editingEdgeId
+      ) {
+        const targetEdge = documentState.edges.find((edge) => edge.id === selection.ids[0]);
+        if (targetEdge) {
+          event.preventDefault();
+          startEdgeInlineEdit(targetEdge);
+        }
       }
     }
 
@@ -2014,11 +3457,23 @@ export default function App() {
   }, [
     canvasHovered,
     clearSelection,
+    createNodeFromShortcut,
+    documentState.nodes,
     deleteSelection,
     duplicateSelection,
+    documentState.edges,
+    editingEdgeId,
+    editingNodeId,
     goToMode,
     mode,
+    redoDocument,
+    selection.ids,
+    selection.kind,
+    startEdgeInlineEdit,
+    startInlineEdit,
     updateViewport,
+    undoDocument,
+    visibleNodes,
     wrapSelectionInSubgraph,
     zoomViewportAtPoint,
   ]);
@@ -2055,6 +3510,20 @@ export default function App() {
       const y = (event.clientY - bounds.top - viewport.y) / viewport.zoom;
 
       if (dragState) {
+        if (dragState.kind === 'node' && (event.ctrlKey || event.metaKey)) {
+          setDragReparentMode(true);
+          const pointer = { x, y };
+          setDragTargetSubgraphId(
+            findSubgraphDropTarget(
+              allSubgraphFrames,
+              pointer,
+            ),
+          );
+        } else {
+          setDragReparentMode(false);
+          setDragTargetSubgraphId(null);
+        }
+
         setDragState((current) =>
           current
             ? {
@@ -2110,34 +3579,83 @@ export default function App() {
         const deltaX = dragState.current.x - dragState.origin.x;
         const deltaY = dragState.current.y - dragState.origin.y;
         const movedDistance = Math.hypot(deltaX, deltaY);
+        const shouldReparent = dragState.kind === 'node' && dragReparentMode;
+        const dropTargetSubgraphId = shouldReparent ? dragTargetSubgraphId : null;
 
-        if (movedDistance > 3) {
+        if (movedDistance > 3 || shouldReparent) {
           commitDocument(
-            (current) => ({
-              ...current,
-              nodes: current.nodes.map((node) => {
+            (current) => {
+              const desiredNodes = current.nodes.map((node) => {
                 const initial = dragState.initialPositions[node.id];
                 if (!initial) {
                   return node;
                 }
+
                 return {
                   ...node,
                   x: Math.round(initial.x + deltaX),
                   y: Math.round(initial.y + deltaY),
+                  subgraphId:
+                    shouldReparent
+                      ? dropTargetSubgraphId ?? null
+                      : node.subgraphId,
                 };
-              }),
-            }),
-            '已移动节点',
-            `已在画布中移动 ${dragState.ids.length} 个节点。`,
+              });
+
+              const resolvedNodes = resolveDraggedNodeCollision(
+                current,
+                dragState.ids,
+                desiredNodes,
+                fullSubgraphLookup,
+                dropTargetSubgraphId,
+              );
+
+              return {
+                ...current,
+                nodes: resolvedNodes,
+              };
+            },
+            dragState.kind === 'subgraph' ? '已移动分组' : '已移动节点',
+            dragState.kind === 'subgraph'
+              ? '已整体移动当前分组及其内部元素。'
+              : shouldReparent
+                ? dropTargetSubgraphId
+                  ? `已将 ${dragState.ids.length} 个节点放入 ${dropTargetSubgraphId}。`
+                  : `已将 ${dragState.ids.length} 个节点移回外层画布。`
+                : `已在画布中移动 ${dragState.ids.length} 个节点。`,
           );
         }
         setDragState(null);
+        setDragTargetSubgraphId(null);
+        setDragReparentMode(false);
       }
 
       if (boxState) {
         const rect = rectFromPoints(boxState.origin, boxState.current);
-        const nextIds = visibleNodes.filter((node) => intersects(rect, node)).map((node) => node.id);
-        setSelection(nextIds.length > 0 ? { kind: 'node', ids: nextIds } : { kind: 'none', ids: [] });
+        const nextNodeIds = visibleNodes.filter((node) => intersects(rect, node)).map((node) => node.id);
+        if (nextNodeIds.length > 0) {
+          setSelection({ kind: 'node', ids: nextNodeIds });
+        } else {
+          const nextEdgeIds = visibleEdges
+            .filter((edge) => {
+              const fromNode = edgeEndpointMap.get(edge.from);
+              const toNode = edgeEndpointMap.get(edge.to);
+              if (!fromNode || !toNode) {
+                return false;
+              }
+
+              const geometry = buildEdgeGeometry(
+                fromNode,
+                toNode,
+                edgeLaneMap.get(edge.id) ?? 0,
+                edgeEndpointOffsetMap.get(edge.id),
+              );
+              return edgeIntersectsRect(rect, geometry);
+            })
+            .map((edge) => edge.id);
+
+          setSelection(nextEdgeIds.length > 0 ? { kind: 'edge', ids: nextEdgeIds } : { kind: 'none', ids: [] });
+        }
         setBoxState(null);
       }
 
@@ -2156,8 +3674,12 @@ export default function App() {
       }
 
       if (connectingState) {
-        const target = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-node-id]');
-        const targetId = target?.dataset.nodeId;
+        const target = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-edge-endpoint-id]');
+        const targetId = target?.dataset.edgeEndpointId;
+        const dragDistance = Math.hypot(
+          connectingState.current.x - connectingState.origin.x,
+          connectingState.current.y - connectingState.origin.y,
+        );
 
         if (targetId && targetId !== connectingState.fromId) {
           const nextEdgeId = crypto.randomUUID();
@@ -2171,7 +3693,9 @@ export default function App() {
                   from: connectingState.fromId,
                   to: targetId,
                   label: '',
-                  type: 'solid',
+                  type: connectingState.edgeType,
+                  strokeColor: defaultEdgeStyle.strokeColor,
+                  strokeWidth: defaultEdgeStyle.strokeWidth,
                 },
               ],
             }),
@@ -2179,13 +3703,18 @@ export default function App() {
             `已将 ${connectingState.fromId} 连接到 ${targetId}。`,
           );
           setSelection({ kind: 'edge', ids: [nextEdgeId] });
-        } else {
+        } else if (dragDistance > 6) {
           const point = pointFromClient(event.clientX, event.clientY);
           if (!point) {
             setConnectingState(null);
             return;
           }
-          createNodeAt(point, connectingState.fromId);
+          createNodeAt(
+            point,
+            connectingState.fromId,
+            connectingState.edgeType,
+            resolveSubgraphAtPoint(point),
+          );
         }
 
         setConnectingState(null);
@@ -2195,6 +3724,8 @@ export default function App() {
     function onPointerCancel() {
       clearPendingBackgroundInteraction();
       setDragState(null);
+      setDragTargetSubgraphId(null);
+      setDragReparentMode(false);
       setBoxState(null);
       setPanState(null);
       setConnectingState(null);
@@ -2215,11 +3746,21 @@ export default function App() {
     commitDocument,
     connectingState,
     createNodeAt,
-    documentState.edges,
+    createNodeFromShortcut,
     documentState.layout.viewport,
+    documentState.nodes,
     dragState,
+    dragReparentMode,
+    dragTargetSubgraphId,
+    edgeEndpointMap,
+    edgeLaneMap,
+    edgeEndpointOffsetMap,
+    allSubgraphFrames,
+    fullSubgraphLookup,
     panState,
     pointFromClient,
+    resolveSubgraphAtPoint,
+    visibleEdges,
     visibleNodes,
   ]);
 
@@ -2315,6 +3856,37 @@ export default function App() {
       ? selection.ids
       : [node.id];
 
+    if (event.altKey) {
+      const currentDocument = structuredClone(documentRef.current);
+      const duplicateSourceIds = activeIds;
+      const { duplicatedNodes, duplicatedEdges } = duplicateNodesWithEdges(currentDocument, duplicateSourceIds, { x: 0, y: 0 });
+      const nextDocument = materializeDocument({
+        ...currentDocument,
+        nodes: [...currentDocument.nodes, ...duplicatedNodes],
+        edges: [...currentDocument.edges, ...duplicatedEdges],
+      });
+
+      applyCommittedDocument(
+        nextDocument,
+        '已复制选中节点',
+        `已复制 ${duplicatedNodes.length} 个节点。`,
+        currentDocument,
+      );
+
+      const duplicatedIds = duplicatedNodes.map((entry) => entry.id);
+      setSelection({ kind: 'node', ids: duplicatedIds });
+      setDragState({
+        kind: 'node',
+        origin: point,
+        current: point,
+        ids: duplicatedIds,
+        initialPositions: Object.fromEntries(
+          duplicatedNodes.map((entry) => [entry.id, { x: entry.x, y: entry.y }]),
+        ),
+      });
+      return;
+    }
+
     if (event.shiftKey) {
       const nextSet = new Set(selection.ids);
       if (nextSet.has(node.id)) {
@@ -2335,6 +3907,7 @@ export default function App() {
     );
 
     setDragState({
+      kind: 'node',
       origin: point,
       current: point,
       ids: activeIds,
@@ -2342,63 +3915,67 @@ export default function App() {
     });
   }
 
-  function visiblePosition(node: GraphNode) {
-    if (!dragState || !dragState.initialPositions[node.id]) {
-      return { x: node.x, y: node.y };
+  function startSubgraphDrag(
+    event: ReactPointerEvent<HTMLDivElement>,
+    subgraphId: string,
+  ) {
+    if (event.button !== 0 || editingSubgraphId) {
+      return;
     }
 
-    const deltaX = dragState.current.x - dragState.origin.x;
-    const deltaY = dragState.current.y - dragState.origin.y;
-    const initial = dragState.initialPositions[node.id];
+    const target = event.target as HTMLElement;
+    if (target.closest('button, input')) {
+      return;
+    }
 
-    return {
-      x: initial.x + deltaX,
-      y: initial.y + deltaY,
-    };
+    event.stopPropagation();
+    const point = pointFromClient(event.clientX, event.clientY);
+    if (!point) {
+      return;
+    }
+
+    const memberIds = collectNodeIdsForSubgraph(subgraphId, documentState.nodes, fullSubgraphLookup);
+    if (memberIds.length === 0) {
+      setSelection({ kind: 'subgraph', ids: [subgraphId] });
+      return;
+    }
+
+    setSelection({ kind: 'subgraph', ids: [subgraphId] });
+    setDragState({
+      kind: 'subgraph',
+      origin: point,
+      current: point,
+      ids: memberIds,
+      initialPositions: Object.fromEntries(
+        documentState.nodes
+          .filter((node) => memberIds.includes(node.id))
+          .map((node) => [node.id, { x: node.x, y: node.y }]),
+      ),
+    });
   }
 
-  function beginConnection(event: ReactPointerEvent<HTMLButtonElement>, node: GraphNode) {
+  function beginConnection(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    endpoint: Pick<EdgeEndpointBox, 'id' | 'x' | 'y' | 'width' | 'height'>,
+    handleSide: 'left' | 'right',
+  ) {
     event.stopPropagation();
+    event.preventDefault();
     if (!canvasRef.current) {
       return;
     }
 
-    const origin = {
-      x: node.x + node.width,
-      y: node.y + node.height / 2,
-    };
     const current = pointFromClient(event.clientX, event.clientY);
     if (!current) {
       return;
     }
     setConnectingState({
-      fromId: node.id,
-      origin,
+      fromId: endpoint.id,
+      origin: current,
       current,
+      edgeType: event.ctrlKey || event.metaKey ? 'line' : 'solid',
+      handleSide,
     });
-  }
-
-  function startInlineEdit(node: GraphNode) {
-    setEditingNodeId(node.id);
-    setEditingLabel(node.label);
-    setSelection({ kind: 'node', ids: [node.id] });
-  }
-
-  function commitInlineEdit(nodeId: string) {
-    commitDocument(
-      (current) => ({
-        ...current,
-        nodes: current.nodes.map((node) =>
-          node.id === nodeId
-            ? resizeNodeToContent(node, editingLabel.trim() || '未命名内容')
-            : node,
-        ),
-      }),
-      '已重命名节点',
-      `已更新 ${nodeId} 的标签。`,
-    );
-
-    setEditingNodeId(null);
   }
 
   const selectedNode =
@@ -2407,12 +3984,22 @@ export default function App() {
       : null;
   const selectedEdge =
     selection.kind === 'edge' && selection.ids.length === 1
-      ? documentState.edges.find((edge) => edge.id === selection.ids[0]) ?? null
+      ? (() => {
+        const edge = documentState.edges.find((entry) => entry.id === selection.ids[0]) ?? null;
+        return edge ? normalizeEdgeStyle(edge) : null;
+      })()
       : null;
   const selectedSubgraph =
     selection.kind === 'subgraph' && selection.ids.length === 1
       ? documentState.subgraphs.find((subgraph) => subgraph.id === selection.ids[0]) ?? null
       : null;
+  const selectedNodePresetId = selectedNode
+    ? nodeStylePresets.find((preset) =>
+      preset.fill === selectedNode.fill &&
+      preset.stroke === selectedNode.stroke &&
+      preset.textColor === selectedNode.textColor,
+    )?.id ?? null
+    : null;
   const selectionLabel =
     selection.kind === 'none'
       ? '未选中任何内容'
@@ -2426,7 +4013,54 @@ export default function App() {
   const showInspector = mode === 'canvas' ? inspectorOpen : isMobileViewport ? inspectorOpen : true;
   const workspaceClassName = `workspace workspace--${mode}${isMobileViewport ? ' workspace--mobile' : ''}${showSidebar ? ' workspace--sidebar-open' : ''}${showInspector ? ' workspace--inspector-open' : ''}`;
   const appShellClassName = `app-shell${isMobileViewport ? ' app-shell--mobile' : ''}${isConstrainedDevice ? ' app-shell--constrained' : ''}`;
-  const mobileOverlayOpen = isMobileViewport && (showSidebar || showInspector || mobileSourcePreviewOpen);
+  const mobileOverlayOpen = isMobileViewport && (showSidebar || mobileSourcePreviewOpen);
+
+  useEffect(() => {
+    if (!selectedNode) {
+      return;
+    }
+
+    setNodeInspectorDraft({
+      label: selectedNode.label,
+      shape: selectedNode.shape,
+      fill: selectedNode.fill,
+      stroke: selectedNode.stroke,
+      textColor: selectedNode.textColor,
+    });
+  }, [selectedNode]);
+
+  useEffect(() => {
+    if (!selectedEdge) {
+      return;
+    }
+
+    setEdgeInspectorDraft({
+      label: selectedEdge.label,
+      type: selectedEdge.type,
+      strokeColor: selectedEdge.strokeColor,
+      strokeWidthInput: String(selectedEdge.strokeWidth),
+    });
+  }, [selectedEdge]);
+
+  useEffect(() => {
+    if (!selectedSubgraph) {
+      return;
+    }
+
+    setSubgraphInspectorDraft({
+      title: selectedSubgraph.title,
+      collapsed: selectedSubgraph.collapsed,
+    });
+  }, [selectedSubgraph]);
+
+  useEffect(() => {
+    if (selection.kind === 'subgraph') {
+      return;
+    }
+
+    setEditingSubgraphId(null);
+    setEditingSubgraphTitle('');
+  }, [selection.kind]);
 
   // External Control API - allows external AI agents to control the editor
   useEffect(() => {
@@ -2581,6 +4215,9 @@ export default function App() {
                   type="button"
                 >
                   删除
+                </button>
+                <button className="desktop-command-button" onClick={compactLayout} type="button">
+                  整理
                 </button>
               </div>
 
@@ -2971,7 +4608,11 @@ export default function App() {
                     return;
                   }
                   const target = event.target as HTMLElement;
-                  if (target.closest('.graph-node, .subgraph-frame')) {
+                  if (target.closest('.graph-node, .edge-path, .edge-hitbox, .edge-label, .edge-label-editor')) {
+                    return;
+                  }
+
+                  if (target.closest('.subgraph-frame__header, .subgraph-frame__action, .subgraph-frame__title-input')) {
                     return;
                   }
 
@@ -2980,7 +4621,7 @@ export default function App() {
                     return;
                   }
 
-                  createNodeAt(point);
+                  createNodeAt(point, undefined, 'solid', resolveSubgraphAtPoint(point));
                 }}
                 onPointerDown={startBackgroundInteraction}
                 onWheel={handleCanvasWheel}
@@ -2992,17 +4633,23 @@ export default function App() {
                     transform: `translate(${documentState.layout.viewport.x}px, ${documentState.layout.viewport.y}px) scale(${documentState.layout.viewport.zoom})`,
                   }}
                 >
-                  {subgraphFrames.map((frame) => {
+                  {[...subgraphFrames].sort((left, right) => left.depth - right.depth).map((frame) => {
                     const subgraph = documentState.subgraphs.find((entry) => entry.id === frame.id);
                     if (!subgraph) {
                       return null;
                     }
 
                     return (
-                      <button
+                      <div
                         key={frame.id}
-                        className={`subgraph-frame${selection.kind === 'subgraph' && selectionContains(selection, frame.id) ? ' is-selected' : ''}`}
-                        onClick={(event) => {
+                        className={`subgraph-frame${selection.kind === 'subgraph' && selectionContains(selection, frame.id) ? ' is-selected' : ''}${dragTargetSubgraphId === frame.id ? ' is-drop-target' : ''}${subgraph.collapsed ? ' is-collapsed' : ''}`}
+                        data-edge-endpoint-id={frame.id}
+                        onPointerDown={(event) => {
+                          const target = event.target as HTMLElement;
+                          if (target.closest('.subgraph-frame__header, .subgraph-frame__action, .subgraph-frame__connector, .subgraph-frame__title-input')) {
+                            return;
+                          }
+
                           event.stopPropagation();
                           selectSingle('subgraph', frame.id);
                         }}
@@ -3013,67 +4660,259 @@ export default function App() {
                           height: frame.height,
                           '--depth': String(frame.depth),
                         } as CSSProperties}
-                        type="button"
                       >
-                        <span className="subgraph-frame__title">{subgraph.title}</span>
-                        <span className="subgraph-frame__meta">
-                          {subgraph.collapsed
-                            ? '已折叠'
-                            : `${countNodesInSubgraph(documentState.nodes, subgraph.id, subgraphLookup)} 个节点`}
-                        </span>
-                      </button>
+                        <div
+                          className="subgraph-frame__header"
+                          onPointerDown={(event) => startSubgraphDrag(event, frame.id)}
+                        >
+                          <div className="subgraph-frame__header-copy">
+                            {editingSubgraphId === frame.id ? (
+                              <input
+                                autoFocus
+                                className="subgraph-frame__title-input"
+                                onBlur={() => commitSubgraphTitleEdit(frame.id)}
+                                onChange={(event) => setEditingSubgraphTitle(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (handleNativeSelectAllShortcut(event)) {
+                                    return;
+                                  }
+
+                                  if (event.key === 'Enter') {
+                                    event.preventDefault();
+                                    commitSubgraphTitleEdit(frame.id);
+                                    return;
+                                  }
+
+                                  if (event.key === 'Escape') {
+                                    event.preventDefault();
+                                    setEditingSubgraphId(null);
+                                    setEditingSubgraphTitle('');
+                                  }
+                                }}
+                                onPointerDown={(event) => event.stopPropagation()}
+                                value={editingSubgraphTitle}
+                              />
+                            ) : (
+                              <span
+                                className="subgraph-frame__title-button"
+                                onDoubleClick={(event) => {
+                                  event.stopPropagation();
+                                  startSubgraphTitleEdit(subgraph);
+                                }}
+                              >
+                                {subgraph.title}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="subgraph-frame__actions">
+                            <button
+                              aria-label="从分组左侧拖出连线"
+                              className="subgraph-frame__connector subgraph-frame__connector--start"
+                              onPointerDown={(event) => beginConnection(event, frame, 'left')}
+                              type="button"
+                            >
+                              <WorkbenchIcon name="link-start" />
+                            </button>
+                            <button
+                              aria-label="从分组右侧拖出连线"
+                              className="subgraph-frame__connector subgraph-frame__connector--end"
+                              onPointerDown={(event) => beginConnection(event, frame, 'right')}
+                              type="button"
+                            >
+                              <WorkbenchIcon name="link-end" />
+                            </button>
+                            <button
+                              aria-label={subgraph.collapsed ? '展开分组' : '折叠分组'}
+                              className="subgraph-frame__action"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleSubgraphCollapsed(frame.id);
+                              }}
+                              type="button"
+                            >
+                              <WorkbenchIcon name={subgraph.collapsed ? 'plus' : 'minus'} />
+                            </button>
+                            <button
+                              aria-label="删除分组"
+                              className="subgraph-frame__action is-danger"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                deleteSubgraphById(frame.id);
+                              }}
+                              type="button"
+                            >
+                              <WorkbenchIcon name="trash" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {subgraph.collapsed ? (
+                          <div className="subgraph-frame__summary">
+                            <div className="subgraph-frame__summary-meta">
+                              <span>{frame.memberCount} 项</span>
+                            </div>
+                            {frame.summaryLabels.length > 0 ? (
+                              <div className="subgraph-frame__summary-chips">
+                                {frame.summaryLabels.map((label, index) => (
+                                  <span className="subgraph-frame__summary-chip" key={`${frame.id}-summary-${index}`}>
+                                    {label.split(/\r?\n/)[0]}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="subgraph-frame__summary-empty">暂无节点</div>
+                            )}
+                          </div>
+                        ) : null}
+                      </div>
                     );
                   })}
 
                   <svg className="edge-layer" aria-hidden="true">
                     <defs>
                       <marker
-                        id="arrow-solid"
-                        markerWidth="10"
-                        markerHeight="10"
-                        refX="8"
-                        refY="5"
+                        id="arrow-outline"
+                        markerWidth="13.4"
+                        markerHeight="13.4"
+                        refX="10.6"
+                        refY="6.7"
                         orient="auto"
+                        markerUnits="userSpaceOnUse"
                       >
-                        <path d="M0,0 L10,5 L0,10 z" fill="#24404f" />
+                        <path d="M0,0 L13.4,6.7 L0,13.4 z" fill="rgba(255,255,255,0.96)" />
+                      </marker>
+                      <marker
+                        id="arrow-solid"
+                        markerWidth="11.2"
+                        markerHeight="11.2"
+                        refX="8.9"
+                        refY="5.6"
+                        orient="auto"
+                        markerUnits="userSpaceOnUse"
+                      >
+                        <path
+                          d="M0,0 L11.2,5.6 L0,11.2 z"
+                          fill="context-stroke"
+                          fillOpacity="0.68"
+                          stroke="rgba(255,255,255,0.96)"
+                          strokeWidth="0.96"
+                        />
                       </marker>
                     </defs>
                     {visibleEdges.map((edge) => {
-                      const fromNode = visibleNodes.find((node) => node.id === edge.from);
-                      const toNode = visibleNodes.find((node) => node.id === edge.to);
+                      const normalizedEdge = normalizeEdgeStyle(edge);
+                      const fromNode = edgeEndpointMap.get(edge.from);
+                      const toNode = edgeEndpointMap.get(edge.to);
                       if (!fromNode || !toNode) {
                         return null;
                       }
 
-                      const from = visiblePosition(fromNode);
-                      const to = visiblePosition(toNode);
+                      const isGroupEdge = fromNode.kind === 'subgraph' || toNode.kind === 'subgraph';
+
                       const geometry = buildEdgeGeometry(
-                        {
-                          ...fromNode,
-                          x: from.x,
-                          y: from.y,
-                        },
-                        {
-                          ...toNode,
-                          x: to.x,
-                          y: to.y,
-                        },
+                        fromNode,
+                        toNode,
+                        edgeLaneMap.get(edge.id) ?? 0,
+                        edgeEndpointOffsetMap.get(edge.id),
                       );
+                      const baseStrokeWidth = isGroupEdge
+                        ? normalizedEdge.strokeWidth * 2
+                        : normalizedEdge.strokeWidth;
+                      const selectedEdgeStrokeWidth =
+                        selection.kind === 'edge' && selectionContains(selection, edge.id)
+                          ? baseStrokeWidth + 0.8
+                          : baseStrokeWidth;
+                      const displayStroke = isGroupEdge
+                        ? 'rgba(56, 189, 248, 0.78)'
+                        : withAlpha(normalizedEdge.strokeColor, 0.6);
+                      const outlineWidth = selectedEdgeStrokeWidth + (isGroupEdge ? 2.6 : 2);
 
                       return (
                         <g key={edge.id}>
                           <path
-                            className={`edge-path edge-path--${edge.type}${selection.kind === 'edge' && selectionContains(selection, edge.id) ? ' is-selected' : ''}`}
+                            className={`edge-path edge-path--outline edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${selection.kind === 'edge' && selectionContains(selection, edge.id) ? ' is-selected' : ''}`}
+                            d={geometry.path}
+                            markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-outline)'}
+                            pointerEvents="none"
+                            stroke="#f8fafc"
+                            strokeOpacity={0.94}
+                            strokeWidth={outlineWidth}
+                          />
+                          <path
+                            className={`edge-path edge-path--main edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${selection.kind === 'edge' && selectionContains(selection, edge.id) ? ' is-selected' : ''}`}
                             d={geometry.path}
                             markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-solid)'}
+                            pointerEvents="none"
+                            stroke={displayStroke}
+                            strokeWidth={selectedEdgeStrokeWidth}
+                          />
+                          <path
+                            className="edge-hitbox"
+                            d={geometry.path}
                             onClick={(event) => {
                               event.stopPropagation();
                               selectSingle('edge', edge.id);
                             }}
+                            onDoubleClick={(event) => {
+                              event.stopPropagation();
+                              startEdgeInlineEdit(edge);
+                            }}
+                            strokeWidth={Math.max(normalizedEdge.strokeWidth + 14, 18)}
                           />
-                          {edge.label ? (
-                            <text className="edge-label" x={geometry.mid.x} y={geometry.mid.y - 10}>
-                              {edge.label}
+                          {editingEdgeId === edge.id ? (
+                            <foreignObject
+                              className="edge-label-editor-fo"
+                              height={44}
+                              width={164}
+                              x={geometry.label.x - 82}
+                              y={geometry.label.y - 32}
+                            >
+                              <input
+                                autoFocus
+                                className="edge-label-editor"
+                                onBlur={() => commitEdgeInlineEdit(edge.id)}
+                                onChange={(event) => setEditingEdgeLabel(event.target.value)}
+                                onDoubleClick={(event) => event.stopPropagation()}
+                                onKeyDown={(event) => {
+                                  if (handleNativeSelectAllShortcut(event)) {
+                                    return;
+                                  }
+
+                                  if (event.key === 'Enter') {
+                                    event.preventDefault();
+                                    commitEdgeInlineEdit(edge.id);
+                                    return;
+                                  }
+
+                                  if (event.key === 'Escape') {
+                                    event.preventDefault();
+                                    setEditingEdgeId(null);
+                                    setEditingEdgeLabel('');
+                                  }
+                                }}
+                                onPointerDown={(event) => event.stopPropagation()}
+                                value={editingEdgeLabel}
+                              />
+                            </foreignObject>
+                          ) : edge.label ? (
+                            <text
+                              className={`edge-label${isGroupEdge ? ' is-group-edge' : ''}`}
+                              onDoubleClick={(event) => {
+                                event.stopPropagation();
+                                startEdgeInlineEdit(edge);
+                              }}
+                              x={geometry.label.x}
+                              y={geometry.label.y - 10}
+                            >
+                              <tspan
+                                onDoubleClick={(event) => {
+                                  event.stopPropagation();
+                                  startEdgeInlineEdit(edge);
+                                }}
+                              >
+                                {edge.label}
+                              </tspan>
                             </text>
                           ) : null}
                         </g>
@@ -3084,34 +4923,29 @@ export default function App() {
                       <path
                         className="edge-path edge-path--preview"
                         d={(() => {
-                          const originNode = visibleNodes.find((node) => node.id === connectingState.fromId);
+                          const originNode = edgeEndpointMap.get(connectingState.fromId);
                           if (!originNode) {
                             return '';
                           }
 
-                          const position = visiblePosition(originNode);
-                          return buildPreviewEdgePath(
-                            {
-                              ...originNode,
-                              x: position.x,
-                              y: position.y,
-                            },
-                            connectingState.current,
-                          );
+                          return buildPreviewEdgePath(originNode, connectingState.current, connectingState.handleSide);
                         })()}
-                        markerEnd="url(#arrow-solid)"
+                        markerEnd={connectingState.edgeType === 'line' ? undefined : 'url(#arrow-solid)'}
                       />
                     ) : null}
                   </svg>
 
                   {visibleNodes.map((node) => {
-                    const position = visiblePosition(node);
                     const selected = selection.kind === 'node' && selectionContains(selection, node.id);
+                    const isEditing = editingNodeId === node.id;
+                    const liveContent = isEditing ? editingLabel || ' ' : node.label;
+                    const liveSize = isEditing ? measureNodeContentSize(liveContent) : node;
 
                     return (
                       <div
                         key={node.id}
                         className={`graph-node graph-node--${node.shape}${selected ? ' is-selected' : ''}${hoveredNodeId === node.id ? ' is-hovered' : ''}`}
+                        data-edge-endpoint-id={node.id}
                         data-node-id={node.id}
                         onDoubleClick={(event) => {
                           if (isMobileViewport) {
@@ -3124,34 +4958,68 @@ export default function App() {
                         onMouseLeave={() => setHoveredNodeId((current) => (current === node.id ? null : current))}
                         onPointerDown={(event) => startNodeDrag(event, node)}
                         style={{
-                          left: position.x,
-                          top: position.y,
-                          width: node.width,
-                          height: node.height,
+                          left: node.x,
+                          top: node.y,
+                          width: liveSize.width,
+                          height: liveSize.height,
                           background: node.fill,
                           borderColor: node.stroke,
                           color: node.textColor,
                         }}
                         tabIndex={0}
                       >
-                        {editingNodeId === node.id ? (
+                        <button
+                          aria-label="从节点左侧拖出连线"
+                          className="graph-node__connector graph-node__connector--start"
+                          onPointerDown={(event) => beginConnection(event, node, 'left')}
+                          type="button"
+                        >
+                          <WorkbenchIcon name="link-start" />
+                        </button>
+
+                        {isEditing ? (
                           <textarea
                             autoFocus
                             className="graph-node__editor"
                             onBlur={() => commitInlineEdit(node.id)}
                             onChange={(event) => setEditingLabel(event.target.value)}
+                            onPointerDown={(event) => event.stopPropagation()}
                             onKeyDown={(event) => {
-                              if (event.key === 'Enter' && !event.shiftKey) {
+                              if (handleNativeSelectAllShortcut(event)) {
+                                return;
+                              }
+
+                              if (
+                                event.key === 'Enter' &&
+                                (event.shiftKey || event.ctrlKey || event.altKey)
+                              ) {
+                                event.preventDefault();
+                                const textarea = event.currentTarget;
+                                const start = textarea.selectionStart;
+                                const end = textarea.selectionEnd;
+                                const nextValue = `${editingLabel.slice(0, start)}\n${editingLabel.slice(end)}`;
+                                setEditingLabel(nextValue);
+                                window.requestAnimationFrame(() => {
+                                  textarea.selectionStart = start + 1;
+                                  textarea.selectionEnd = start + 1;
+                                });
+                                return;
+                              }
+
+                              if (event.key === 'Enter') {
                                 event.preventDefault();
                                 commitInlineEdit(node.id);
+                                return;
                               }
 
                               if (event.key === 'Escape') {
                                 event.preventDefault();
                                 setEditingNodeId(null);
+                                setEditingLabel('');
                               }
                             }}
-                            rows={3}
+                            rows={1}
+                            style={{ minHeight: Math.max(liveSize.height - 28, 32) }}
                             value={editingLabel}
                           />
                         ) : (
@@ -3159,12 +5027,12 @@ export default function App() {
                         )}
 
                         <button
-                          aria-label={`从当前节点创建连线`}
-                          className="graph-node__connector"
-                          onPointerDown={(event) => beginConnection(event, node)}
+                          aria-label="从节点右侧拖出连线"
+                          className="graph-node__connector graph-node__connector--end"
+                          onPointerDown={(event) => beginConnection(event, node, 'right')}
                           type="button"
                         >
-                          +
+                          <WorkbenchIcon name="link-end" />
                         </button>
                       </div>
                     );
@@ -3184,12 +5052,6 @@ export default function App() {
                     )}
                   />
                 ) : null}
-
-                <div className="canvas-hud">
-                  <div className="canvas-hud__card">
-                    <strong>空白拖拽框选，双指平移，Pinch 缩放，`Space` 临时拖动画布。</strong>
-                  </div>
-                </div>
 
                 <div className="tool-dock" role="toolbar" aria-label="画布工具">
                   <button
@@ -3311,6 +5173,10 @@ export default function App() {
                     setSaveStatus('saving');
                     setSourceDraft(event.target.value);
                   }}
+                  onBlur={commitSourceDraft}
+                  onKeyDown={(event) => {
+                    handleNativeSelectAllShortcut(event);
+                  }}
                   spellCheck={false}
                   value={sourceDraft}
                 />
@@ -3318,8 +5184,8 @@ export default function App() {
                 <div className="source-status">
                   <span>
                     {sourceParseError
-                      ? '当前草稿存在语法问题，已暂停从源码模式回写。'
-                      : '你输入的内容会实时同步回共享图模型。'}
+                      ? '当前草稿存在语法问题，退出编辑前不会提交。'
+                      : '源码草稿会在失焦或切换模式后提交到共享图模型。'}
                   </span>
                   {sourceParseError ? <strong>{sourceParseError}</strong> : null}
                   {documentState.warnings.length > 0 ? (
@@ -3366,7 +5232,11 @@ export default function App() {
           ) : null}
         </section>
 
-        <aside className={`inspector${showInspector ? ' is-open' : ''}`}>
+        <aside
+          className={`inspector${showInspector ? ' is-open' : ''}`}
+          onClick={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
           {isMobileViewport ? (
             <div className="mobile-sheet-handle" aria-hidden="true" />
           ) : null}
@@ -3392,16 +5262,34 @@ export default function App() {
               <label className="field">
                 <span>内容</span>
                 <textarea
-                  onChange={(event) => updateSelectedNode('label', event.target.value)}
+                  onBlur={() => applyNodeInspectorDraft()}
+                  onChange={(event) =>
+                    setNodeInspectorDraft((current) => ({ ...current, label: event.target.value }))
+                  }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault();
+                      applyNodeInspectorDraft();
+                      event.currentTarget.blur();
+                    }
+                  }}
                   rows={4}
-                  value={selectedNode.label}
+                  value={nodeInspectorDraft.label}
                 />
               </label>
               <label className="field">
                 <span>形状</span>
                 <select
-                  onChange={(event) => updateSelectedNode('shape', event.target.value as NodeShape)}
-                  value={selectedNode.shape}
+                  onChange={(event) => {
+                    const nextDraft = { ...nodeInspectorDraft, shape: event.target.value as NodeShape };
+                    setNodeInspectorDraft(nextDraft);
+                    applyNodeInspectorDraft(nextDraft);
+                  }}
+                  value={nodeInspectorDraft.shape}
                 >
                   {shapeOptions.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -3410,29 +5298,69 @@ export default function App() {
                   ))}
                 </select>
               </label>
+              <div className="field">
+                <span>样式预设</span>
+                <div className="node-style-presets" role="list">
+                  {nodeStylePresets.map((preset) => (
+                    <button
+                      key={preset.id}
+                      className={selectedNodePresetId === preset.id ? 'node-style-preset is-active' : 'node-style-preset'}
+                      onClick={() => {
+                        setNodeInspectorDraft({
+                          ...nodeInspectorDraft,
+                          fill: preset.fill,
+                          stroke: preset.stroke,
+                          textColor: preset.textColor,
+                        });
+                        applyNodeStylePreset(preset);
+                      }}
+                      type="button"
+                    >
+                      <span className="node-style-preset__swatches" aria-hidden="true">
+                        <span style={{ background: preset.fill }} />
+                        <span style={{ background: preset.stroke }} />
+                        <span style={{ background: preset.textColor }} />
+                      </span>
+                      <span className="node-style-preset__label">{preset.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
               <div className="color-grid">
                 <label className="field">
                   <span>填充</span>
                   <input
-                    onChange={(event) => updateSelectedNode('fill', event.target.value)}
+                    onChange={(event) => {
+                      const nextDraft = { ...nodeInspectorDraft, fill: event.target.value };
+                      setNodeInspectorDraft(nextDraft);
+                      applyNodeInspectorDraft(nextDraft);
+                    }}
                     type="color"
-                    value={selectedNode.fill}
+                    value={nodeInspectorDraft.fill}
                   />
                 </label>
                 <label className="field">
                   <span>描边</span>
                   <input
-                    onChange={(event) => updateSelectedNode('stroke', event.target.value)}
+                    onChange={(event) => {
+                      const nextDraft = { ...nodeInspectorDraft, stroke: event.target.value };
+                      setNodeInspectorDraft(nextDraft);
+                      applyNodeInspectorDraft(nextDraft);
+                    }}
                     type="color"
-                    value={selectedNode.stroke}
+                    value={nodeInspectorDraft.stroke}
                   />
                 </label>
                 <label className="field">
                   <span>文字</span>
                   <input
-                    onChange={(event) => updateSelectedNode('textColor', event.target.value)}
+                    onChange={(event) => {
+                      const nextDraft = { ...nodeInspectorDraft, textColor: event.target.value };
+                      setNodeInspectorDraft(nextDraft);
+                      applyNodeInspectorDraft(nextDraft);
+                    }}
                     type="color"
-                    value={selectedNode.textColor}
+                    value={nodeInspectorDraft.textColor}
                   />
                 </label>
               </div>
@@ -3448,15 +5376,25 @@ export default function App() {
               <label className="field">
                 <span>标签</span>
                 <input
-                  onChange={(event) => updateSelectedEdge('label', event.target.value)}
-                  value={selectedEdge.label}
+                  onBlur={() => applyEdgeInspectorDraft()}
+                  onChange={(event) =>
+                    setEdgeInspectorDraft((current) => ({ ...current, label: event.target.value }))
+                  }
+                  onKeyDown={(event) => {
+                    handleNativeSelectAllShortcut(event);
+                  }}
+                  value={edgeInspectorDraft.label}
                 />
               </label>
               <label className="field">
                 <span>类型</span>
                 <select
-                  onChange={(event) => updateSelectedEdge('type', event.target.value as GraphEdge['type'])}
-                  value={selectedEdge.type}
+                  onChange={(event) => {
+                    const nextDraft = { ...edgeInspectorDraft, type: event.target.value as GraphEdge['type'] };
+                    setEdgeInspectorDraft(nextDraft);
+                    applyEdgeInspectorDraft(nextDraft);
+                  }}
+                  value={edgeInspectorDraft.type}
                 >
                   <option value="solid">箭头</option>
                   <option value="line">直线</option>
@@ -3464,6 +5402,48 @@ export default function App() {
                   <option value="thick">粗线</option>
                 </select>
               </label>
+              <div className="color-grid">
+                <label className="field">
+                  <span>颜色</span>
+                  <input
+                    onChange={(event) => {
+                      const nextDraft = { ...edgeInspectorDraft, strokeColor: event.target.value };
+                      setEdgeInspectorDraft(nextDraft);
+                      applyEdgeInspectorDraft(nextDraft);
+                    }}
+                    type="color"
+                    value={edgeInspectorDraft.strokeColor}
+                  />
+                </label>
+                <label className="field">
+                  <span>粗细</span>
+                  <input
+                    max={12}
+                    min={1}
+                    onBlur={() => applyEdgeInspectorDraft()}
+                    onChange={(event) =>
+                      setEdgeInspectorDraft((current) => ({
+                        ...current,
+                        strokeWidthInput: event.target.value,
+                      }))
+                    }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      applyEdgeInspectorDraft();
+                      event.currentTarget.blur();
+                      }
+                    }}
+                    step={0.2}
+                    type="number"
+                    value={edgeInspectorDraft.strokeWidthInput}
+                  />
+                </label>
+              </div>
             </section>
           ) : null}
 
@@ -3476,15 +5456,33 @@ export default function App() {
               <label className="field">
                 <span>标题</span>
                 <input
-                  onChange={(event) => updateSelectedSubgraph('title', event.target.value)}
-                  value={selectedSubgraph.title}
+                  onBlur={() => applySubgraphInspectorDraft()}
+                  onChange={(event) =>
+                    setSubgraphInspectorDraft((current) => ({ ...current, title: event.target.value }))
+                  }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      applySubgraphInspectorDraft();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  value={subgraphInspectorDraft.title}
                 />
               </label>
               <label className="toggle-row">
                 <span>折叠</span>
                 <input
-                  checked={selectedSubgraph.collapsed}
-                  onChange={(event) => updateSelectedSubgraph('collapsed', event.target.checked)}
+                  checked={subgraphInspectorDraft.collapsed}
+                  onChange={(event) => {
+                    const nextDraft = { ...subgraphInspectorDraft, collapsed: event.target.checked };
+                    setSubgraphInspectorDraft(nextDraft);
+                    applySubgraphInspectorDraft(nextDraft);
+                  }}
                   type="checkbox"
                 />
               </label>

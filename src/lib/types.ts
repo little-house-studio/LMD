@@ -36,6 +36,8 @@ export interface GraphEdge {
   to: string;
   label: string;
   type: EdgeType;
+  strokeColor: string;
+  strokeWidth: number;
 }
 
 export interface GraphSubgraph {

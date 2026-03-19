@@ -16,6 +16,29 @@ const defaultNodeStyle = {
   textColor: '#12212c',
 };
 
+export const defaultEdgeStyle = {
+  strokeColor: '#bfd2de',
+  strokeWidth: 1,
+};
+
+export function normalizeEdgeStyle(edge: GraphEdge): GraphEdge {
+  const strokeColor = edge.strokeColor ?? defaultEdgeStyle.strokeColor;
+  let strokeWidth = edge.strokeWidth ?? defaultEdgeStyle.strokeWidth;
+
+  if (
+    strokeColor === defaultEdgeStyle.strokeColor &&
+    (strokeWidth === 3.4 || strokeWidth === 1.7)
+  ) {
+    strokeWidth = defaultEdgeStyle.strokeWidth;
+  }
+
+  return {
+    ...edge,
+    strokeColor,
+    strokeWidth,
+  };
+}
+
 const defaultLayout: LayoutSidecar = {
   version: 1,
   viewport: {
@@ -195,6 +218,41 @@ function parseEdgeLine(raw: string) {
   return null;
 }
 
+function parseLinkStyleLine(raw: string) {
+  const match = raw.match(/^linkStyle\s+([0-9,\s]+)\s+(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  const indices = match[1]
+    .split(',')
+    .map((value) => Number.parseInt(value.trim(), 10))
+    .filter((value) => Number.isFinite(value) && value >= 0);
+
+  const styleParts = match[2]
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const styleMap: Record<string, string> = {};
+
+  for (const part of styleParts) {
+    const [key, value] = part.split(':').map((entry) => entry.trim());
+    if (key && value) {
+      styleMap[key] = value.replace(/;$/, '');
+    }
+  }
+
+  const strokeWidth = styleMap['stroke-width']
+    ? Number.parseFloat(styleMap['stroke-width'].replace(/px$/i, ''))
+    : undefined;
+
+  return {
+    indices,
+    strokeColor: styleMap.stroke,
+    strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : undefined,
+  };
+}
+
 function buildAutoLayout(
   direction: Direction,
   nodes: GraphNode[],
@@ -316,6 +374,7 @@ export function parseMermaidDocument(
   const nodeMap = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const subgraphs: GraphSubgraph[] = [];
+  const pendingEdgeStyles: Array<ReturnType<typeof parseLinkStyleLine>> = [];
   const subgraphStack: string[] = [];
   let direction: Direction = 'LR';
 
@@ -400,6 +459,12 @@ export function parseMermaidDocument(
       continue;
     }
 
+    const parsedLinkStyle = parseLinkStyleLine(line);
+    if (parsedLinkStyle) {
+      pendingEdgeStyles.push(parsedLinkStyle);
+      continue;
+    }
+
     const parsedEdge = parseEdgeLine(line);
     if (parsedEdge) {
       const from = ensureNode(parsedEdge.from);
@@ -411,6 +476,8 @@ export function parseMermaidDocument(
           to: to.id,
           label: parsedEdge.label,
           type: parsedEdge.type,
+          strokeColor: defaultEdgeStyle.strokeColor,
+          strokeWidth: defaultEdgeStyle.strokeWidth,
         });
       }
       continue;
@@ -424,6 +491,22 @@ export function parseMermaidDocument(
 
     unsupportedLines.push(line);
   }
+
+  pendingEdgeStyles.forEach((entry) => {
+    if (!entry) {
+      return;
+    }
+
+    entry.indices.forEach((index) => {
+      const target = edges[index];
+      if (!target) {
+        return;
+      }
+
+      target.strokeColor = entry.strokeColor ?? target.strokeColor;
+      target.strokeWidth = entry.strokeWidth ?? target.strokeWidth;
+    });
+  });
 
   const nodes = [...nodeMap.values()];
   if (unsupportedLines.length > 0) {
@@ -519,9 +602,29 @@ export function serializeMermaidDocument(
     lines.push('');
   }
 
-  for (const edge of edges) {
+  const normalizedEdges = edges.map(normalizeEdgeStyle);
+
+  for (const edge of normalizedEdges) {
     const label = edge.label ? `|${edge.label}|` : '';
     lines.push(`  ${edge.from} ${edgeToken(edge.type)}${label} ${edge.to}`);
+  }
+
+  const styledEdges = normalizedEdges
+    .map((edge, index) => ({ edge, index }))
+    .filter(
+      ({ edge }) =>
+        edge.strokeColor !== defaultEdgeStyle.strokeColor ||
+        edge.strokeWidth !== defaultEdgeStyle.strokeWidth,
+    );
+
+  if (styledEdges.length > 0) {
+    lines.push('');
+  }
+
+  for (const { edge, index } of styledEdges) {
+    lines.push(
+      `  linkStyle ${index} stroke:${edge.strokeColor},stroke-width:${edge.strokeWidth}px`,
+    );
   }
 
   const styledNodes = nodes.filter(
@@ -558,6 +661,7 @@ export function syncDocument(
 ): GraphDocument {
   return {
     ...partial,
+    edges: partial.edges.map(normalizeEdgeStyle),
     source,
   };
 }
