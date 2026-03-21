@@ -38,7 +38,7 @@ import type {
 } from './lib/types';
 
 type LeftPanel = 'files' | 'graph';
-type WorkspaceTabId = 'diagram' | 'release-notes' | 'sdk';
+type WorkspaceTabId = 'diagram';
 
 interface Point {
   x: number;
@@ -55,6 +55,9 @@ interface Rect {
 interface EdgeEndpointBox extends Rect {
   id: string;
   kind: 'node' | 'subgraph';
+  fill: string;
+  stroke: string;
+  textColor: string;
 }
 
 interface DragState {
@@ -204,17 +207,23 @@ const shapeOptions: Array<{ label: string; value: NodeShape }> = [
 ];
 
 const nodeStylePresets = [
-  { id: 'sunrise', label: '晨曦', fill: '#fff5dd', stroke: '#d97706', textColor: '#7c2d12' },
-  { id: 'ocean', label: '海岸', fill: '#e0f2fe', stroke: '#0284c7', textColor: '#0f172a' },
-  { id: 'mint', label: '薄荷', fill: '#dcfce7', stroke: '#16a34a', textColor: '#14532d' },
-  { id: 'rose', label: '玫瑰', fill: '#ffe4e6', stroke: '#e11d48', textColor: '#881337' },
-  { id: 'violet', label: '暮紫', fill: '#ede9fe', stroke: '#7c3aed', textColor: '#4c1d95' },
-  { id: 'slate', label: '石墨', fill: '#e2e8f0', stroke: '#475569', textColor: '#0f172a' },
-  { id: 'ember', label: '炽焰', fill: '#ffedd5', stroke: '#ea580c', textColor: '#7c2d12' },
-  { id: 'teal', label: '湖青', fill: '#ccfbf1', stroke: '#0f766e', textColor: '#134e4a' },
-  { id: 'gold', label: '琥珀', fill: '#fef3c7', stroke: '#ca8a04', textColor: '#713f12' },
-  { id: 'night', label: '夜幕', fill: '#1f2937', stroke: '#93c5fd', textColor: '#f8fafc' },
+  { id: 'sunrise', label: '晨曦', fill: '#ffd5a1', stroke: '#f97316', textColor: '#4a1d00' },
+  { id: 'ocean', label: '海岸', fill: '#8ed8ff', stroke: '#0284c7', textColor: '#082f49' },
+  { id: 'mint', label: '薄荷', fill: '#9ef0b8', stroke: '#16a34a', textColor: '#052e16' },
+  { id: 'rose', label: '玫瑰', fill: '#ffb4c7', stroke: '#e11d48', textColor: '#4a001f' },
+  { id: 'violet', label: '暮紫', fill: '#cdb7ff', stroke: '#7c3aed', textColor: '#2e1065' },
+  { id: 'slate', label: '石墨', fill: '#cfd8e3', stroke: '#475569', textColor: '#111827' },
+  { id: 'ember', label: '炽焰', fill: '#ffb089', stroke: '#ea580c', textColor: '#431407' },
+  { id: 'teal', label: '湖青', fill: '#88ede0', stroke: '#0f766e', textColor: '#042f2e' },
+  { id: 'gold', label: '琥珀', fill: '#ffd86e', stroke: '#ca8a04', textColor: '#422006' },
+  { id: 'night', label: '夜幕', fill: '#0f172a', stroke: '#60a5fa', textColor: '#f8fafc' },
 ] as const;
+
+const subgraphVisualStyle = {
+  fill: '#d7efff',
+  stroke: '#38bdf8',
+  textColor: '#083344',
+} as const;
 
 const collaboratorPresets = [
   { id: 'lin', name: 'Lin', role: '画布', color: '#f97316' },
@@ -224,8 +233,6 @@ const collaboratorPresets = [
 
 const workspaceTabs: Array<{ id: WorkspaceTabId; label: string; detail: string }> = [
   { id: 'diagram', label: 'diagram.md', detail: '主图' },
-  { id: 'release-notes', label: 'release-notes.md', detail: '关联说明' },
-  { id: 'sdk', label: 'sdk-v0.1.md', detail: '平台规范' },
 ];
 
 const defaultLocalProjectItems: ExplorerItem[] = [
@@ -254,16 +261,6 @@ const defaultLocalProjectItems: ExplorerItem[] = [
     path: '/Users/mac/Documents/projects/roadmap-studio/docs/diagram.md',
     tabId: 'diagram',
     mode: 'canvas',
-  },
-  {
-    id: 'local-release-notes',
-    label: 'release-notes.md',
-    meta: '本地文件 / 文档草稿',
-    depth: 2,
-    kind: 'file',
-    path: '/Users/mac/Documents/projects/roadmap-studio/docs/release-notes.md',
-    tabId: 'release-notes',
-    mode: 'source',
   },
 ];
 
@@ -798,6 +795,111 @@ function withAlpha(color: string, alpha: number) {
   return color;
 }
 
+function parseColorChannels(color: string) {
+  const hex = color.trim();
+  const shortMatch = hex.match(/^#([\da-f]{3})$/i);
+  if (shortMatch) {
+    const [r, g, b] = shortMatch[1].split('').map((value) => Number.parseInt(value + value, 16));
+    return { r, g, b };
+  }
+
+  const longMatch = hex.match(/^#([\da-f]{6})$/i);
+  if (longMatch) {
+    const raw = longMatch[1];
+    return {
+      r: Number.parseInt(raw.slice(0, 2), 16),
+      g: Number.parseInt(raw.slice(2, 4), 16),
+      b: Number.parseInt(raw.slice(4, 6), 16),
+    };
+  }
+
+  const rgbMatch = hex.match(/^rgba?\(([\d.\s]+),\s*([\d.\s]+),\s*([\d.\s]+)/i);
+  if (rgbMatch) {
+    return {
+      r: Number.parseInt(rgbMatch[1].trim(), 10),
+      g: Number.parseInt(rgbMatch[2].trim(), 10),
+      b: Number.parseInt(rgbMatch[3].trim(), 10),
+    };
+  }
+
+  return null;
+}
+
+function mixColors(baseColor: string, targetColor: string, targetWeight: number) {
+  const base = parseColorChannels(baseColor);
+  const target = parseColorChannels(targetColor);
+  if (!base || !target) {
+    return targetColor;
+  }
+
+  const weight = clamp(targetWeight, 0, 1);
+  const inverse = 1 - weight;
+  const r = Math.round(base.r * inverse + target.r * weight);
+  const g = Math.round(base.g * inverse + target.g * weight);
+  const b = Math.round(base.b * inverse + target.b * weight);
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+function getRelativeLuminance(color: string) {
+  const channels = parseColorChannels(color);
+  if (!channels) {
+    return 0;
+  }
+
+  const normalizeChannel = (value: number) => {
+    const normalized = value / 255;
+    return normalized <= 0.03928
+      ? normalized / 12.92
+      : ((normalized + 0.055) / 1.055) ** 2.4;
+  };
+
+  const r = normalizeChannel(channels.r);
+  const g = normalizeChannel(channels.g);
+  const b = normalizeChannel(channels.b);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function getContrastRatio(leftColor: string, rightColor: string) {
+  const left = getRelativeLuminance(leftColor);
+  const right = getRelativeLuminance(rightColor);
+  const lighter = Math.max(left, right);
+  const darker = Math.min(left, right);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function getReadableLabelTextColor(background: string, preferred: string) {
+  if (getContrastRatio(preferred, background) >= 4.5) {
+    return preferred;
+  }
+
+  const darkCandidate = '#0f172a';
+  if (getContrastRatio(darkCandidate, background) >= 4.5) {
+    return darkCandidate;
+  }
+
+  return '#f8fafc';
+}
+
+function measureEdgeLabelBadge(label: string) {
+  const content = label.trim();
+  const estimatedWidth = Array.from(content).reduce((width, character) => {
+    if (/[\u2e80-\u9fff\uac00-\ud7af]/.test(character)) {
+      return width + 11.4;
+    }
+
+    if (/[A-Z0-9]/.test(character)) {
+      return width + 7.4;
+    }
+
+    return width + 6.5;
+  }, 0);
+
+  return {
+    width: Math.max(54, Math.ceil(estimatedWidth + 18)),
+    height: 22,
+  };
+}
+
 function getNodeRectAt(
   node: Pick<GraphNode, 'width' | 'height'>,
   point: Point,
@@ -945,7 +1047,7 @@ function buildEdgeGeometry(
     x: toAnchor.x + toAnchor.dirX * endInset + toNormal.x * endpointOffsets.to,
     y: toAnchor.y + toAnchor.dirY * endInset + toNormal.y * endpointOffsets.to,
   };
-  const laneInfluence = laneOffset * 0.52;
+  const laneInfluence = laneOffset * (Math.abs(laneOffset) >= 30 ? 0.66 : 0.52);
   const controlA = {
     x:
       start.x +
@@ -1006,7 +1108,23 @@ function buildEdgeLaneMap(edges: GraphEdge[]) {
         candidate.to === edge.from,
       ),
     );
-    const spacing = hasReciprocal ? 34 : 22;
+    if (hasReciprocal) {
+      const [canonicalFrom, canonicalTo] = [sorted[0].from, sorted[0].to].sort((left, right) => left.localeCompare(right));
+      const forward = sorted.filter((edge) => edge.from === canonicalFrom && edge.to === canonicalTo);
+      const reverse = sorted.filter((edge) => !(edge.from === canonicalFrom && edge.to === canonicalTo));
+      const assignReciprocalOffsets = (directionEdges: GraphEdge[]) => {
+        const center = (directionEdges.length - 1) / 2;
+        directionEdges.forEach((edge, index) => {
+          laneMap.set(edge.id, 40 + (index - center) * 18);
+        });
+      };
+
+      assignReciprocalOffsets(forward);
+      assignReciprocalOffsets(reverse);
+      return;
+    }
+
+    const spacing = 22;
     sorted.forEach((edge, index) => {
       laneMap.set(edge.id, (index - (sorted.length - 1) / 2) * spacing);
     });
@@ -1108,7 +1226,7 @@ function duplicateNodesWithEdges(document: GraphDocument, sourceIds: string[], o
       ]);
       nodeIdMap.set(node.id, nextId);
       return {
-        ...resizeNodeToContent(node, `${node.label} 副本`),
+        ...resizeNodeToContent(node, node.label),
         id: nextId,
         x: node.x + offset.x,
         y: node.y + offset.y,
@@ -1592,11 +1710,15 @@ function searchFreeRect(
 
 function compactDocumentNodes(document: GraphDocument) {
   const primaryIsVertical = document.direction === 'TD' || document.direction === 'BT';
-  const clusterThreshold = primaryIsVertical ? 230 : 180;
-  const preferredTrackGap = primaryIsVertical ? 108 : 96;
-  const minTrackGap = primaryIsVertical ? 72 : 64;
-  const preferredPrimaryGap = primaryIsVertical ? 84 : 96;
-  const minPrimaryGap = primaryIsVertical ? 52 : 58;
+  const clusterThreshold = primaryIsVertical ? 210 : 172;
+  const maxTrackGap = primaryIsVertical ? 132 : 116;
+  const minTrackGap = primaryIsVertical ? 80 : 72;
+  const preferredTrackGap = primaryIsVertical ? 104 : 92;
+  const maxPrimaryGap = primaryIsVertical ? 116 : 124;
+  const minPrimaryGap = primaryIsVertical ? 56 : 62;
+  const preferredPrimaryGap = primaryIsVertical ? 82 : 88;
+  const maxTrackShift = primaryIsVertical ? 44 : 38;
+  const maxNodeShift = primaryIsVertical ? 52 : 56;
   const orderedNodes = [...document.nodes].sort((left, right) => {
     const leftMinor = primaryIsVertical ? left.x : left.y;
     const rightMinor = primaryIsVertical ? right.x : right.y;
@@ -1625,6 +1747,7 @@ function compactDocumentNodes(document: GraphDocument) {
   tracks.sort((left, right) => left.axis - right.axis);
   const nextPositions = new Map<string, Point>();
   let previousTrackEnd: number | null = null;
+  let previousTrackAxis: number | null = null;
 
   tracks.forEach((track, trackIndex) => {
     const sortedTrackNodes = [...track.nodes].sort((left, right) => {
@@ -1636,12 +1759,19 @@ function compactDocumentNodes(document: GraphDocument) {
     const trackMax = Math.max(...sortedTrackNodes.map((node) => primaryIsVertical ? node.x + node.width : node.y + node.height));
     let trackShift = 0;
 
-    if (trackIndex > 0 && previousTrackEnd !== null) {
+    if (trackIndex > 0 && previousTrackEnd !== null && previousTrackAxis !== null) {
       const currentGap = trackMin - previousTrackEnd;
-      if (currentGap > preferredTrackGap) {
-        trackShift = -(currentGap - preferredTrackGap);
+      if (currentGap > maxTrackGap) {
+        trackShift = -Math.min(maxTrackShift, Math.round((currentGap - preferredTrackGap) * 0.42));
       } else if (currentGap < minTrackGap) {
-        trackShift = minTrackGap - currentGap;
+        trackShift = Math.min(maxTrackShift, minTrackGap - currentGap);
+      }
+
+      const axisGap = track.axis + trackShift - previousTrackAxis;
+      if (axisGap > maxTrackGap) {
+        trackShift -= Math.min(maxTrackShift, Math.round((axisGap - preferredTrackGap) * 0.35));
+      } else if (axisGap < minTrackGap) {
+        trackShift += Math.min(maxTrackShift, Math.round((minTrackGap - axisGap) * 0.7));
       }
     }
 
@@ -1653,13 +1783,11 @@ function compactDocumentNodes(document: GraphDocument) {
       let nextPrimary = originalPrimary;
 
       if (previousPlacedEnd !== null) {
-        const preferredPrimary = previousPlacedEnd + preferredPrimaryGap;
-        const minimumPrimary = previousPlacedEnd + minPrimaryGap;
-        if (nextPrimary > preferredPrimary) {
-          nextPrimary = preferredPrimary;
-        }
-        if (nextPrimary < minimumPrimary) {
-          nextPrimary = minimumPrimary;
+        const originalGap = nextPrimary - previousPlacedEnd;
+        if (originalGap > maxPrimaryGap) {
+          nextPrimary -= Math.min(maxNodeShift, Math.round((originalGap - preferredPrimaryGap) * 0.45));
+        } else if (originalGap < minPrimaryGap) {
+          nextPrimary += Math.min(maxNodeShift, Math.round((minPrimaryGap - originalGap) * 0.85));
         }
       }
 
@@ -1674,6 +1802,7 @@ function compactDocumentNodes(document: GraphDocument) {
     });
 
     previousTrackEnd = trackMax + trackShift;
+    previousTrackAxis = track.axis + trackShift;
   });
 
   return document.nodes.map((node) => {
@@ -2028,6 +2157,9 @@ export default function App() {
         y: node.y,
         width: node.width,
         height: node.height,
+        fill: node.fill,
+        stroke: node.stroke,
+        textColor: node.textColor,
       })),
       ...subgraphFrames.map((frame) => ({
         id: frame.id,
@@ -2036,6 +2168,9 @@ export default function App() {
         y: frame.y,
         width: frame.width,
         height: frame.height,
+        fill: subgraphVisualStyle.fill,
+        stroke: subgraphVisualStyle.stroke,
+        textColor: subgraphVisualStyle.textColor,
       })),
     ],
     [subgraphFrames, visibleNodes],
@@ -2120,34 +2255,6 @@ export default function App() {
         path: 'cloud://projects/product-graph-platform/docs/diagram.md',
         tabId: 'diagram',
         mode: 'canvas',
-      },
-      {
-        id: 'cloud-release-notes',
-        label: 'release-notes.md',
-        meta: '云端文档 / 评审说明',
-        depth: 2,
-        kind: 'file',
-        path: 'cloud://projects/product-graph-platform/docs/release-notes.md',
-        tabId: 'release-notes',
-        mode: 'source',
-      },
-      {
-        id: 'cloud-sdk-folder',
-        label: 'sdk',
-        meta: '扩展接口目录',
-        depth: 1,
-        kind: 'folder',
-        path: 'cloud://projects/product-graph-platform/sdk',
-      },
-      {
-        id: 'cloud-sdk',
-        label: 'sdk-v0.1.md',
-        meta: '云端文档 / SDK 规范',
-        depth: 2,
-        kind: 'file',
-        path: 'cloud://projects/product-graph-platform/sdk/sdk-v0.1.md',
-        tabId: 'sdk',
-        mode: 'source',
       },
     ],
     [documentState.edges.length, documentState.nodes.length],
@@ -2417,6 +2524,9 @@ export default function App() {
           y: node.y,
           width: node.width,
           height: node.height,
+          fill: node.fill,
+          stroke: node.stroke,
+          textColor: node.textColor,
         })),
         ...liveFrames.map((frame) => ({
           id: frame.id,
@@ -2425,6 +2535,9 @@ export default function App() {
           y: frame.y,
           width: frame.width,
           height: frame.height,
+          fill: subgraphVisualStyle.fill,
+          stroke: subgraphVisualStyle.stroke,
+          textColor: subgraphVisualStyle.textColor,
         })),
       ];
       const liveEndpointMap = new Map<string, EdgeEndpointBox>(
@@ -2650,7 +2763,7 @@ export default function App() {
         nodes: compactDocumentNodes(current),
       }),
       '已整理布局',
-      '已在当前摆放基础上温和收紧布局。',
+      '已按当前编排做局部整理，不会重排整张图。',
     );
   }, [commitDocument]);
 
@@ -2849,7 +2962,7 @@ export default function App() {
         ]);
         nodeIdMap.set(node.id, nextId);
         return {
-          ...resizeNodeToContent(node, `${node.label} 副本`),
+          ...resizeNodeToContent(node, node.label),
           id: nextId,
           x: node.x + 40,
           y: node.y + 40,
@@ -4062,7 +4175,7 @@ export default function App() {
     setEditingSubgraphTitle('');
   }, [selection.kind]);
 
-  // External Control API - allows external AI agents to control the editor
+  // External Control API - allows external tools to control the editor
   useEffect(() => {
     const api = {
       setSource: (code: string) => {
@@ -4393,6 +4506,17 @@ export default function App() {
           ))}
         </nav>
 
+        {!isMobileViewport ? (
+          <button
+            aria-label={showSidebar ? '收起左侧侧栏' : '展开左侧侧栏'}
+            className="edge-toggle edge-toggle--left"
+            onClick={() => setSidebarOpen((current) => !current)}
+            type="button"
+          >
+            <WorkbenchIcon name={showSidebar ? 'chevron-left' : 'chevron-right'} />
+          </button>
+        ) : null}
+
         <aside className={`sidebar${showSidebar ? ' is-open' : ''}`}>
           {isMobileViewport ? (
             <div className="mobile-sheet-handle" aria-hidden="true" />
@@ -4413,42 +4537,13 @@ export default function App() {
               ))}
             </div>
           ) : null}
-          <section className="sidebar-card sidebar-card--header">
-            <div>
-              <p className="eyebrow">
-                {leftPanel === 'files' ? '项目资源' : '图谱导航'}
-              </p>
-              <h2>
-                {leftPanel === 'files' ? '文件面板' : '图谱导航'}
-              </h2>
-            </div>
-            <div className="panel-header-actions">
-              <span className="panel-badge">
-                {leftPanel === 'files' ? '云端 + 本地' : '联动画布'}
-              </span>
-              <button
-                aria-label="收起左侧面板"
-                className="panel-icon-button has-tooltip"
-                data-tooltip="收起侧栏"
-                onClick={() => setSidebarOpen(false)}
-                type="button"
-              >
-                <WorkbenchIcon name="chevron-left" />
-              </button>
-            </div>
-          </section>
-
           {!isMobileViewport ? (
             <section className="sidebar-card sidebar-card--search">
-              <div className="sidebar-card__header">
-                <h2>搜索框</h2>
-                <span>定位</span>
-              </div>
               <label className="field">
                 <input
                   value={searchQuery}
                   onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder="查找节点、分组、源码"
+                  placeholder={leftPanel === 'files' ? '查找文件、节点、源码' : '查找图层、节点、分组'}
                 />
               </label>
             </section>
@@ -4518,20 +4613,6 @@ export default function App() {
 
           {leftPanel === 'graph' ? (
             <>
-              <section className="sidebar-card">
-                <p className="sidebar-copy">
-                  图谱按树形层级展示分组与节点。点击任一项后会把当前焦点定位回主舞台。
-                </p>
-                <label className="field">
-                  <span>搜索</span>
-                  <input
-                    value={searchQuery}
-                    onChange={(event) => setSearchQuery(event.target.value)}
-                    placeholder="查找图层、节点、分组"
-                  />
-                </label>
-              </section>
-
               <section className="sidebar-card">
                 <div className="sidebar-card__header">
                   <h2>图层树</h2>
@@ -4780,7 +4861,7 @@ export default function App() {
                         orient="auto"
                         markerUnits="userSpaceOnUse"
                       >
-                        <path d="M0,0 L13.4,6.7 L0,13.4 z" fill="rgba(255,255,255,0.96)" />
+                        <path d="M0,0 L13.4,6.7 L0,13.4 z" fill="rgba(255,255,255,0.56)" />
                       </marker>
                       <marker
                         id="arrow-solid"
@@ -4794,9 +4875,9 @@ export default function App() {
                         <path
                           d="M0,0 L11.2,5.6 L0,11.2 z"
                           fill="context-stroke"
-                          fillOpacity="0.68"
-                          stroke="rgba(255,255,255,0.96)"
-                          strokeWidth="0.96"
+                          fillOpacity="1"
+                          stroke="rgba(255,255,255,0.68)"
+                          strokeWidth="0.7"
                         />
                       </marker>
                     </defs>
@@ -4809,6 +4890,10 @@ export default function App() {
                       }
 
                       const isGroupEdge = fromNode.kind === 'subgraph' || toNode.kind === 'subgraph';
+                      const isEdgeSelected =
+                        selection.kind === 'edge' && selectionContains(selection, edge.id);
+                      const inheritsSourceColor =
+                        normalizedEdge.strokeColor === defaultEdgeStyle.strokeColor;
 
                       const geometry = buildEdgeGeometry(
                         fromNode,
@@ -4816,31 +4901,54 @@ export default function App() {
                         edgeLaneMap.get(edge.id) ?? 0,
                         edgeEndpointOffsetMap.get(edge.id),
                       );
+                      const edgeBaseColor = inheritsSourceColor
+                        ? fromNode.stroke
+                        : normalizedEdge.strokeColor;
                       const baseStrokeWidth = isGroupEdge
                         ? normalizedEdge.strokeWidth * 2
                         : normalizedEdge.strokeWidth;
+                      const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 2.8 : 2.05);
                       const selectedEdgeStrokeWidth =
-                        selection.kind === 'edge' && selectionContains(selection, edge.id)
-                          ? baseStrokeWidth + 0.8
-                          : baseStrokeWidth;
-                      const displayStroke = isGroupEdge
-                        ? 'rgba(56, 189, 248, 0.78)'
-                        : withAlpha(normalizedEdge.strokeColor, 0.6);
-                      const outlineWidth = selectedEdgeStrokeWidth + (isGroupEdge ? 2.6 : 2);
+                        isEdgeSelected
+                          ? visualStrokeWidth + 0.8
+                          : visualStrokeWidth;
+                      const displayStroke = withAlpha(edgeBaseColor, isGroupEdge ? 0.97 : 0.95);
+                      const outlineWidth = selectedEdgeStrokeWidth + (isGroupEdge ? 0.95 : 0.75);
+                      const labelBackground = mixColors(
+                        edgeBaseColor,
+                        '#f8fafc',
+                        inheritsSourceColor ? 0.82 : 0.86,
+                      );
+                      const labelTextColor = getReadableLabelTextColor(
+                        labelBackground,
+                        edgeBaseColor,
+                      );
+                      const labelBorder = withAlpha(edgeBaseColor, isEdgeSelected ? 0.82 : 0.64);
+                      const labelMetrics = edge.label ? measureEdgeLabelBadge(edge.label) : null;
 
                       return (
                         <g key={edge.id}>
+                          {isEdgeSelected ? (
+                            <path
+                              className={`edge-path edge-path--selection${isGroupEdge ? ' is-group-edge' : ''}`}
+                              d={geometry.path}
+                              markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-outline)'}
+                              pointerEvents="none"
+                              stroke={withAlpha(edgeBaseColor, 0.9)}
+                              strokeWidth={selectedEdgeStrokeWidth + (isGroupEdge ? 8 : 7)}
+                            />
+                          ) : null}
                           <path
-                            className={`edge-path edge-path--outline edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${selection.kind === 'edge' && selectionContains(selection, edge.id) ? ' is-selected' : ''}`}
+                            className={`edge-path edge-path--outline edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
                             d={geometry.path}
                             markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-outline)'}
                             pointerEvents="none"
                             stroke="#f8fafc"
-                            strokeOpacity={0.94}
+                            strokeOpacity={0.72}
                             strokeWidth={outlineWidth}
                           />
                           <path
-                            className={`edge-path edge-path--main edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${selection.kind === 'edge' && selectionContains(selection, edge.id) ? ' is-selected' : ''}`}
+                            className={`edge-path edge-path--main edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
                             d={geometry.path}
                             markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-solid)'}
                             pointerEvents="none"
@@ -4896,24 +5004,42 @@ export default function App() {
                               />
                             </foreignObject>
                           ) : edge.label ? (
-                            <text
-                              className={`edge-label${isGroupEdge ? ' is-group-edge' : ''}`}
+                            <g
+                              className={`edge-label-group${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
                               onDoubleClick={(event) => {
                                 event.stopPropagation();
                                 startEdgeInlineEdit(edge);
                               }}
-                              x={geometry.label.x}
-                              y={geometry.label.y - 10}
+                              transform={`translate(${geometry.label.x}, ${geometry.label.y})`}
                             >
-                              <tspan
-                                onDoubleClick={(event) => {
-                                  event.stopPropagation();
-                                  startEdgeInlineEdit(edge);
-                                }}
+                              <rect
+                                className={`edge-label-badge${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
+                                fill={labelBackground}
+                                height={labelMetrics?.height ?? 22}
+                                rx={11}
+                                stroke={labelBorder}
+                                strokeWidth={isEdgeSelected ? 1.6 : 1}
+                                width={labelMetrics?.width ?? 54}
+                                x={-((labelMetrics?.width ?? 54) / 2)}
+                                y={-((labelMetrics?.height ?? 22) / 2)}
+                              />
+                              <text
+                                className={`edge-label${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
+                                dominantBaseline="middle"
+                                fill={labelTextColor}
+                                x={0}
+                                y={0}
                               >
-                                {edge.label}
-                              </tspan>
-                            </text>
+                                <tspan
+                                  onDoubleClick={(event) => {
+                                    event.stopPropagation();
+                                    startEdgeInlineEdit(edge);
+                                  }}
+                                >
+                                  {edge.label}
+                                </tspan>
+                              </text>
+                            </g>
                           ) : null}
                         </g>
                       );
@@ -4931,6 +5057,10 @@ export default function App() {
                           return buildPreviewEdgePath(originNode, connectingState.current, connectingState.handleSide);
                         })()}
                         markerEnd={connectingState.edgeType === 'line' ? undefined : 'url(#arrow-solid)'}
+                        stroke={(() => {
+                          const originNode = edgeEndpointMap.get(connectingState.fromId);
+                          return originNode ? withAlpha(originNode.stroke, 0.9) : undefined;
+                        })()}
                       />
                     ) : null}
                   </svg>
@@ -5240,18 +5370,6 @@ export default function App() {
           {isMobileViewport ? (
             <div className="mobile-sheet-handle" aria-hidden="true" />
           ) : null}
-          <div className="inspector-heading">
-            <span>{selectedNode ? '节点属性' : selectedEdge ? '连线属性' : selectedSubgraph ? '分组属性' : '属性'}</span>
-            <button
-              aria-label="收起属性面板"
-              className="panel-icon-button has-tooltip"
-              data-tooltip="收起属性"
-              onClick={() => setInspectorOpen(false)}
-              type="button"
-            >
-              <WorkbenchIcon name="chevron-right" />
-            </button>
-          </div>
 
           {selectedNode ? (
             <section className="sidebar-card">
@@ -5496,6 +5614,17 @@ export default function App() {
             </section>
           ) : null}
         </aside>
+
+        {!isMobileViewport ? (
+          <button
+            aria-label={showInspector ? '收起右侧侧栏' : '展开右侧侧栏'}
+            className="edge-toggle edge-toggle--right"
+            onClick={() => setInspectorOpen((current) => !current)}
+            type="button"
+          >
+            <WorkbenchIcon name={showInspector ? 'chevron-right' : 'chevron-left'} />
+          </button>
+        ) : null}
 
         {isMobileViewport && mode === 'source' ? (
           <section className={`mobile-source-preview-sheet${mobileSourcePreviewOpen ? ' is-open' : ''}`}>

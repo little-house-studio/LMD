@@ -41,7 +41,9 @@ html,
 body,
 #root {
   height: 100%;
+  width: 100%;
   margin: 0;
+  overflow: hidden;
   overscroll-behavior: none;
 }
 
@@ -86,7 +88,6 @@ body {
 .app-shell--constrained .panel-icon-button,
 .app-shell--constrained .mode-pill,
 .app-shell--constrained .project-item,
-.app-shell--constrained .ai-card,
 .app-shell--constrained .explorer-item,
 .app-shell--constrained .tool-dock__button,
 .app-shell--constrained .nav-rail__button,
@@ -106,7 +107,6 @@ body {
 .app-shell--constrained .panel-icon-button:hover,
 .app-shell--constrained .mode-pill:hover,
 .app-shell--constrained .project-item:hover,
-.app-shell--constrained .ai-card:hover,
 .app-shell--constrained .explorer-item:hover,
 .app-shell--constrained .tool-dock__button:hover,
 .app-shell--constrained .nav-rail__button:hover,
@@ -147,12 +147,16 @@ select:focus-visible {
 }
 
 .app-shell {
-  position: relative;
+  position: fixed;
+  inset: 0;
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 8px;
-  height: 100vh;
+  height: 100dvh;
+  min-height: 100dvh;
+  max-height: 100dvh;
   padding: 8px;
+  overflow: hidden;
 }
 
 .diagnostic-shell {
@@ -240,11 +244,11 @@ select:focus-visible {
 .workbench-bar {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  gap: 6px;
+  gap: 4px;
   align-items: center;
   width: 100%;
-  min-height: 40px;
-  padding: 4px 6px;
+  min-height: 36px;
+  padding: 3px 4px;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: rgba(14, 16, 19, 0.94);
@@ -261,7 +265,7 @@ select:focus-visible {
 .desktop-commandbar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
   overflow: auto;
   padding-bottom: 1px;
@@ -271,30 +275,30 @@ select:focus-visible {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 3px;
+  padding: 2px;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.03);
 }
 
 .desktop-command-group__label {
-  padding: 0 8px 0 6px;
+  padding: 0 6px 0 4px;
   color: var(--ink-faint);
-  font-size: 0.7rem;
+  font-size: 0.66rem;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
 .desktop-command-button {
-  min-width: 54px;
-  height: 28px;
-  padding: 0 10px;
+  min-width: 46px;
+  height: 26px;
+  padding: 0 8px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--ink);
-  font-size: 0.8rem;
+  font-size: 0.76rem;
   font-weight: 600;
 }
 
@@ -335,7 +339,7 @@ select:focus-visible {
 .sidebar-card h2,
 .pane-header h2 {
   margin: 0;
-  font-size: 1rem;
+  font-size: 0.9rem;
 }
 
 .workbench-tabs {
@@ -350,9 +354,9 @@ select:focus-visible {
 .desktop-path-chip {
   display: inline-grid;
   gap: 1px;
-  min-width: 220px;
-  max-width: 340px;
-  padding: 5px 10px;
+  min-width: 188px;
+  max-width: 280px;
+  padding: 4px 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.02);
@@ -426,7 +430,6 @@ select:focus-visible {
 .panel-icon-button:hover,
 .mode-pill:hover,
 .project-item:hover,
-.ai-card:hover,
 .explorer-item:hover,
 .tool-dock__button:hover,
 .nav-rail__button:hover,
@@ -665,13 +668,14 @@ select:focus-visible {
 }
 
 .workspace {
-  --nav-width: 42px;
+  --nav-width: 38px;
   --sidebar-width: 0px;
   --inspector-width: 0px;
   flex: 1;
   position: relative;
   min-height: 0;
-  height: calc(100vh - 70px);
+  height: 100%;
+  max-height: 100%;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: rgba(12, 14, 18, 0.84);
@@ -680,11 +684,11 @@ select:focus-visible {
 }
 
 .workspace--sidebar-open {
-  --sidebar-width: 220px;
+  --sidebar-width: 196px;
 }
 
 .workspace--inspector-open {
-  --inspector-width: 196px;
+  --inspector-width: 184px;
 }
 
 .nav-rail,
@@ -712,16 +716,16 @@ select:focus-visible {
   align-items: stretch;
   gap: 0;
   width: var(--nav-width);
-  padding: 4px;
+  padding: 2px;
   border-right: 1px solid var(--line);
 }
 
 .nav-rail__button {
   display: grid;
   place-items: center;
-  gap: 4px;
-  min-height: 54px;
-  padding: 4px 0;
+  gap: 2px;
+  min-height: 42px;
+  padding: 3px 0;
   border-radius: var(--radius-sm);
   border-bottom: 0;
   background: transparent;
@@ -729,7 +733,7 @@ select:focus-visible {
 }
 
 .nav-rail__label {
-  font-size: 0.66rem;
+  font-size: 0.62rem;
   font-weight: 700;
   letter-spacing: 0.04em;
 }
@@ -744,11 +748,11 @@ select:focus-visible {
 .inspector {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
   overflow: auto;
   top: 0;
   bottom: 0;
-  padding: 10px;
+  padding: 7px;
   opacity: 0;
   pointer-events: none;
   transition:
@@ -759,14 +763,14 @@ select:focus-visible {
 
 .sidebar {
   left: var(--nav-width);
-  width: 220px;
+  width: 196px;
   border-right: 1px solid var(--line);
   transform: translateX(-100%);
 }
 
 .inspector {
   right: 0;
-  width: 196px;
+  width: 184px;
   border-left: 1px solid var(--line);
   transform: translateX(100%);
 }
@@ -776,6 +780,39 @@ select:focus-visible {
   opacity: 1;
   pointer-events: auto;
   transform: translateX(0);
+}
+
+.edge-toggle {
+  position: absolute;
+  top: 50%;
+  z-index: 18;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 52px;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: rgba(24, 27, 33, 0.98);
+  color: var(--ink-soft);
+  transform: translateY(-50%);
+}
+
+.edge-toggle:hover,
+.edge-toggle:focus-visible {
+  color: var(--ink);
+  background: rgba(32, 36, 43, 1);
+}
+
+.edge-toggle--left {
+  left: calc(var(--nav-width) + var(--sidebar-width) - 1px);
+  border-left: 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.edge-toggle--right {
+  right: calc(var(--inspector-width) - 1px);
+  border-right: 0;
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
 }
 
 .workspace-main {
@@ -811,35 +848,16 @@ select:focus-visible {
 
 .sidebar-card {
   display: grid;
-  gap: 8px;
-  padding: 8px;
+  gap: 6px;
+  padding: 4px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
-.sidebar-card--header {
-  gap: 8px;
-}
-
-.sidebar-card--search {
-  background: rgba(255, 255, 255, 0.015);
-}
-
-.sidebar-card--muted {
-  background: var(--bg-panel-muted);
-}
-
-.panel-header-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.panel-badge {
-  justify-self: start;
-  padding: 4px 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  color: var(--ink-faint);
-  font-size: 0.7rem;
+.sidebar-card + .sidebar-card {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 8px;
 }
 
 .sidebar-card__header,
@@ -847,29 +865,29 @@ select:focus-visible {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  gap: 12px;
+  gap: 8px;
 }
 
 .sidebar-copy,
 .source-status p,
 .preview-empty p,
 .history-card p,
-.ai-card span,
 .canvas-hud__card span {
   margin: 0;
   color: var(--ink-soft);
-  font-size: 0.84rem;
+  font-size: 0.76rem;
+  line-height: 1.35;
 }
 
 .field {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .field span,
 .toggle-row span {
   color: var(--ink-faint);
-  font-size: 0.82rem;
+  font-size: 0.76rem;
   font-weight: 600;
 }
 
@@ -886,8 +904,8 @@ select:focus-visible {
 
 .field input,
 .field select {
-  height: 34px;
-  padding: 0 10px;
+  height: 30px;
+  padding: 0 8px;
 }
 
 .field input[type='color'] {
@@ -897,18 +915,16 @@ select:focus-visible {
 .project-list,
 .graph-tree,
 .history-timeline,
-.ai-list,
 .presence-list,
 .activity-feed,
 .stack-list {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
-.project-item,
-.ai-card {
+.project-item {
   width: 100%;
-  padding: 9px 10px;
+  padding: 7px 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.04);
@@ -919,10 +935,10 @@ select:focus-visible {
 .graph-tree__item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   width: 100%;
-  min-height: 34px;
-  padding: 7px 8px;
+  min-height: 28px;
+  padding: 4px 6px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -965,13 +981,13 @@ select:focus-visible {
 }
 
 .graph-tree__body strong {
-  font-size: 0.84rem;
+  font-size: 0.8rem;
   font-weight: 600;
 }
 
 .graph-tree__body small {
   color: var(--ink-faint);
-  font-size: 0.72rem;
+  font-size: 0.68rem;
 }
 
 .project-item {
@@ -1003,9 +1019,9 @@ select:focus-visible {
 .explorer-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   width: 100%;
-  padding: 7px 8px;
+  padding: 4px 6px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -1021,8 +1037,8 @@ select:focus-visible {
 
 .explorer-item__marker {
   flex: 0 0 auto;
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   border-radius: 999px;
 }
 
@@ -1055,7 +1071,7 @@ select:focus-visible {
 .info-row strong,
 .activity-item strong,
 .presence-list__item strong {
-  font-size: 0.84rem;
+  font-size: 0.8rem;
   font-weight: 600;
 }
 
@@ -1270,10 +1286,12 @@ select:focus-visible {
 }
 
 .subgraph-frame.is-selected {
-  border-color: rgba(96, 165, 250, 0.62);
+  border-color: rgba(125, 211, 252, 0.96);
+  transform: translateY(-2px);
   box-shadow:
-    0 22px 46px rgba(2, 6, 23, 0.34),
-    0 0 0 1px rgba(96, 165, 250, 0.28),
+    0 26px 52px rgba(2, 6, 23, 0.38),
+    0 0 0 2px rgba(56, 189, 248, 0.46),
+    0 0 0 8px rgba(56, 189, 248, 0.12),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
@@ -1483,9 +1501,17 @@ select:focus-visible {
   stroke-width: 1.8;
 }
 
+.edge-path--selection {
+  filter: drop-shadow(0 0 10px rgba(56, 189, 248, 0.42));
+}
+
+.edge-path--selection.is-group-edge {
+  filter: drop-shadow(0 0 12px rgba(34, 211, 238, 0.46));
+}
+
 .edge-path--main.is-selected,
 .edge-path--outline.is-selected {
-  filter: drop-shadow(0 0 6px rgba(96, 165, 250, 0.5));
+  filter: drop-shadow(0 0 9px rgba(96, 165, 250, 0.72));
 }
 
 .edge-path--main.is-group-edge,
@@ -1501,15 +1527,31 @@ select:focus-visible {
 }
 
 .edge-label {
-  fill: #e9edf2;
   font-size: 12px;
   font-family: ui-monospace, 'SFMono-Regular', 'SF Mono', Consolas, monospace;
   text-anchor: middle;
   cursor: text;
+  font-weight: 700;
+  pointer-events: none;
 }
 
-.edge-label.is-group-edge {
-  fill: #bae6fd;
+.edge-label-group {
+  cursor: text;
+  pointer-events: auto;
+}
+
+.edge-label-badge {
+  filter: drop-shadow(0 2px 6px rgba(15, 23, 42, 0.22));
+}
+
+.edge-label-badge.is-selected {
+  filter:
+    drop-shadow(0 0 0.75px rgba(255, 255, 255, 0.24))
+    drop-shadow(0 4px 10px rgba(15, 23, 42, 0.28));
+}
+
+.edge-label.is-selected {
+  font-weight: 800;
 }
 
 .edge-label-editor-fo {
@@ -1567,8 +1609,12 @@ select:focus-visible {
 }
 
 .graph-node.is-selected {
-  border-color: rgba(37, 99, 235, 0.78);
-  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.18), 0 18px 32px rgba(0, 0, 0, 0.32);
+  border-color: rgba(125, 211, 252, 1);
+  transform: translateY(-2px);
+  box-shadow:
+    0 0 0 2px rgba(56, 189, 248, 0.72),
+    0 0 0 8px rgba(56, 189, 248, 0.16),
+    0 20px 34px rgba(0, 0, 0, 0.34);
 }
 
 .graph-node--rect,
@@ -1619,6 +1665,9 @@ select:focus-visible {
 .graph-node.is-selected .graph-node__connector {
   opacity: 1;
   transform: scale(1);
+  border-color: rgba(56, 189, 248, 0.62);
+  background: rgba(224, 242, 254, 0.96);
+  box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.14), 0 10px 22px rgba(0, 0, 0, 0.24);
 }
 
 .graph-node__connector:hover {
@@ -1949,31 +1998,9 @@ select:focus-visible {
   gap: 12px;
 }
 
-.ai-list {
-  margin-top: 2px;
-}
-
-.ai-card strong {
-  display: block;
-  margin-bottom: 4px;
-}
-
 .inspector-actions {
   display: flex;
   justify-content: flex-end;
-}
-
-.inspector-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 8px 8px 0;
-  color: var(--ink-faint);
-  font-size: 0.68rem;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
 }
 
 .inspector-empty {
@@ -1989,13 +2016,10 @@ select:focus-visible {
 }
 
 @media (max-width: 1180px) {
-  body {
-    overflow: auto;
-  }
-
   .app-shell {
-    height: auto;
-    min-height: 100vh;
+    height: 100dvh;
+    min-height: 100dvh;
+    max-height: 100dvh;
   }
 
   .workbench-bar {
@@ -2008,8 +2032,9 @@ select:focus-visible {
   }
 
   .workspace {
-    min-height: calc(100vh - 126px);
-    height: calc(100vh - 126px);
+    min-height: 0;
+    height: 100%;
+    max-height: 100%;
   }
 
   .nav-rail {
@@ -2034,6 +2059,10 @@ select:focus-visible {
 
   .workspace--inspector-open .workspace-main {
     right: 0;
+  }
+
+  .edge-toggle {
+    display: none;
   }
 
   .source-mode {
