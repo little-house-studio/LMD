@@ -33,10 +33,10 @@ export class RootErrorBoundary extends Component<
             </p>
             <pre className="diagnostic-code">{this.state.error.message}</pre>
             <div className="diagnostic-actions">
-              <a className="solid-button" href="/?safe=1">
+              <a className="solid-button" href="?safe=1">
                 打开安全模式
               </a>
-              <a className="ghost-button" href="/?reset=1">
+              <a className="ghost-button" href="?reset=1">
                 重置本地工作区
               </a>
             </div>
@@ -71,13 +71,13 @@ export function DiagnosticShell() {
         </div>
 
         <div className="diagnostic-actions">
-          <a className="solid-button" href="/">
+          <a className="solid-button" href="./">
             打开完整编辑器
           </a>
-          <a className="ghost-button" href="/?reset=1">
+          <a className="ghost-button" href="?reset=1">
             重置本地工作区
           </a>
-          <a className="ghost-button" href="/?reset=1&safe=1">
+          <a className="ghost-button" href="?reset=1&safe=1">
             安全模式 + 重置
           </a>
         </div>

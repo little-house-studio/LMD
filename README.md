@@ -11,7 +11,7 @@ pnpm dev
 
 默认开发地址：
 
-- `http://127.0.0.1:5173/LTHS_MD/`
+- `http://127.0.0.1:5173/`
 
 ## 生产构建
 
@@ -48,7 +48,7 @@ pnpm build
 
 ## nginx 部署示例
 
-站点建议挂到 `/LTHS_MD/`，与当前 Vite `base` 保持一致。
+构建产物使用相对资源路径，可部署在站点根路径，也可挂在任意子目录。
 
 ```nginx
 server {
@@ -57,8 +57,8 @@ server {
 
   root /srv/www;
 
-  location /LTHS_MD/ {
-    try_files $uri $uri/ /LTHS_MD/index.html;
+  location / {
+    try_files $uri $uri/ /index.html;
   }
 
   location ~* \.(js|css|svg|png|jpg|jpeg|webp|woff2?)$ {
@@ -73,8 +73,8 @@ server {
 
 建议目录：
 
-- `/srv/www/LTHS_MD/index.html`
-- `/srv/www/LTHS_MD/assets/...`
+- `/srv/www/index.html`
+- `/srv/www/assets/...`
 
 ## 当前已做的低性能优化
 
