@@ -54,6 +54,17 @@ export interface LayoutSidecar {
   subgraphs: Record<string, { collapsed: boolean }>;
 }
 
+export interface ProjectCompatLayer {
+  version: number;
+  layout: LayoutSidecar;
+  editor?: {
+    localFileActions?: {
+      enabled: boolean;
+    };
+  };
+  extras?: Record<string, unknown>;
+}
+
 export interface GraphDocument {
   direction: Direction;
   nodes: GraphNode[];
@@ -63,6 +74,12 @@ export interface GraphDocument {
   unsupportedLines: string[];
   source: string;
   layout: LayoutSidecar;
+  markdown?: string;
+  projectName?: string;
+  projectSummary?: string;
+  prefixMarkdown?: string;
+  suffixMarkdown?: string;
+  compat?: ProjectCompatLayer;
 }
 
 export interface HistoryEntry {
@@ -73,7 +90,7 @@ export interface HistoryEntry {
 }
 
 export interface SelectionState {
-  kind: 'none' | 'node' | 'edge' | 'subgraph';
+  kind: 'none' | 'node' | 'edge' | 'subgraph' | 'content';
   ids: string[];
 }
 

@@ -17,11 +17,16 @@ import {
   defaultEdgeStyle,
   measureNodeContentSize,
   normalizeEdgeStyle,
-  parseMermaidDocument,
   serializeMermaidDocument,
-  syncDocument,
 } from './lib/mermaid';
-import { sampleSource } from './lib/sample';
+import {
+  createProjectMarkdownTemplate,
+  extractMermaidFromProjectMarkdown,
+  parseProjectMarkdown,
+  serializeProjectMarkdown,
+  standardizeProjectMarkdown,
+} from './lib/projectMarkdown';
+import { sampleProjectMarkdown } from './lib/sample';
 import { storageKeys } from './lib/storage';
 import type {
   Direction,
@@ -61,7 +66,7 @@ interface EdgeEndpointBox extends Rect {
 }
 
 interface DragState {
-  kind: 'node' | 'subgraph';
+  kind: 'node' | 'subgraph' | 'content';
   origin: Point;
   current: Point;
   ids: string[];
@@ -111,6 +116,28 @@ interface GraphTreeItem {
   meta: string;
 }
 
+interface ContentInspectorDraft {
+  markdown: string;
+}
+
+interface ProjectInspectorDraft {
+  projectName: string;
+  projectSummary: string;
+  contentMarkdown: string;
+}
+
+interface ContentCardLayout {
+  x: number;
+  y: number;
+  collapsed: boolean;
+}
+
+interface MiniMapDragState {
+  pointerId: number;
+  grabOffsetX: number;
+  grabOffsetY: number;
+}
+
 const PINCH_RESPONSE = 1.3;
 const WHEEL_PINCH_DIVISOR = 360;
 const SUBGRAPH_HEADER_HEIGHT = 42;
@@ -121,6 +148,9 @@ const SUBGRAPH_COLLAPSED_MIN_WIDTH = 220;
 const SUBGRAPH_HORIZONTAL_PADDING = 28;
 const SUBGRAPH_TOP_PADDING = 18;
 const SUBGRAPH_BOTTOM_PADDING = 24;
+const CONTENT_CARD_ID = '__content__';
+const MINIMAP_WIDTH = 208;
+const MINIMAP_HEIGHT = 128;
 
 interface ExplorerItem {
   id: string;
@@ -129,6 +159,7 @@ interface ExplorerItem {
   depth: number;
   kind: 'project' | 'folder' | 'file';
   path: string;
+  parentId?: string | null;
   tabId?: WorkspaceTabId;
   mode?: EditorMode;
 }
@@ -149,9 +180,18 @@ interface LocalProjectDirectoryHandle {
   kind: 'directory';
   name: string;
   entries(): AsyncIterableIterator<[string, LocalProjectHandle]>;
+  getFileHandle?(name: string, options?: { create?: boolean }): Promise<LocalProjectFileHandle>;
+  getDirectoryHandle?(name: string, options?: { create?: boolean }): Promise<LocalProjectDirectoryHandle>;
+  removeEntry?(name: string, options?: { recursive?: boolean }): Promise<void>;
 }
 
 type LocalProjectHandle = LocalProjectFileHandle | LocalProjectDirectoryHandle;
+
+interface LocalHandleEntry {
+  handle: LocalProjectHandle;
+  parentId: string | null;
+  parentHandle: LocalProjectDirectoryHandle | null;
+}
 
 interface NodeInspectorDraft {
   label: string;
@@ -235,34 +275,101 @@ const workspaceTabs: Array<{ id: WorkspaceTabId; label: string; detail: string }
   { id: 'diagram', label: 'diagram.md', detail: '主图' },
 ];
 
-const defaultLocalProjectItems: ExplorerItem[] = [
-  {
-    id: 'local-project',
-    label: 'roadmap-studio',
-    meta: '本地 Git 工程',
-    depth: 0,
-    kind: 'project',
-    path: '/Users/mac/Documents/projects/roadmap-studio',
-  },
-  {
-    id: 'local-docs',
-    label: 'docs',
-    meta: '本地项目目录',
-    depth: 1,
-    kind: 'folder',
-    path: '/Users/mac/Documents/projects/roadmap-studio/docs',
-  },
-  {
-    id: 'local-diagram',
-    label: 'diagram.md',
-    meta: '本地文件 / 可直接编辑',
-    depth: 2,
-    kind: 'file',
-    path: '/Users/mac/Documents/projects/roadmap-studio/docs/diagram.md',
-    tabId: 'diagram',
-    mode: 'canvas',
-  },
-];
+const defaultLocalProjectItems: ExplorerItem[] = [];
+
+async function scanLocalProjectDirectory(root: LocalProjectDirectoryHandle) {
+  const nextItems: ExplorerItem[] = [
+    {
+      id: 'local-project',
+      label: root.name,
+      meta: '本地项目',
+      depth: 0,
+      kind: 'project',
+      path: `local://${root.name}`,
+      parentId: null,
+    },
+  ];
+  const nextHandles: Record<string, LocalHandleEntry> = {
+    'local-project': {
+      handle: root,
+      parentId: null,
+      parentHandle: null,
+    },
+  };
+  let folderIndex = 0;
+  let fileIndex = 0;
+
+  const walk = async (
+    directory: LocalProjectDirectoryHandle,
+    parentId: string,
+    depth: number,
+    basePath: string,
+  ) => {
+    const entries: Array<[string, LocalProjectHandle]> = [];
+    for await (const entry of directory.entries()) {
+      entries.push(entry);
+    }
+
+    entries.sort((left, right) => {
+      if (left[1].kind !== right[1].kind) {
+        return left[1].kind === 'directory' ? -1 : 1;
+      }
+      return left[0].localeCompare(right[0]);
+    });
+
+    for (const [name, handle] of entries) {
+      const nextPath = `${basePath}/${name}`;
+      if (handle.kind === 'directory') {
+        const id = `local-folder-${folderIndex++}`;
+        nextItems.push({
+          id,
+          label: name,
+          meta: '文件夹',
+          depth,
+          kind: 'folder',
+          path: nextPath,
+          parentId,
+        });
+        nextHandles[id] = {
+          handle,
+          parentId,
+          parentHandle: directory,
+        };
+        await walk(handle, id, depth + 1, nextPath);
+        continue;
+      }
+
+      if (!/\.md$/i.test(name)) {
+        continue;
+      }
+
+      const id = `local-file-${fileIndex++}`;
+      nextItems.push({
+        id,
+        label: name,
+        meta: 'Markdown 工程',
+        depth,
+        kind: 'file',
+        path: nextPath,
+        parentId,
+        tabId: 'diagram',
+        mode: 'canvas',
+      });
+      nextHandles[id] = {
+        handle,
+        parentId,
+        parentHandle: directory,
+      };
+    }
+  };
+
+  await walk(root, 'local-project', 1, `local://${root.name}`);
+
+  return {
+    items: nextItems,
+    handles: nextHandles,
+  };
+}
 
 const leftPanelMeta: Array<{ id: LeftPanel; label: string; icon: IconName }> = [
   { id: 'files', label: '文件', icon: 'files' },
@@ -497,6 +604,8 @@ function selectionKindLabel(kind: SelectionState['kind']) {
       return '连线';
     case 'subgraph':
       return '分组';
+    case 'content':
+      return '内容';
     default:
       return '项目';
   }
@@ -586,30 +695,48 @@ function materializeDocument(candidate: GraphDocument): GraphDocument {
     candidate.subgraphs,
     candidate.unsupportedLines,
   );
+  const projectName = candidate.projectName ?? 'Untitled Project';
+  const projectSummary = candidate.projectSummary ?? '';
+  const compat = {
+    version: candidate.compat?.version ?? 1,
+    layout,
+    editor: {
+      localFileActions: {
+        enabled: candidate.compat?.editor?.localFileActions?.enabled ?? true,
+      },
+    },
+    extras: candidate.compat?.extras,
+  };
+  const markdown = serializeProjectMarkdown({
+    projectName,
+    projectSummary,
+    prefixMarkdown: candidate.prefixMarkdown,
+    suffixMarkdown: candidate.suffixMarkdown,
+    mermaidSource: source,
+    compat,
+    nodes: candidate.nodes,
+    subgraphs: candidate.subgraphs,
+  });
 
   return {
     ...candidate,
     edges: normalizedEdges,
     layout,
     source,
+    markdown,
+    projectName,
+    projectSummary,
+    prefixMarkdown: candidate.prefixMarkdown ?? '',
+    suffixMarkdown: candidate.suffixMarkdown ?? '',
+    compat,
   };
 }
 
 function loadWorkspace() {
-  const savedSource = localStorage.getItem(storageKeys.source);
-  const savedLayout = localStorage.getItem(storageKeys.sidecar);
+  const savedProject = localStorage.getItem(storageKeys.project);
   const savedHistory = localStorage.getItem(storageKeys.history);
 
-  let layout = createDefaultLayout();
   let history: HistoryEntry[] = [createHistoryEntry('工作区已启动', '已打开原型编辑器。')];
-
-  if (savedLayout) {
-    try {
-      layout = JSON.parse(savedLayout) as LayoutSidecar;
-    } catch {
-      layout = createDefaultLayout();
-    }
-  }
 
   if (savedHistory) {
     try {
@@ -619,11 +746,16 @@ function loadWorkspace() {
     }
   }
 
-  const source = savedSource ?? sampleSource;
-  const parsed = parseMermaidDocument(source, layout);
+  const projectMarkdown = savedProject ?? sampleProjectMarkdown;
+  let parsed: GraphDocument;
+  try {
+    parsed = parseProjectMarkdown(projectMarkdown, 'Untitled Project', createDefaultLayout());
+  } catch {
+    parsed = standardizeProjectMarkdown(projectMarkdown, 'Untitled Project', createDefaultLayout());
+  }
 
   return {
-    document: syncDocument(parsed, source),
+    document: materializeDocument(parsed),
     history,
   };
 }
@@ -880,23 +1012,294 @@ function getReadableLabelTextColor(background: string, preferred: string) {
   return '#f8fafc';
 }
 
-function measureEdgeLabelBadge(label: string) {
-  const content = label.trim();
-  const estimatedWidth = Array.from(content).reduce((width, character) => {
-    if (/[\u2e80-\u9fff\uac00-\ud7af]/.test(character)) {
-      return width + 11.4;
-    }
+function trimMultilineBlock(value: string) {
+  return value.replace(/\r\n/g, '\n').replace(/^\n+|\n+$/g, '');
+}
 
-    if (/[A-Z0-9]/.test(character)) {
-      return width + 7.4;
-    }
+function extractContentMarkdown(suffixMarkdown?: string) {
+  const normalized = trimMultilineBlock(suffixMarkdown ?? '');
+  if (!normalized) {
+    return '';
+  }
 
-    return width + 6.5;
+  const match = normalized.match(/^##\s+Content\s*\n?([\s\S]*)$/i);
+  return trimMultilineBlock(match?.[1] ?? normalized);
+}
+
+function buildContentSuffixMarkdown(content: string) {
+  const trimmed = trimMultilineBlock(content);
+  return trimmed ? `## Content\n\n${trimmed}` : '## Content';
+}
+
+function buildProjectPrefixMarkdown(projectName: string, projectSummary: string) {
+  const normalizedName = projectName.trim() || 'Untitled Project';
+  const normalizedSummary = trimMultilineBlock(projectSummary);
+  const lines = [`# ${normalizedName}`, '', '## Summary', ''];
+  if (normalizedSummary) {
+    lines.push(normalizedSummary, '');
+  }
+  lines.push('## Diagram');
+  return lines.join('\n');
+}
+
+function stripMarkdownToPlainText(markdown: string) {
+  return trimMultilineBlock(
+    markdown
+      .replace(/```[\s\S]*?```/g, (block) => block.replace(/```/g, '').trim())
+      .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/[*_~#>`-]/g, '')
+      .replace(/\|/g, ' ')
+      .replace(/\s+/g, ' '),
+  );
+}
+
+function buildContentCardSummary(markdown: string) {
+  const plain = stripMarkdownToPlainText(markdown);
+  if (!plain) {
+    return '暂无用户内容';
+  }
+
+  return plain.length > 30 ? `${plain.slice(0, 30)}…` : plain;
+}
+
+function measureContentCard(markdown: string, collapsed = false) {
+  if (collapsed) {
+    const summary = buildContentCardSummary(markdown);
+    return {
+      width: clamp(188 + summary.length * 4.1, 220, 340),
+      height: 96,
+    };
+  }
+
+  const content = markdown.trim();
+  if (!content) {
+    return {
+      width: 260,
+      height: 132,
+    };
+  }
+
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const wrappedLines = lines.reduce((total, line) => {
+    const plain = stripMarkdownToPlainText(line);
+    return total + Math.max(1, Math.ceil((plain.length || 1) / 26));
+  }, 0);
+  const longestLine = lines.reduce((max, line) => {
+    const plain = stripMarkdownToPlainText(line);
+    return Math.max(max, plain.length);
   }, 0);
 
   return {
-    width: Math.max(54, Math.ceil(estimatedWidth + 18)),
-    height: 22,
+    width: clamp(220 + longestLine * 5.8, 260, 460),
+    height: clamp(82 + wrappedLines * 22, 132, 520),
+  };
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderMarkdownInline(value: string) {
+  let html = escapeHtml(value);
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  html = html.replace(/_([^_]+)_/g, '<em>$1</em>');
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  return html;
+}
+
+function renderMarkdownPreviewHtml(markdown: string) {
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const html: string[] = [];
+  const paragraph: string[] = [];
+  let listItems: string[] = [];
+  let listType: 'ul' | 'ol' | null = null;
+  let codeLines: string[] = [];
+  let inCode = false;
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) {
+      return;
+    }
+    html.push(`<p>${renderMarkdownInline(paragraph.join('<br />'))}</p>`);
+    paragraph.length = 0;
+  };
+
+  const flushList = () => {
+    if (!listType || listItems.length === 0) {
+      return;
+    }
+    html.push(`<${listType}>${listItems.join('')}</${listType}>`);
+    listType = null;
+    listItems = [];
+  };
+
+  const flushCode = () => {
+    if (!inCode) {
+      return;
+    }
+    html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+    codeLines = [];
+    inCode = false;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\t/g, '  ');
+    if (line.trim().startsWith('```')) {
+      flushParagraph();
+      flushList();
+      if (inCode) {
+        flushCode();
+      } else {
+        inCode = true;
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = Math.min(3, heading[1].length);
+      html.push(`<h${level}>${renderMarkdownInline(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    const unordered = line.match(/^[-*+]\s+(.+)$/);
+    if (unordered) {
+      flushParagraph();
+      if (listType && listType !== 'ul') {
+        flushList();
+      }
+      listType = 'ul';
+      listItems.push(`<li>${renderMarkdownInline(unordered[1])}</li>`);
+      continue;
+    }
+
+    const ordered = line.match(/^\d+\.\s+(.+)$/);
+    if (ordered) {
+      flushParagraph();
+      if (listType && listType !== 'ol') {
+        flushList();
+      }
+      listType = 'ol';
+      listItems.push(`<li>${renderMarkdownInline(ordered[1])}</li>`);
+      continue;
+    }
+
+    const quote = line.match(/^>\s?(.+)$/);
+    if (quote) {
+      flushParagraph();
+      flushList();
+      html.push(`<blockquote>${renderMarkdownInline(quote[1])}</blockquote>`);
+      continue;
+    }
+
+    paragraph.push(line.trim());
+  }
+
+  flushParagraph();
+  flushList();
+  flushCode();
+
+  if (html.length === 0) {
+    return '<p class="content-card__empty">暂无用户内容。</p>';
+  }
+
+  return html.join('');
+}
+
+function getContentCardLayout(document: GraphDocument, size: { width: number; height: number }): ContentCardLayout {
+  const raw = document.compat?.extras && typeof document.compat.extras === 'object'
+    ? (document.compat.extras as Record<string, unknown>).contentBox
+    : null;
+
+  if (Array.isArray(raw) && raw.length >= 2) {
+    const [x, y, collapsed] = raw;
+    if (typeof x === 'number' && typeof y === 'number') {
+      return { x, y, collapsed: collapsed === 1 || collapsed === true };
+    }
+  }
+
+  if (document.nodes.length === 0) {
+    return { x: 120, y: 120, collapsed: false };
+  }
+
+  const maxX = Math.max(...document.nodes.map((node) => node.x + node.width));
+  const minY = Math.min(...document.nodes.map((node) => node.y));
+
+  return {
+    x: Math.max(60, maxX + 120),
+    y: Math.max(60, minY - Math.min(40, size.height * 0.15)),
+    collapsed: false,
+  };
+}
+
+function withContentCardLayout(document: GraphDocument, layout: ContentCardLayout): GraphDocument {
+  const compat = document.compat ?? {
+    version: 1,
+    layout: document.layout,
+    editor: {
+      localFileActions: { enabled: true },
+    },
+  };
+
+  return {
+    ...document,
+    compat: {
+      ...compat,
+      extras: {
+        ...(compat.extras ?? {}),
+        contentBox: layout.collapsed
+          ? [Math.round(layout.x), Math.round(layout.y), 1]
+          : [Math.round(layout.x), Math.round(layout.y)],
+      },
+    },
+  };
+}
+
+function measureEdgeLabelBadge(label: string) {
+  const lines = label.split(/\r?\n/).map((line) => line.trim());
+  const lineHeights = 18;
+  const longestLineWidth = lines.reduce((maxWidth, line) => {
+    const estimatedWidth = Array.from(line).reduce((width, character) => {
+      if (/[\u2e80-\u9fff\uac00-\ud7af]/.test(character)) {
+        return width + 11.4;
+      }
+
+      if (/[A-Z0-9]/.test(character)) {
+        return width + 7.4;
+      }
+
+      return width + 6.5;
+    }, 0);
+
+    return Math.max(maxWidth, estimatedWidth);
+  }, 0);
+  const visibleLineCount = Math.max(1, lines.length);
+
+  return {
+    width: Math.max(54, Math.ceil(longestLineWidth + 24)),
+    height: Math.max(22, 10 + visibleLineCount * lineHeights),
   };
 }
 
@@ -931,6 +1334,7 @@ function buildEdgeEndpointOffsetMap(edges: GraphEdge[], endpoints: EdgeEndpointB
   const endpointMap = new Map(endpoints.map((endpoint) => [endpoint.id, endpoint]));
   const groups = new Map<string, Array<{ edgeId: string; end: 'from' | 'to'; angle: number }>>();
   const offsets = new Map<string, { from: number; to: number }>();
+  const pairGroups = new Map<string, GraphEdge[]>();
 
   for (const edge of edges) {
     const fromEndpoint = endpointMap.get(edge.from);
@@ -947,21 +1351,79 @@ function buildEdgeEndpointOffsetMap(edges: GraphEdge[], endpoints: EdgeEndpointB
     const toKey = `${edge.to}:${sideFromAnchor(toAnchor)}`;
     const fromAngle = Math.atan2(toCenter.y - fromCenter.y, toCenter.x - fromCenter.x);
     const toAngle = Math.atan2(fromCenter.y - toCenter.y, fromCenter.x - toCenter.x);
+    const pairKey = [edge.from, edge.to].sort().join('::');
 
     groups.set(fromKey, [...(groups.get(fromKey) ?? []), { edgeId: edge.id, end: 'from', angle: fromAngle }]);
     groups.set(toKey, [...(groups.get(toKey) ?? []), { edgeId: edge.id, end: 'to', angle: toAngle }]);
+    pairGroups.set(pairKey, [...(pairGroups.get(pairKey) ?? []), edge]);
     offsets.set(edge.id, { from: 0, to: 0 });
   }
+
+  const reciprocalEdgeIds = new Set<string>();
+  pairGroups.forEach((group) => {
+    const directions = new Set(group.map((edge) => `${edge.from}->${edge.to}`));
+    if (directions.size < 2) {
+      return;
+    }
+
+    const [canonicalFrom, canonicalTo] = [group[0].from, group[0].to].sort((left, right) =>
+      left.localeCompare(right),
+    );
+    const forward = group
+      .filter((edge) => edge.from === canonicalFrom && edge.to === canonicalTo)
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const reverse = group
+      .filter((edge) => !(edge.from === canonicalFrom && edge.to === canonicalTo))
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const canonicalFromEndpoint = endpointMap.get(canonicalFrom);
+    const canonicalToEndpoint = endpointMap.get(canonicalTo);
+    if (!canonicalFromEndpoint || !canonicalToEndpoint) {
+      return;
+    }
+
+    const canonicalFromCenter = getNodeCenter(canonicalFromEndpoint);
+    const canonicalToCenter = getNodeCenter(canonicalToEndpoint);
+    const canonicalVector = normalizeVector({
+      x: canonicalToCenter.x - canonicalFromCenter.x,
+      y: canonicalToCenter.y - canonicalFromCenter.y,
+    });
+    const pairNormal = {
+      x: -canonicalVector.y,
+      y: canonicalVector.x,
+    };
+
+    assignReciprocalEndpointOffsets(
+      forward,
+      canonicalFromEndpoint,
+      canonicalToEndpoint,
+      pairNormal,
+      -1,
+      offsets,
+    );
+    assignReciprocalEndpointOffsets(
+      reverse,
+      canonicalToEndpoint,
+      canonicalFromEndpoint,
+      pairNormal,
+      1,
+      offsets,
+    );
+
+    group.forEach((edge) => reciprocalEdgeIds.add(edge.id));
+  });
 
   groups.forEach((entries) => {
     const sorted = [...entries].sort((left, right) => left.angle - right.angle);
     sorted.forEach((entry, index) => {
+      if (reciprocalEdgeIds.has(entry.edgeId)) {
+        return;
+      }
       const current = offsets.get(entry.edgeId);
       if (!current) {
         return;
       }
 
-      const nextOffset = (index - (sorted.length - 1) / 2) * 12;
+      const nextOffset = (index - (sorted.length - 1) / 2) * 16;
       current[entry.end] = nextOffset;
       offsets.set(entry.edgeId, current);
     });
@@ -1018,13 +1480,17 @@ function getNodeAnchor(
   return { x: center.x, y: node.y, dirX: 0, dirY: -1 };
 }
 
+function tangentAxisFromAnchor(anchor: { dirX: number; dirY: number }) {
+  return anchor.dirX !== 0 ? { x: 0, y: 1 } : { x: 1, y: 0 };
+}
+
 function buildEdgeGeometry(
   fromNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
   toNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
   laneOffset = 0,
   endpointOffsets: { from: number; to: number } = { from: 0, to: 0 },
 ) {
-  const endInset = 10;
+  const endInset = 12;
   const fromAnchor = getNodeAnchor(fromNode, getNodeCenter(toNode));
   const toAnchor = getNodeAnchor(toNode, getNodeCenter(fromNode));
   const fromCenter = getNodeCenter(fromNode);
@@ -1131,6 +1597,46 @@ function buildEdgeLaneMap(edges: GraphEdge[]) {
   });
 
   return laneMap;
+}
+
+function assignReciprocalEndpointOffsets(
+  directionEdges: GraphEdge[],
+  fromEndpoint: EdgeEndpointBox,
+  toEndpoint: EdgeEndpointBox,
+  pairNormal: Point,
+  side: 1 | -1,
+  offsets: Map<string, { from: number; to: number }>,
+) {
+  if (directionEdges.length === 0) {
+    return;
+  }
+
+  const fromCenter = getNodeCenter(fromEndpoint);
+  const toCenter = getNodeCenter(toEndpoint);
+  const baseSpread = 24;
+  const intraSpacing = 18;
+  const center = (directionEdges.length - 1) / 2;
+
+  directionEdges.forEach((edge, index) => {
+    const current = offsets.get(edge.id);
+    if (!current) {
+      return;
+    }
+
+    const localSpread = baseSpread + Math.abs(index - center) * intraSpacing;
+    const desiredWorldOffset = {
+      x: pairNormal.x * side * localSpread,
+      y: pairNormal.y * side * localSpread,
+    };
+    const edgeFromAnchor = getNodeAnchor(fromEndpoint, toCenter);
+    const edgeToAnchor = getNodeAnchor(toEndpoint, fromCenter);
+    const fromAxis = tangentAxisFromAnchor(edgeFromAnchor);
+    const toAxis = tangentAxisFromAnchor(edgeToAnchor);
+
+    current.from = desiredWorldOffset.x * fromAxis.x + desiredWorldOffset.y * fromAxis.y;
+    current.to = desiredWorldOffset.x * toAxis.x + desiredWorldOffset.y * toAxis.y;
+    offsets.set(edge.id, current);
+  });
 }
 
 function sampleCubic(
@@ -1280,12 +1786,15 @@ function handleNativeSelectAllShortcut(
   return true;
 }
 
-function intersects(rect: { x: number; y: number; width: number; height: number }, node: GraphNode) {
+function intersects(
+  rect: { x: number; y: number; width: number; height: number },
+  box: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
+) {
   return !(
-    node.x + node.width < rect.x ||
-    node.x > rect.x + rect.width ||
-    node.y + node.height < rect.y ||
-    node.y > rect.y + rect.height
+    box.x + box.width < rect.x ||
+    box.x > rect.x + rect.width ||
+    box.y + box.height < rect.y ||
+    box.y > rect.y + rect.height
   );
 }
 
@@ -1298,14 +1807,212 @@ function selectionBoxStyle(rect: { x: number; y: number; width: number; height: 
   };
 }
 
+function buildMiniMapModel(
+  shapes: Array<{
+    id: string;
+    kind: 'node' | 'subgraph' | 'content';
+    rect: Rect;
+    fill: string;
+    stroke: string;
+    selected?: boolean;
+  }>,
+  viewportRect: Rect | null,
+  width = MINIMAP_WIDTH,
+  height = MINIMAP_HEIGHT,
+) {
+  const allRects = [
+    ...shapes.map((shape) => shape.rect),
+    ...(viewportRect ? [viewportRect] : []),
+  ];
+
+  if (allRects.length === 0) {
+    return null;
+  }
+
+  const minX = Math.min(...allRects.map((rect) => rect.x));
+  const minY = Math.min(...allRects.map((rect) => rect.y));
+  const maxX = Math.max(...allRects.map((rect) => rect.x + rect.width));
+  const maxY = Math.max(...allRects.map((rect) => rect.y + rect.height));
+  const padding = 64;
+  const worldBounds = {
+    x: minX - padding,
+    y: minY - padding,
+    width: Math.max(160, maxX - minX + padding * 2),
+    height: Math.max(120, maxY - minY + padding * 2),
+  };
+  const scale = Math.min(width / worldBounds.width, height / worldBounds.height);
+  const offsetX = (width - worldBounds.width * scale) / 2;
+  const offsetY = (height - worldBounds.height * scale) / 2;
+
+  const projectRect = (rect: Rect) => ({
+    x: offsetX + (rect.x - worldBounds.x) * scale,
+    y: offsetY + (rect.y - worldBounds.y) * scale,
+    width: Math.max(2, rect.width * scale),
+    height: Math.max(2, rect.height * scale),
+  });
+
+  return {
+    width,
+    height,
+    scale,
+    offsetX,
+    offsetY,
+    worldBounds,
+    shapes: shapes.map((shape) => ({
+      ...shape,
+      projected: projectRect(shape.rect),
+    })),
+    viewport: viewportRect ? projectRect(viewportRect) : null,
+  };
+}
+
 function downloadFile(filename: string, content: string, contentType: string) {
   const blob = new Blob([content], { type: contentType });
+  downloadBlob(filename, blob);
+}
+
+function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+function sanitizeFilename(value: string, fallback = 'diagram') {
+  const normalized = value
+    .trim()
+    .split('')
+    .map((character) => {
+      const code = character.charCodeAt(0);
+      if (
+        code <= 31 ||
+        character === '<' ||
+        character === '>' ||
+        character === ':' ||
+        character === '"' ||
+        character === '/' ||
+        character === '\\' ||
+        character === '|' ||
+        character === '?' ||
+        character === '*'
+      ) {
+        return '-';
+      }
+
+      return character;
+    })
+    .join('')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+  return normalized || fallback;
+}
+
+function collectDocumentCssText() {
+  const chunks: string[] = [];
+
+  for (const stylesheet of Array.from(document.styleSheets)) {
+    try {
+      const rules = stylesheet.cssRules;
+      for (const rule of Array.from(rules)) {
+        chunks.push(rule.cssText);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return chunks.join('\n');
+}
+
+function loadImageFromUrl(url: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('Image load failed'));
+    image.src = url;
+  });
+}
+
+function buildCanvasExportBounds(input: {
+  nodes: GraphNode[];
+  subgraphs: SubgraphFrame[];
+  contentRect: Rect;
+  edges: GraphEdge[];
+  endpointMap: Map<string, EdgeEndpointBox>;
+  laneMap: Map<string, number>;
+  endpointOffsets: Map<string, { from: number; to: number }>;
+}) {
+  const xs: number[] = [];
+  const ys: number[] = [];
+
+  const includeRect = (rect: Rect) => {
+    xs.push(rect.x, rect.x + rect.width);
+    ys.push(rect.y, rect.y + rect.height);
+  };
+
+  const includePoint = (point: Point) => {
+    xs.push(point.x);
+    ys.push(point.y);
+  };
+
+  input.nodes.forEach((node) => includeRect(node));
+  input.subgraphs.forEach((frame) => includeRect(frame));
+  includeRect(input.contentRect);
+
+  input.edges.forEach((edge) => {
+    const fromNode = input.endpointMap.get(edge.from);
+    const toNode = input.endpointMap.get(edge.to);
+    if (!fromNode || !toNode) {
+      return;
+    }
+
+    const geometry = buildEdgeGeometry(
+      fromNode,
+      toNode,
+      input.laneMap.get(edge.id) ?? 0,
+      input.endpointOffsets.get(edge.id),
+    );
+    includePoint(geometry.start);
+    includePoint(geometry.controlA);
+    includePoint(geometry.controlB);
+    includePoint(geometry.end);
+
+    if (edge.label) {
+      const badge = measureEdgeLabelBadge(edge.label);
+      includeRect({
+        x: geometry.label.x - badge.width / 2,
+        y: geometry.label.y - badge.height / 2,
+        width: badge.width,
+        height: badge.height,
+      });
+    }
+  });
+
+  if (xs.length === 0 || ys.length === 0) {
+    return {
+      x: 0,
+      y: 0,
+      width: 1280,
+      height: 720,
+    };
+  }
+
+  const padding = 72;
+  const minX = Math.min(...xs) - padding;
+  const minY = Math.min(...ys) - padding;
+  const maxX = Math.max(...xs) + padding;
+  const maxY = Math.max(...ys) + padding;
+
+  return {
+    x: Math.floor(minX),
+    y: Math.floor(minY),
+    width: Math.ceil(maxX - minX),
+    height: Math.ceil(maxY - minY),
+  };
 }
 
 function getVisibleSubgraphIds(subgraphs: GraphSubgraph[]) {
@@ -1489,19 +2196,6 @@ function removeSubgraphs(current: GraphDocument, rootIds: string[]) {
   };
 }
 
-function toMarkdownDocument(source: string) {
-  return `\`\`\`mermaid\n${source}\n\`\`\`\n`;
-}
-
-function extractEditableSource(raw: string) {
-  const fencedMatch = raw.match(/```mermaid\s*([\s\S]*?)```/i);
-  if (fencedMatch?.[1]) {
-    return fencedMatch[1].trim();
-  }
-
-  return raw.trim();
-}
-
 function isInsideCollapsedSubgraph(
   node: GraphNode,
   lookup: Map<string, GraphSubgraph>,
@@ -1646,6 +2340,7 @@ function buildCollisionObstacles(
   nodes: GraphNode[],
   ignoredNodeIds: Set<string>,
   excludedSubgraphIds: Set<string>,
+  contentRect?: Rect | null,
 ) {
   const nodeRects = nodes
     .filter((node) => !ignoredNodeIds.has(node.id))
@@ -1653,8 +2348,9 @@ function buildCollisionObstacles(
   const subgraphRects = buildSubgraphFrames(document, nodes)
     .filter((frame) => !excludedSubgraphIds.has(frame.id))
     .map((frame) => expandRect({ x: frame.x, y: frame.y, width: frame.width, height: frame.height }, 10));
+  const contentRects = contentRect ? [expandRect(contentRect, 18)] : [];
 
-  return [...nodeRects, ...subgraphRects];
+  return [...nodeRects, ...subgraphRects, ...contentRects];
 }
 
 function searchFreeRect(
@@ -1819,6 +2515,7 @@ function resolveDraggedNodeCollision(
   desiredNodes: GraphNode[],
   subgraphLookup: Map<string, GraphSubgraph>,
   targetSubgraphId: string | null,
+  contentRect?: Rect | null,
 ) {
   if (movedNodeIds.length === 0 || desiredNodes.length === 0) {
     return desiredNodes;
@@ -1851,6 +2548,7 @@ function resolveDraggedNodeCollision(
     desiredNodes,
     movedSet,
     excludedSubgraphIds,
+    contentRect,
   );
   const previousSelectionNodes = document.nodes.filter((node) => movedSet.has(node.id));
   const previousBounds = buildSelectionBounds(previousSelectionNodes) ?? selectionBounds;
@@ -2072,6 +2770,7 @@ export default function App() {
   const [activeWorkspaceSource, setActiveWorkspaceSource] = useState<'cloud' | 'local'>('cloud');
   const [localExplorerItems, setLocalExplorerItems] = useState<ExplorerItem[]>(defaultLocalProjectItems);
   const [activeLocalFileId, setActiveLocalFileId] = useState<string | null>(null);
+  const [activeLocalDirectoryId, setActiveLocalDirectoryId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [mobileSourcePreviewOpen, setMobileSourcePreviewOpen] = useState(false);
@@ -2080,10 +2779,14 @@ export default function App() {
   const [history, setHistory] = useState<HistoryEntry[]>(initialWorkspace.history);
   const [, setUndoStack] = useState<GraphDocument[]>([]);
   const [, setRedoStack] = useState<GraphDocument[]>([]);
-  const [sourceDraft, setSourceDraft] = useState(initialWorkspace.document.source);
+  const [sourceDraft, setSourceDraft] = useState(
+    initialWorkspace.document.markdown ?? initialWorkspace.document.source,
+  );
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved');
   const [searchQuery, setSearchQuery] = useState('');
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  const [activeLocalExplorerItemId, setActiveLocalExplorerItemId] = useState<string | null>(null);
+  const [hasLocalProjectAccess, setHasLocalProjectAccess] = useState(false);
   const [nodeInspectorDraft, setNodeInspectorDraft] = useState<NodeInspectorDraft>({
     label: '',
     shape: 'rect',
@@ -2101,21 +2804,33 @@ export default function App() {
     title: '',
     collapsed: false,
   });
+  const [contentInspectorDraft, setContentInspectorDraft] = useState<ContentInspectorDraft>({
+    markdown: '',
+  });
+  const [projectInspectorDraft, setProjectInspectorDraft] = useState<ProjectInspectorDraft>({
+    projectName: initialWorkspace.document.projectName ?? 'Untitled Project',
+    projectSummary: initialWorkspace.document.projectSummary ?? '',
+    contentMarkdown: extractContentMarkdown(initialWorkspace.document.suffixMarkdown),
+  });
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [editingLabel, setEditingLabel] = useState('');
   const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
   const [editingEdgeLabel, setEditingEdgeLabel] = useState('');
   const [editingSubgraphId, setEditingSubgraphId] = useState<string | null>(null);
   const [editingSubgraphTitle, setEditingSubgraphTitle] = useState('');
+  const [editingContent, setEditingContent] = useState(false);
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [dragTargetSubgraphId, setDragTargetSubgraphId] = useState<string | null>(null);
   const [dragReparentMode, setDragReparentMode] = useState(false);
   const [boxState, setBoxState] = useState<BoxState | null>(null);
   const [panState, setPanState] = useState<PanState | null>(null);
+  const [miniMapDragState, setMiniMapDragState] = useState<MiniMapDragState | null>(null);
   const [connectingState, setConnectingState] = useState<ConnectingState | null>(null);
   const [spacePressed, setSpacePressed] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
-  const localFileHandlesRef = useRef<Record<string, LocalProjectFileHandle>>({});
+  const canvasBoardRef = useRef<HTMLDivElement>(null);
+  const localHandleEntriesRef = useRef<Record<string, LocalHandleEntry>>({});
+  const localRootDirectoryRef = useRef<LocalProjectDirectoryHandle | null>(null);
   const documentRef = useRef(documentState);
   const previousModeRef = useRef(mode);
   const gestureStateRef = useRef<GestureState | null>(null);
@@ -2128,12 +2843,16 @@ export default function App() {
   const deferredSource = useDeferredValue(sourceDraft);
   const sourceParseError = useMemo(() => {
     try {
-      parseMermaidDocument(deferredSource, documentState.layout);
+      parseProjectMarkdown(
+        deferredSource,
+        documentState.projectName ?? 'Untitled Project',
+        documentState.layout,
+      );
       return null;
     } catch (error) {
-      return error instanceof Error ? error.message : '无法解析 Mermaid 源码。';
+      return error instanceof Error ? error.message : '无法解析工程 Markdown。';
     }
-  }, [deferredSource, documentState.layout]);
+  }, [deferredSource, documentState.layout, documentState.projectName]);
 
   const subgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
   const fullSubgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
@@ -2145,6 +2864,97 @@ export default function App() {
     () => buildSubgraphFrames(documentState, previewNodes),
     [documentState, previewNodes],
   );
+  const contentMarkdown = useMemo(
+    () => extractContentMarkdown(documentState.suffixMarkdown),
+    [documentState.suffixMarkdown],
+  );
+  const contentCardLayout = useMemo(
+    () => getContentCardLayout(documentState, { width: 320, height: 180 }),
+    [documentState],
+  );
+  const contentCardCollapsed = contentCardLayout.collapsed && !editingContent;
+  const contentCardSize = useMemo(
+    () => measureContentCard(editingContent ? contentInspectorDraft.markdown : contentMarkdown, contentCardCollapsed),
+    [contentCardCollapsed, contentInspectorDraft.markdown, contentMarkdown, editingContent],
+  );
+  const contentCardRenderLayout = useMemo(() => {
+    if (dragState?.kind !== 'content') {
+      return contentCardLayout;
+    }
+
+    const deltaX = dragState.current.x - dragState.origin.x;
+    const deltaY = dragState.current.y - dragState.origin.y;
+    return {
+      ...contentCardLayout,
+      x: (dragState.initialPositions[CONTENT_CARD_ID]?.x ?? contentCardLayout.x) + deltaX,
+      y: (dragState.initialPositions[CONTENT_CARD_ID]?.y ?? contentCardLayout.y) + deltaY,
+    };
+  }, [contentCardLayout, dragState]);
+  const contentCardRect = useMemo(
+    () => ({
+      x: contentCardRenderLayout.x,
+      y: contentCardRenderLayout.y,
+      width: contentCardSize.width,
+      height: contentCardSize.height,
+    }),
+    [contentCardRenderLayout, contentCardSize],
+  );
+  const contentCardPreviewHtml = useMemo(
+    () => renderMarkdownPreviewHtml(contentMarkdown),
+    [contentMarkdown],
+  );
+  const contentCardSummary = useMemo(
+    () => buildContentCardSummary(contentMarkdown),
+    [contentMarkdown],
+  );
+  const miniMapModel = useMemo(() => {
+    const canvasBounds = canvasRef.current?.getBoundingClientRect();
+    const viewport = documentState.layout.viewport;
+    const viewportRect = canvasBounds
+      ? {
+          x: -viewport.x / viewport.zoom,
+          y: -viewport.y / viewport.zoom,
+          width: canvasBounds.width / viewport.zoom,
+          height: canvasBounds.height / viewport.zoom,
+        }
+      : null;
+
+    return buildMiniMapModel(
+      [
+        ...previewNodes.map((node) => ({
+          id: node.id,
+          kind: 'node' as const,
+          rect: { x: node.x, y: node.y, width: node.width, height: node.height },
+          fill: node.fill,
+          stroke: node.stroke,
+          selected: selection.kind === 'node' && selectionContains(selection, node.id),
+        })),
+        ...subgraphFrames.map((frame) => ({
+          id: frame.id,
+          kind: 'subgraph' as const,
+          rect: { x: frame.x, y: frame.y, width: frame.width, height: frame.height },
+          fill: 'rgba(96, 165, 250, 0.08)',
+          stroke: subgraphVisualStyle.stroke,
+          selected: selection.kind === 'subgraph' && selectionContains(selection, frame.id),
+        })),
+        {
+          id: CONTENT_CARD_ID,
+          kind: 'content' as const,
+          rect: contentCardRect,
+          fill: 'rgba(248, 250, 252, 0.16)',
+          stroke: '#f8fafc',
+          selected: selection.kind === 'content',
+        },
+      ],
+      viewportRect,
+    );
+  }, [
+    contentCardRect,
+    documentState.layout.viewport,
+    previewNodes,
+    selection,
+    subgraphFrames,
+  ]);
   const visibleNodes = previewNodes.filter(
     (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
   );
@@ -2208,6 +3018,26 @@ export default function App() {
     () => buildEdgeEndpointOffsetMap(visibleEdges, edgeEndpoints),
     [edgeEndpoints, visibleEdges],
   );
+  const canvasExportBounds = useMemo(
+    () => buildCanvasExportBounds({
+      nodes: visibleNodes,
+      subgraphs: subgraphFrames,
+      contentRect: contentCardRect,
+      edges: visibleEdges,
+      endpointMap: edgeEndpointMap,
+      laneMap: edgeLaneMap,
+      endpointOffsets: edgeEndpointOffsetMap,
+    }),
+    [
+      contentCardRect,
+      edgeEndpointMap,
+      edgeEndpointOffsetMap,
+      edgeLaneMap,
+      subgraphFrames,
+      visibleEdges,
+      visibleNodes,
+    ],
+  );
   const allSubgraphFrames = useMemo(
     () => buildSubgraphFrames(documentState, previewNodes),
     [documentState, previewNodes],
@@ -2228,6 +3058,10 @@ export default function App() {
     [allSubgraphFrameMap, documentState.nodes, documentState.subgraphs, fullSubgraphLookup, searchQuery],
   );
   const activeTab = workspaceTabs.find((tab) => tab.id === activeFileTab) ?? workspaceTabs[0];
+  const localExplorerItemMap = useMemo(
+    () => new Map(localExplorerItems.map((item) => [item.id, item])),
+    [localExplorerItems],
+  );
   const cloudExplorerItems = useMemo<ExplorerItem[]>(
     () => [
       {
@@ -2260,14 +3094,57 @@ export default function App() {
     [documentState.edges.length, documentState.nodes.length],
   );
   const activeCloudPath = useMemo(() => {
-    const activeItem = cloudExplorerItems.find((item) => item.tabId === activeFileTab);
-    return activeItem?.path ?? 'cloud://projects/product-graph-platform/docs/diagram.md';
+      const activeItem = cloudExplorerItems.find((item) => item.tabId === activeFileTab);
+      return activeItem?.path ?? 'cloud://projects/product-graph-platform/docs/diagram.md';
   }, [activeFileTab, cloudExplorerItems]);
   const activeLocalPath = useMemo(() => {
-    const activeItem = localExplorerItems.find((item) => item.tabId === activeFileTab);
-    return activeItem?.path ?? '/Users/mac/Documents/projects/roadmap-studio/docs/diagram.md';
-  }, [activeFileTab, localExplorerItems]);
+    const activeItem = activeLocalExplorerItemId
+      ? localExplorerItems.find((item) => item.id === activeLocalExplorerItemId)
+      : localExplorerItems.find((item) => item.id === activeLocalFileId) ??
+        localExplorerItems.find((item) => item.kind === 'project');
+    return activeItem?.path ?? 'No local project opened';
+  }, [activeLocalExplorerItemId, activeLocalFileId, localExplorerItems]);
   const activeProjectPath = activeWorkspaceSource === 'cloud' ? activeCloudPath : activeLocalPath;
+  const activeLocalItem = useMemo(
+    () => (activeLocalExplorerItemId ? localExplorerItemMap.get(activeLocalExplorerItemId) ?? null : null),
+    [activeLocalExplorerItemId, localExplorerItemMap],
+  );
+  const localBreadcrumbItems = useMemo(() => {
+    if (!activeLocalDirectoryId) {
+      return [];
+    }
+
+    const chain: ExplorerItem[] = [];
+    let currentId: string | null = activeLocalDirectoryId;
+    while (currentId) {
+      const item = localExplorerItemMap.get(currentId);
+      if (!item) {
+        break;
+      }
+      chain.unshift(item);
+      currentId = item.parentId ?? null;
+    }
+    return chain;
+  }, [activeLocalDirectoryId, localExplorerItemMap]);
+  const localDirectoryEntries = useMemo(() => {
+    if (!activeLocalDirectoryId) {
+      return [];
+    }
+
+    return localExplorerItems
+      .filter((item) => item.parentId === activeLocalDirectoryId)
+      .sort((left, right) => {
+        if (left.kind !== right.kind) {
+          if (left.kind === 'folder') {
+            return -1;
+          }
+          if (right.kind === 'folder') {
+            return 1;
+          }
+        }
+        return left.label.localeCompare(right.label);
+      });
+  }, [activeLocalDirectoryId, localExplorerItems]);
   const applyCommittedDocument = useCallback((
     nextDocument: GraphDocument,
     title: string,
@@ -2278,7 +3155,7 @@ export default function App() {
     setRedoStack([]);
     setSaveStatus('saving');
     setDocumentState(nextDocument);
-    setSourceDraft(nextDocument.source);
+    setSourceDraft(nextDocument.markdown ?? nextDocument.source);
     setHistory((current) => [createHistoryEntry(title, detail), ...current].slice(0, 40));
   }, []);
 
@@ -2289,7 +3166,7 @@ export default function App() {
   ) => {
     setSaveStatus('saving');
     setDocumentState(snapshot);
-    setSourceDraft(snapshot.source);
+    setSourceDraft(snapshot.markdown ?? snapshot.source);
     setHistory((current) => [createHistoryEntry(title, detail), ...current].slice(0, 40));
   }, []);
 
@@ -2305,13 +3182,17 @@ export default function App() {
 
   const commitSourceDraft = useCallback(() => {
     const currentDocument = structuredClone(documentRef.current);
-    if (sourceDraft === currentDocument.source) {
+    if (sourceDraft === (currentDocument.markdown ?? currentDocument.source)) {
       return;
     }
 
     try {
-      const parsed = parseMermaidDocument(sourceDraft, currentDocument.layout);
-      const nextDocument = syncDocument(parsed, sourceDraft);
+      const parsed = parseProjectMarkdown(
+        sourceDraft,
+        currentDocument.projectName ?? 'Untitled Project',
+        currentDocument.layout,
+      );
+      const nextDocument = materializeDocument(parsed);
       applyCommittedDocument(
         nextDocument,
         '已更新源码',
@@ -2322,6 +3203,36 @@ export default function App() {
       setSaveStatus('error');
     }
   }, [applyCommittedDocument, sourceDraft]);
+
+  const standardizeCurrentProject = useCallback(() => {
+    const fallbackName = (
+      activeLocalItem?.kind === 'file'
+        ? activeLocalItem.label.replace(/\.md$/i, '')
+        : documentRef.current.projectName
+    ) ?? 'Untitled Project';
+    const rawMarkdown = (sourceDraft || documentRef.current.markdown || '').trim();
+    if (!rawMarkdown) {
+      return;
+    }
+
+    try {
+      const nextDocument = materializeDocument(
+        standardizeProjectMarkdown(
+          rawMarkdown,
+          fallbackName,
+          documentRef.current.layout,
+        ),
+      );
+      applyCommittedDocument(
+        nextDocument,
+        '已标准化工程',
+        '已将当前 Markdown 统一为单文件工程格式。',
+        documentRef.current,
+      );
+    } catch {
+      setSaveStatus('error');
+    }
+  }, [activeLocalItem, applyCommittedDocument, sourceDraft]);
 
   const selectSingle = useCallback((kind: SelectionState['kind'], id: string) => {
     setSelection({ kind, ids: [id] });
@@ -2489,6 +3400,19 @@ export default function App() {
     [updateViewport],
   );
 
+  const centerViewportOnWorldPoint = useCallback((point: Point) => {
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    if (!bounds) {
+      return;
+    }
+
+    updateViewport((viewport) => ({
+      ...viewport,
+      x: bounds.width / 2 - point.x * viewport.zoom,
+      y: bounds.height / 2 - point.y * viewport.zoom,
+    }));
+  }, [updateViewport]);
+
   const focusSelectionInViewport = useCallback(() => {
     if (mode !== 'canvas') {
       return;
@@ -2506,6 +3430,11 @@ export default function App() {
 
     if (selection.kind === 'subgraph' && selection.ids.length === 1) {
       focusViewportOnRect(allSubgraphFrameMap.get(selection.ids[0]) ?? null, anchorY);
+      return;
+    }
+
+    if (selection.kind === 'content') {
+      focusViewportOnRect(contentCardRect, anchorY);
       return;
     }
 
@@ -2570,12 +3499,88 @@ export default function App() {
     }
   }, [
     allSubgraphFrameMap,
+    contentCardRect,
     documentState,
     focusViewportOnRect,
     isMobileViewport,
     mode,
     selection,
   ]);
+
+  const moveViewportFromMiniMapRect = useCallback((miniX: number, miniY: number) => {
+    if (!miniMapModel?.viewport) {
+      return;
+    }
+
+    const clampedMiniX = clamp(miniX, 0, miniMapModel.width - miniMapModel.viewport.width);
+    const clampedMiniY = clamp(miniY, 0, miniMapModel.height - miniMapModel.viewport.height);
+    const worldLeft = (clampedMiniX - miniMapModel.offsetX) / miniMapModel.scale + miniMapModel.worldBounds.x;
+    const worldTop = (clampedMiniY - miniMapModel.offsetY) / miniMapModel.scale + miniMapModel.worldBounds.y;
+
+    updateViewport((viewport) => ({
+      ...viewport,
+      x: -worldLeft * viewport.zoom,
+      y: -worldTop * viewport.zoom,
+    }));
+  }, [miniMapModel, updateViewport]);
+
+  const beginMiniMapInteraction = useCallback((event: ReactPointerEvent<SVGSVGElement>) => {
+    if (!miniMapModel) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setMode('canvas');
+
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const localX = clamp(event.clientX - bounds.left, 0, miniMapModel.width);
+    const localY = clamp(event.clientY - bounds.top, 0, miniMapModel.height);
+    const viewportRect = miniMapModel.viewport;
+    const viewportHit = viewportRect
+      ? localX >= viewportRect.x &&
+        localX <= viewportRect.x + viewportRect.width &&
+        localY >= viewportRect.y &&
+        localY <= viewportRect.y + viewportRect.height
+      : false;
+
+    if (viewportHit && viewportRect) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+      setMiniMapDragState({
+        pointerId: event.pointerId,
+        grabOffsetX: localX - viewportRect.x,
+        grabOffsetY: localY - viewportRect.y,
+      });
+      return;
+    }
+
+    const worldX = (localX - miniMapModel.offsetX) / miniMapModel.scale + miniMapModel.worldBounds.x;
+    const worldY = (localY - miniMapModel.offsetY) / miniMapModel.scale + miniMapModel.worldBounds.y;
+    centerViewportOnWorldPoint({ x: worldX, y: worldY });
+  }, [centerViewportOnWorldPoint, miniMapModel]);
+
+  const updateMiniMapInteraction = useCallback((event: ReactPointerEvent<SVGSVGElement>) => {
+    if (!miniMapModel || !miniMapDragState || miniMapDragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const localX = clamp(event.clientX - bounds.left, 0, miniMapModel.width);
+    const localY = clamp(event.clientY - bounds.top, 0, miniMapModel.height);
+    moveViewportFromMiniMapRect(
+      localX - miniMapDragState.grabOffsetX,
+      localY - miniMapDragState.grabOffsetY,
+    );
+  }, [miniMapDragState, miniMapModel, moveViewportFromMiniMapRect]);
+
+  const endMiniMapInteraction = useCallback((event?: ReactPointerEvent<SVGSVGElement>) => {
+    if (event && miniMapDragState && event.currentTarget.hasPointerCapture(miniMapDragState.pointerId)) {
+      event.currentTarget.releasePointerCapture(miniMapDragState.pointerId);
+    }
+    setMiniMapDragState(null);
+  }, [miniMapDragState]);
 
   const handleMobileInspectorToggle = useCallback(() => {
     if (mode === 'source') {
@@ -2695,6 +3700,81 @@ export default function App() {
     );
   }, [commitDocument, selection.ids, selection.kind, subgraphInspectorDraft]);
 
+  const startContentInlineEdit = useCallback(() => {
+    const current = documentRef.current;
+    setEditingContent(true);
+    setContentInspectorDraft({
+      markdown: extractContentMarkdown(current.suffixMarkdown),
+    });
+    setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
+    if (contentCardLayout.collapsed) {
+      commitDocument(
+        (document) => withContentCardLayout(document, { ...contentCardLayout, collapsed: false }),
+        '已展开用户内容',
+        '已展开用户内容框。',
+      );
+    }
+  }, [commitDocument, contentCardLayout]);
+
+  const toggleContentCollapsed = useCallback((nextCollapsed?: boolean) => {
+    const collapsed = nextCollapsed ?? !contentCardLayout.collapsed;
+    if (collapsed && editingContent) {
+      setEditingContent(false);
+    }
+
+    commitDocument(
+      (current) => withContentCardLayout(current, { ...contentCardLayout, collapsed }),
+      collapsed ? '已折叠用户内容' : '已展开用户内容',
+      collapsed ? '已折叠用户内容框。' : '已展开用户内容框。',
+    );
+  }, [commitDocument, contentCardLayout, editingContent]);
+
+  const applyContentInspectorDraft = useCallback((draft: ContentInspectorDraft = contentInspectorDraft) => {
+    commitDocument(
+      (current) => ({
+        ...current,
+        suffixMarkdown: buildContentSuffixMarkdown(draft.markdown),
+      }),
+      '已更新用户内容',
+      '已更新工程 Markdown 的用户内容层。',
+    );
+  }, [commitDocument, contentInspectorDraft]);
+
+  const commitContentInlineEdit = useCallback(() => {
+    applyContentInspectorDraft();
+    setEditingContent(false);
+  }, [applyContentInspectorDraft]);
+
+  const applyProjectInspectorDraft = useCallback((draft: ProjectInspectorDraft = projectInspectorDraft) => {
+    const normalizedName = draft.projectName.trim() || 'Untitled Project';
+    const normalizedSummary = trimMultilineBlock(draft.projectSummary);
+    const normalizedContent = trimMultilineBlock(draft.contentMarkdown);
+    const current = documentRef.current;
+    const currentName = current.projectName?.trim() || 'Untitled Project';
+    const currentSummary = trimMultilineBlock(current.projectSummary ?? '');
+    const currentContent = trimMultilineBlock(extractContentMarkdown(current.suffixMarkdown));
+
+    if (
+      normalizedName === currentName &&
+      normalizedSummary === currentSummary &&
+      normalizedContent === currentContent
+    ) {
+      return;
+    }
+
+    commitDocument(
+      (document) => ({
+        ...document,
+        projectName: normalizedName,
+        projectSummary: normalizedSummary,
+        prefixMarkdown: buildProjectPrefixMarkdown(normalizedName, normalizedSummary),
+        suffixMarkdown: buildContentSuffixMarkdown(normalizedContent),
+      }),
+      '已更新工程信息',
+      '已更新 Project Name、Summary 与 Content。',
+    );
+  }, [commitDocument, projectInspectorDraft]);
+
   const commitSubgraphTitleEdit = useCallback((subgraphId: string, nextTitle = editingSubgraphTitle) => {
     const normalizedTitle = nextTitle.trim() || '未命名分组';
 
@@ -2789,6 +3869,7 @@ export default function App() {
         documentState.nodes,
         new Set<string>(),
         subgraphExclusions,
+        contentCardRect,
       ),
       sourceNodeId
         ? {
@@ -2839,7 +3920,7 @@ export default function App() {
     );
 
     setSelection({ kind: 'node', ids: [id] });
-  }, [allSubgraphFrameMap, commitDocument, documentState, fullSubgraphLookup, selection]);
+  }, [allSubgraphFrameMap, commitDocument, contentCardRect, documentState, fullSubgraphLookup, selection]);
 
   const createNodeFromShortcut = useCallback((
     sourceNode: GraphNode,
@@ -2859,6 +3940,7 @@ export default function App() {
         documentState.nodes,
         new Set<string>(),
         subgraphExclusions,
+        contentCardRect,
       ),
       {
         x: desiredPoint.x - sourceNode.x,
@@ -2908,10 +3990,10 @@ export default function App() {
     setSelection({ kind: 'node', ids: [id] });
     setEditingNodeId(id);
     setEditingLabel(newNode.label);
-  }, [allSubgraphFrameMap, commitDocument, documentState, fullSubgraphLookup]);
+  }, [allSubgraphFrameMap, commitDocument, contentCardRect, documentState, fullSubgraphLookup]);
 
   const deleteSelection = useCallback(() => {
-    if (selection.kind === 'none' || selection.ids.length === 0) {
+    if (selection.kind === 'none' || selection.kind === 'content' || selection.ids.length === 0) {
       return;
     }
 
@@ -3037,17 +4119,90 @@ export default function App() {
 
   const exportMarkdown = useCallback(() => {
     downloadFile(
-      'diagram.md',
-      toMarkdownDocument(documentState.source),
+      `${(documentState.projectName ?? 'diagram').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'diagram'}.md`,
+      documentState.markdown ?? '',
       'text/markdown;charset=utf-8',
     );
-  }, [documentState.source]);
+  }, [documentState.markdown, documentState.projectName]);
+
+  const exportCanvasImage = useCallback(async () => {
+    const board = canvasBoardRef.current;
+    if (!board) {
+      return;
+    }
+
+    const clone = board.cloneNode(true) as HTMLDivElement;
+    clone.querySelectorAll(
+      '.graph-node__connector, .subgraph-frame__connector, .subgraph-frame__action, .content-card__action',
+    ).forEach((element) => element.remove());
+    clone.style.transform = `translate(${-canvasExportBounds.x}px, ${-canvasExportBounds.y}px)`;
+    clone.style.transformOrigin = 'top left';
+
+    const cssText = collectDocumentCssText();
+    const wrapperMarkup = `
+      <div xmlns="http://www.w3.org/1999/xhtml" style="width:${canvasExportBounds.width}px;height:${canvasExportBounds.height}px;overflow:hidden;position:relative;background:
+        linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(17,19,23,1), rgba(20,23,29,1));
+        background-size:24px 24px,24px 24px,100% 100%;
+        background-position:${-canvasExportBounds.x}px ${-canvasExportBounds.y}px, ${-canvasExportBounds.x}px ${-canvasExportBounds.y}px, 0 0;">
+        <style>${cssText}</style>
+        ${clone.outerHTML}
+      </div>
+    `;
+    const svgMarkup = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="${canvasExportBounds.width}" height="${canvasExportBounds.height}" viewBox="0 0 ${canvasExportBounds.width} ${canvasExportBounds.height}">
+        <foreignObject width="100%" height="100%">${wrapperMarkup}</foreignObject>
+      </svg>
+    `;
+
+    const svgBlob = new Blob([svgMarkup], { type: 'image/svg+xml;charset=utf-8' });
+    const svgUrl = URL.createObjectURL(svgBlob);
+
+    try {
+      const image = await loadImageFromUrl(svgUrl);
+      const canvas = document.createElement('canvas');
+      const scale = Math.min(2, window.devicePixelRatio || 1.5);
+      canvas.width = Math.ceil(canvasExportBounds.width * scale);
+      canvas.height = Math.ceil(canvasExportBounds.height * scale);
+      const context = canvas.getContext('2d');
+      if (!context) {
+        throw new Error('Canvas context unavailable');
+      }
+
+      context.scale(scale, scale);
+      context.drawImage(image, 0, 0, canvasExportBounds.width, canvasExportBounds.height);
+
+      const pngBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((blob) => {
+          if (blob) {
+            resolve(blob);
+            return;
+          }
+          reject(new Error('PNG export failed'));
+        }, 'image/png');
+      });
+
+      downloadBlob(
+        `${sanitizeFilename(documentState.projectName ?? activeTab.label, 'diagram')}.png`,
+        pngBlob,
+      );
+    } catch {
+      downloadFile(
+        `${sanitizeFilename(documentState.projectName ?? activeTab.label, 'diagram')}.svg`,
+        svgMarkup,
+        'image/svg+xml;charset=utf-8',
+      );
+    } finally {
+      URL.revokeObjectURL(svgUrl);
+    }
+  }, [activeTab.label, canvasExportBounds, documentState.projectName]);
 
   const copySource = useCallback(() => {
     navigator.clipboard
-      .writeText(documentState.source)
+      .writeText(documentState.markdown ?? '')
       .catch(() => {});
-  }, [documentState.source]);
+  }, [documentState.markdown]);
 
   const goToMode = useCallback((nextMode: EditorMode) => {
     if (mode === 'source' && nextMode !== 'source' && sourceParseError) {
@@ -3058,27 +4213,53 @@ export default function App() {
   }, [mode, sourceParseError]);
 
   const openLocalProjectFile = useCallback(async (item: ExplorerItem) => {
-    const handle = localFileHandlesRef.current[item.id];
-    if (!handle) {
+    const localEntry = localHandleEntriesRef.current[item.id];
+    if (!localEntry || localEntry.handle.kind !== 'file') {
       return;
     }
 
     try {
-      const file = await handle.getFile();
+      const file = await localEntry.handle.getFile();
       const content = await file.text();
-      const source = extractEditableSource(content);
+      const parsed = materializeDocument(
+        parseProjectMarkdown(
+          content,
+          file.name.replace(/\.md$/i, ''),
+          documentRef.current.layout,
+        ),
+      );
       setActiveWorkspaceSource('local');
       setActiveLocalFileId(item.id);
+      setActiveLocalExplorerItemId(item.id);
+      setActiveLocalDirectoryId(item.parentId ?? 'local-project');
       setActiveFileTab(item.tabId ?? 'diagram');
       if (item.mode) {
         goToMode(item.mode);
       }
-      setSourceDraft(source);
+      setDocumentState(parsed);
+      setSourceDraft(parsed.markdown ?? parsed.source);
+      setSaveStatus('saved');
       if (isMobileViewport) {
         setSidebarOpen(false);
       }
     } catch {
-      setSaveStatus('error');
+      try {
+        const file = await localEntry.handle.getFile();
+        const content = await file.text();
+        setActiveWorkspaceSource('local');
+        setActiveLocalFileId(item.id);
+        setActiveLocalExplorerItemId(item.id);
+        setActiveLocalDirectoryId(item.parentId ?? 'local-project');
+        setActiveFileTab(item.tabId ?? 'diagram');
+        setMode('source');
+        setSourceDraft(content);
+        setSaveStatus('error');
+        if (isMobileViewport) {
+          setSidebarOpen(false);
+        }
+      } catch {
+        setSaveStatus('error');
+      }
     }
   }, [goToMode, isMobileViewport]);
 
@@ -3093,74 +4274,18 @@ export default function App() {
 
     try {
       const root = await pickerWindow.showDirectoryPicker();
-      const nextItems: ExplorerItem[] = [
-        {
-          id: 'local-project',
-          label: root.name,
-          meta: '本地 Git 工程',
-          depth: 0,
-          kind: 'project',
-          path: `local://${root.name}`,
-        },
-      ];
-      const nextHandles: Record<string, LocalProjectFileHandle> = {};
-      let fileIndex = 0;
-
-      const walk = async (directory: LocalProjectDirectoryHandle, depth: number, basePath: string) => {
-        const entries: Array<[string, LocalProjectHandle]> = [];
-        for await (const entry of directory.entries()) {
-          entries.push(entry);
-        }
-
-        entries.sort((left, right) => {
-          if (left[1].kind !== right[1].kind) {
-            return left[1].kind === 'directory' ? -1 : 1;
-          }
-          return left[0].localeCompare(right[0]);
-        });
-
-        for (const [name, handle] of entries) {
-          const nextPath = `${basePath}/${name}`;
-          if (handle.kind === 'directory') {
-            nextItems.push({
-              id: `local-folder-${nextItems.length}`,
-              label: name,
-              meta: '本地目录',
-              depth,
-              kind: 'folder',
-              path: nextPath,
-            });
-            await walk(handle, depth + 1, nextPath);
-            continue;
-          }
-
-          if (!/\.(md|mmd)$/i.test(name)) {
-            continue;
-          }
-
-          const id = `local-file-${fileIndex++}`;
-          nextHandles[id] = handle;
-          nextItems.push({
-            id,
-            label: name,
-            meta: '本地文件 / 直接编辑',
-            depth,
-            kind: 'file',
-            path: nextPath,
-            tabId: 'diagram',
-            mode: 'canvas',
-          });
-        }
-      };
-
-      await walk(root, 1, `local://${root.name}`);
-      setLocalExplorerItems(nextItems);
-      localFileHandlesRef.current = nextHandles;
+      const scanned = await scanLocalProjectDirectory(root);
+      setLocalExplorerItems(scanned.items);
+      localHandleEntriesRef.current = scanned.handles;
+      localRootDirectoryRef.current = root;
+      setHasLocalProjectAccess(true);
       setActiveWorkspaceSource('local');
+      setActiveLocalExplorerItemId('local-project');
+      setActiveLocalDirectoryId('local-project');
       setLeftPanel('files');
       setSidebarOpen(true);
 
-      const firstFile = nextItems.find((item) => item.kind === 'file');
+      const firstFile = scanned.items.find((item) => item.kind === 'file');
       if (firstFile) {
         await openLocalProjectFile(firstFile);
       }
@@ -3169,14 +4294,265 @@ export default function App() {
     }
   }, [openLocalProjectFile]);
 
+  const refreshLocalProjectDirectory = useCallback(async (preferredPath?: string) => {
+    const root = localRootDirectoryRef.current;
+    if (!root) {
+      return null;
+    }
+
+    const currentDirectoryPath = activeLocalDirectoryId
+      ? localExplorerItems.find((item) => item.id === activeLocalDirectoryId)?.path ?? null
+      : null;
+    const scanned = await scanLocalProjectDirectory(root);
+    setLocalExplorerItems(scanned.items);
+    localHandleEntriesRef.current = scanned.handles;
+    setHasLocalProjectAccess(true);
+
+    if (preferredPath) {
+      const preferredItem = scanned.items.find((item) => item.path === preferredPath);
+      if (preferredItem) {
+        setActiveLocalExplorerItemId(preferredItem.id);
+        setActiveLocalDirectoryId(
+          preferredItem.kind === 'file'
+            ? (preferredItem.parentId ?? 'local-project')
+            : preferredItem.id,
+        );
+        if (preferredItem.kind === 'file') {
+          setActiveLocalFileId(preferredItem.id);
+        }
+        return preferredItem;
+      }
+    }
+
+    if (currentDirectoryPath) {
+      const preferredDirectory = scanned.items.find((item) => item.path === currentDirectoryPath);
+      if (preferredDirectory && preferredDirectory.kind !== 'file') {
+        setActiveLocalDirectoryId(preferredDirectory.id);
+      } else {
+        setActiveLocalDirectoryId(scanned.items.find((item) => item.kind === 'project')?.id ?? null);
+      }
+    }
+
+    return null;
+  }, [activeLocalDirectoryId, localExplorerItems]);
+
+  const openLocalMarkdownFile = useCallback(async () => {
+    const pickerWindow = window as Window & {
+      showOpenFilePicker?: (options?: {
+        excludeAcceptAllOption?: boolean;
+        multiple?: boolean;
+        types?: Array<{ description?: string; accept: Record<string, string[]> }>;
+      }) => Promise<LocalProjectFileHandle[]>;
+    };
+
+    if (!pickerWindow.showOpenFilePicker) {
+      await openLocalProjectDirectory();
+      return;
+    }
+
+    try {
+      const [fileHandle] = await pickerWindow.showOpenFilePicker({
+        multiple: false,
+        excludeAcceptAllOption: true,
+        types: [
+          {
+            description: 'Markdown',
+            accept: {
+              'text/markdown': ['.md'],
+              'text/plain': ['.md'],
+            },
+          },
+        ],
+      });
+
+      if (!fileHandle) {
+        return;
+      }
+
+      const file = await fileHandle.getFile();
+      const item: ExplorerItem = {
+        id: 'local-file-standalone',
+        label: file.name,
+        meta: 'Markdown 工程',
+        depth: 1,
+        kind: 'file',
+        path: `local-file://${file.name}`,
+        parentId: 'local-project',
+        tabId: 'diagram',
+        mode: 'canvas',
+      };
+
+      const rootItem: ExplorerItem = {
+        id: 'local-project',
+        label: file.name.replace(/\.md$/i, '') || 'local-file',
+        meta: '本地 Markdown 文件',
+        depth: 0,
+        kind: 'project',
+        path: `local-file://${file.name.replace(/\.md$/i, '') || 'local-file'}`,
+        parentId: null,
+      };
+
+      setLocalExplorerItems([rootItem, item]);
+      localHandleEntriesRef.current = {
+        'local-file-standalone': {
+          handle: fileHandle,
+          parentId: 'local-project',
+          parentHandle: null,
+        },
+      };
+      localRootDirectoryRef.current = null;
+      setHasLocalProjectAccess(true);
+      setActiveWorkspaceSource('local');
+      setActiveLocalExplorerItemId(item.id);
+      setActiveLocalDirectoryId('local-project');
+      setLeftPanel('files');
+      setSidebarOpen(true);
+      await openLocalProjectFile(item);
+    } catch {
+      setSaveStatus('error');
+    }
+  }, [openLocalProjectDirectory, openLocalProjectFile]);
+
+  const createLocalProjectFile = useCallback(async () => {
+    if (!localRootDirectoryRef.current) {
+      await openLocalProjectDirectory();
+    }
+
+    const selectedItem = activeLocalExplorerItemId
+      ? localExplorerItems.find((item) => item.id === activeLocalExplorerItemId)
+      : null;
+    const parentItem = selectedItem?.kind === 'file'
+      ? localExplorerItems.find((item) => item.id === selectedItem.parentId)
+      : selectedItem;
+    const parentEntry = parentItem
+      ? localHandleEntriesRef.current[parentItem.id]
+      : localHandleEntriesRef.current['local-project'];
+
+    if (!parentEntry || parentEntry.handle.kind !== 'directory' || !parentEntry.handle.getFileHandle) {
+      return;
+    }
+
+    const existingNames = new Set<string>();
+    for await (const [name] of parentEntry.handle.entries()) {
+      existingNames.add(name.toLowerCase());
+    }
+
+    let filename = 'untitled.md';
+    let index = 2;
+    while (existingNames.has(filename.toLowerCase())) {
+      filename = `untitled-${index}.md`;
+      index += 1;
+    }
+
+    const fileHandle = await parentEntry.handle.getFileHandle(filename, { create: true });
+    if (fileHandle.createWritable) {
+      const writable = await fileHandle.createWritable();
+      await writable.write(
+        createProjectMarkdownTemplate(
+          filename.replace(/\.md$/i, ''),
+          'flowchart LR\n  Start[Start]',
+        ),
+      );
+      await writable.close();
+    }
+
+    const rootName = localRootDirectoryRef.current?.name ?? 'project';
+    const nextPath = `${parentItem?.path ?? `local://${rootName}`}/${filename}`;
+    const nextItem = await refreshLocalProjectDirectory(nextPath);
+    if (nextItem) {
+      await openLocalProjectFile(nextItem);
+    }
+  }, [activeLocalExplorerItemId, localExplorerItems, openLocalProjectDirectory, openLocalProjectFile, refreshLocalProjectDirectory]);
+
+  const renameLocalProjectItem = useCallback(async () => {
+    if (!activeLocalExplorerItemId) {
+      return;
+    }
+
+    const item = localExplorerItems.find((entry) => entry.id === activeLocalExplorerItemId);
+    if (!item || item.kind !== 'file') {
+      return;
+    }
+
+    const handleEntry = localHandleEntriesRef.current[item.id];
+    if (!handleEntry || handleEntry.handle.kind !== 'file' || !handleEntry.parentHandle?.getFileHandle || !handleEntry.parentHandle.removeEntry) {
+      return;
+    }
+
+    const nextNameInput = window.prompt('Rename Markdown file', item.label)?.trim();
+    if (!nextNameInput) {
+      return;
+    }
+
+    const nextFilename = /\.md$/i.test(nextNameInput) ? nextNameInput : `${nextNameInput}.md`;
+    if (nextFilename === item.label) {
+      return;
+    }
+
+    const content = await handleEntry.handle.getFile().then((file) => file.text());
+    const nextHandle = await handleEntry.parentHandle.getFileHandle(nextFilename, { create: true });
+    if (nextHandle.createWritable) {
+      const writable = await nextHandle.createWritable();
+      await writable.write(content);
+      await writable.close();
+    }
+    await handleEntry.parentHandle.removeEntry(item.label);
+
+    const nextPath = `${item.path.slice(0, item.path.lastIndexOf('/'))}/${nextFilename}`;
+    const nextItem = await refreshLocalProjectDirectory(nextPath);
+    if (nextItem) {
+      await openLocalProjectFile(nextItem);
+    }
+  }, [activeLocalExplorerItemId, localExplorerItems, openLocalProjectFile, refreshLocalProjectDirectory]);
+
+  const deleteLocalProjectItem = useCallback(async () => {
+    if (!activeLocalExplorerItemId) {
+      return;
+    }
+
+    const item = localExplorerItems.find((entry) => entry.id === activeLocalExplorerItemId);
+    if (!item || item.kind !== 'file') {
+      return;
+    }
+
+    const handleEntry = localHandleEntriesRef.current[item.id];
+    if (!handleEntry?.parentHandle?.removeEntry) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete ${item.label}?`);
+    if (!confirmed) {
+      return;
+    }
+
+    await handleEntry.parentHandle.removeEntry(item.label);
+    const nextItem = await refreshLocalProjectDirectory();
+    setActiveLocalExplorerItemId(null);
+
+    if (activeLocalFileId === item.id) {
+      const fallbackFile = localExplorerItems.find((entry) => entry.kind === 'file' && entry.id !== item.id);
+      if (fallbackFile) {
+        await openLocalProjectFile(fallbackFile);
+      } else {
+        setActiveLocalFileId(null);
+      }
+    }
+
+    return nextItem;
+  }, [activeLocalExplorerItemId, activeLocalFileId, localExplorerItems, openLocalProjectFile, refreshLocalProjectDirectory]);
+
   const openExplorerItem = useCallback((item: ExplorerItem) => {
-    if (item.id.startsWith('local-file-') && localFileHandlesRef.current[item.id]) {
+    if (item.id.startsWith('local-file-') && localHandleEntriesRef.current[item.id]) {
       void openLocalProjectFile(item);
       return;
     }
 
     setActiveWorkspaceSource(item.id.startsWith('local') ? 'local' : 'cloud');
     setActiveLocalFileId(item.id.startsWith('local') && item.kind === 'file' ? item.id : null);
+    setActiveLocalExplorerItemId(item.id.startsWith('local') ? item.id : null);
+    if (item.id.startsWith('local')) {
+      setActiveLocalDirectoryId(item.kind === 'file' ? (item.parentId ?? 'local-project') : item.id);
+    }
 
     if (item.tabId) {
       setActiveFileTab(item.tabId);
@@ -3276,19 +4652,25 @@ export default function App() {
   }, [commitSourceDraft, mode]);
 
   useEffect(() => {
+    if (
+      sourceParseError ||
+      sourceDraft !== (documentState.markdown ?? documentState.source)
+    ) {
+      return undefined;
+    }
+
     let cancelled = false;
     const timeout = window.setTimeout(() => {
       void (async () => {
         try {
-          localStorage.setItem(storageKeys.source, documentState.source);
-          localStorage.setItem(storageKeys.sidecar, JSON.stringify(documentState.layout));
+          localStorage.setItem(storageKeys.project, documentState.markdown ?? '');
           localStorage.setItem(storageKeys.history, JSON.stringify(history));
 
           if (activeWorkspaceSource === 'local' && activeLocalFileId) {
-            const handle = localFileHandlesRef.current[activeLocalFileId];
-            if (handle?.createWritable) {
+            const handle = localHandleEntriesRef.current[activeLocalFileId]?.handle;
+            if (handle?.kind === 'file' && handle.createWritable) {
               const writable = await handle.createWritable();
-              await writable.write(toMarkdownDocument(documentState.source));
+              await writable.write(documentState.markdown ?? '');
               await writable.close();
             }
           }
@@ -3308,7 +4690,15 @@ export default function App() {
       cancelled = true;
       window.clearTimeout(timeout);
     };
-  }, [activeLocalFileId, activeWorkspaceSource, documentState.layout, documentState.source, history]);
+  }, [
+    activeLocalFileId,
+    activeWorkspaceSource,
+    documentState.markdown,
+    documentState.source,
+    history,
+    sourceDraft,
+    sourceParseError,
+  ]);
 
   useEffect(() => {
     if (mode !== 'canvas') {
@@ -3516,11 +4906,16 @@ export default function App() {
         setEditingLabel('');
         setEditingEdgeId(null);
         setEditingEdgeLabel('');
+        setEditingContent(false);
         clearSelection();
         setConnectingState(null);
       }
 
       if (event.key === 'Delete' || event.key === 'Backspace') {
+        if (selection.kind === 'content') {
+          event.preventDefault();
+          return;
+        }
         event.preventDefault();
         deleteSelection();
         return;
@@ -3551,6 +4946,16 @@ export default function App() {
           event.preventDefault();
           startEdgeInlineEdit(targetEdge);
         }
+        return;
+      }
+
+      if (
+        event.key === 'Enter' &&
+        selection.kind === 'content' &&
+        !editingContent
+      ) {
+        event.preventDefault();
+        startContentInlineEdit();
       }
     }
 
@@ -3583,12 +4988,14 @@ export default function App() {
     selection.ids,
     selection.kind,
     startEdgeInlineEdit,
+    startContentInlineEdit,
     startInlineEdit,
     updateViewport,
     undoDocument,
     visibleNodes,
     wrapSelectionInSubgraph,
     zoomViewportAtPoint,
+    editingContent,
   ]);
 
   useEffect(() => {
@@ -3695,6 +5102,25 @@ export default function App() {
         const shouldReparent = dragState.kind === 'node' && dragReparentMode;
         const dropTargetSubgraphId = shouldReparent ? dragTargetSubgraphId : null;
 
+        if (dragState.kind === 'content') {
+          if (movedDistance > 3) {
+            commitDocument(
+              (current) =>
+                withContentCardLayout(current, {
+                  x: (dragState.initialPositions[CONTENT_CARD_ID]?.x ?? contentCardLayout.x) + deltaX,
+                  y: (dragState.initialPositions[CONTENT_CARD_ID]?.y ?? contentCardLayout.y) + deltaY,
+                  collapsed: contentCardLayout.collapsed,
+                }),
+              '已移动用户内容',
+              '已调整用户内容框位置。',
+            );
+          }
+          setDragState(null);
+          setDragTargetSubgraphId(null);
+          setDragReparentMode(false);
+          return;
+        }
+
         if (movedDistance > 3 || shouldReparent) {
           commitDocument(
             (current) => {
@@ -3721,6 +5147,7 @@ export default function App() {
                 desiredNodes,
                 fullSubgraphLookup,
                 dropTargetSubgraphId,
+                contentCardRect,
               );
 
               return {
@@ -3748,6 +5175,8 @@ export default function App() {
         const nextNodeIds = visibleNodes.filter((node) => intersects(rect, node)).map((node) => node.id);
         if (nextNodeIds.length > 0) {
           setSelection({ kind: 'node', ids: nextNodeIds });
+        } else if (intersects(rect, contentCardRect)) {
+          setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
         } else {
           const nextEdgeIds = visibleEdges
             .filter((edge) => {
@@ -3857,6 +5286,10 @@ export default function App() {
     boxState,
     clearPendingBackgroundInteraction,
     commitDocument,
+    contentCardLayout.collapsed,
+    contentCardLayout.x,
+    contentCardLayout.y,
+    contentCardRect,
     connectingState,
     createNodeAt,
     createNodeFromShortcut,
@@ -3911,7 +5344,7 @@ export default function App() {
     }
 
     const target = event.target as HTMLElement;
-    if (target.closest('.graph-node, .subgraph-frame')) {
+    if (target.closest('.graph-node, .subgraph-frame, .content-card')) {
       return;
     }
 
@@ -4028,6 +5461,37 @@ export default function App() {
     });
   }
 
+  function startContentDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0 || editingContent) {
+      return;
+    }
+
+    const target = event.target as HTMLElement;
+    if (target.closest('button, input, textarea, a')) {
+      return;
+    }
+
+    event.stopPropagation();
+    const point = pointFromClient(event.clientX, event.clientY);
+    if (!point) {
+      return;
+    }
+
+    setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
+    setDragState({
+      kind: 'content',
+      origin: point,
+      current: point,
+      ids: [CONTENT_CARD_ID],
+      initialPositions: {
+        [CONTENT_CARD_ID]: {
+          x: contentCardRenderLayout.x,
+          y: contentCardRenderLayout.y,
+        },
+      },
+    });
+  }
+
   function startSubgraphDrag(
     event: ReactPointerEvent<HTMLDivElement>,
     subgraphId: string,
@@ -4106,6 +5570,8 @@ export default function App() {
     selection.kind === 'subgraph' && selection.ids.length === 1
       ? documentState.subgraphs.find((subgraph) => subgraph.id === selection.ids[0]) ?? null
       : null;
+  const selectedContent =
+    selection.kind === 'content' && selection.ids[0] === CONTENT_CARD_ID;
   const selectedNodePresetId = selectedNode
     ? nodeStylePresets.find((preset) =>
       preset.fill === selectedNode.fill &&
@@ -4122,6 +5588,8 @@ export default function App() {
   const canGroupSelection = selection.kind === 'node' && selection.ids.length >= 2;
   const supportsLocalProjectPicker =
     typeof (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function';
+  const supportsLocalMarkdownPicker =
+    typeof (window as Window & { showOpenFilePicker?: unknown }).showOpenFilePicker === 'function';
   const showSidebar = mode === 'canvas' ? sidebarOpen : isMobileViewport ? sidebarOpen : true;
   const showInspector = mode === 'canvas' ? inspectorOpen : isMobileViewport ? inspectorOpen : true;
   const workspaceClassName = `workspace workspace--${mode}${isMobileViewport ? ' workspace--mobile' : ''}${showSidebar ? ' workspace--sidebar-open' : ''}${showInspector ? ' workspace--inspector-open' : ''}`;
@@ -4165,6 +5633,36 @@ export default function App() {
       collapsed: selectedSubgraph.collapsed,
     });
   }, [selectedSubgraph]);
+
+  useEffect(() => {
+    if (!selectedContent) {
+      return;
+    }
+
+    setContentInspectorDraft({
+      markdown: contentMarkdown,
+    });
+  }, [contentMarkdown, selectedContent]);
+
+  useEffect(() => {
+    if (selectedNode || selectedEdge || selectedSubgraph || selectedContent) {
+      return;
+    }
+
+    setProjectInspectorDraft({
+      projectName: documentState.projectName ?? 'Untitled Project',
+      projectSummary: documentState.projectSummary ?? '',
+      contentMarkdown: contentMarkdown,
+    });
+  }, [
+    contentMarkdown,
+    documentState.projectName,
+    documentState.projectSummary,
+    selectedContent,
+    selectedEdge,
+    selectedNode,
+    selectedSubgraph,
+  ]);
 
   useEffect(() => {
     if (selection.kind === 'subgraph') {
@@ -4236,23 +5734,7 @@ export default function App() {
               <WorkbenchIcon name="menu" />
             </button>
           ) : null}
-          {isMobileViewport ? (
-            <>
-              <div className="topbar__mark">LTHS</div>
-              <div className="workbench-brand__copy">
-                <p className="eyebrow">{activeWorkspaceSource === 'cloud' ? '云端文件' : '本地文件'}</p>
-                <h1>{activeTab.label}</h1>
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="topbar__mark">LTHS</div>
-              <div className="workbench-brand__copy">
-                <p className="eyebrow">{activeWorkspaceSource === 'cloud' ? '云端工程' : '本地工程'}</p>
-                <h1>{activeTab.label}</h1>
-              </div>
-            </>
-          )}
+          <div className="topbar__mark">MD</div>
         </div>
 
         <div className="workbench-tabs" aria-label="已打开文件">
@@ -4292,14 +5774,21 @@ export default function App() {
                 <button className="desktop-command-button" onClick={exportMarkdown} type="button">
                   导出
                 </button>
+                <button className="desktop-command-button" onClick={exportCanvasImage} type="button">
+                  导出图片
+                </button>
                 <button
-                  className={supportsLocalProjectPicker ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  className={
+                    supportsLocalMarkdownPicker || supportsLocalProjectPicker
+                      ? 'desktop-command-button'
+                      : 'desktop-command-button is-disabled'
+                  }
                   onClick={() => {
-                    void openLocalProjectDirectory();
+                    void openLocalMarkdownFile();
                   }}
                   type="button"
                 >
-                  打开本地
+                  打开 MD
                 </button>
               </div>
 
@@ -4331,6 +5820,9 @@ export default function App() {
                 </button>
                 <button className="desktop-command-button" onClick={compactLayout} type="button">
                   整理
+                </button>
+                <button className="desktop-command-button" onClick={standardizeCurrentProject} type="button">
+                  标准化
                 </button>
               </div>
 
@@ -4462,6 +5954,15 @@ export default function App() {
                   <WorkbenchIcon name="copy" />
                 </button>
                 <button
+                  aria-label="导出当前画布图片"
+                  className="icon-button has-tooltip"
+                  data-tooltip="导出图片"
+                  onClick={exportCanvasImage}
+                  type="button"
+                >
+                  <WorkbenchIcon name="preview" />
+                </button>
+                <button
                   aria-label="导出标准 Markdown"
                   className="icon-button icon-button--primary has-tooltip"
                   data-tooltip="导出 Markdown"
@@ -4579,40 +6080,190 @@ export default function App() {
               <section className="sidebar-card">
                 <div className="sidebar-card__header">
                   <h2>本地</h2>
+                </div>
+                <div className="file-manager-toolbar">
+                  <button
+                    className={supportsLocalMarkdownPicker ? 'ghost-button' : 'ghost-button is-disabled'}
+                    disabled={!supportsLocalMarkdownPicker}
+                    onClick={() => {
+                      void openLocalMarkdownFile();
+                    }}
+                    type="button"
+                  >
+                    打开 MD
+                  </button>
                   <button
                     className={supportsLocalProjectPicker ? 'ghost-button' : 'ghost-button is-disabled'}
+                    disabled={!supportsLocalProjectPicker}
                     onClick={() => {
                       void openLocalProjectDirectory();
                     }}
                     type="button"
                   >
-                    打开本地工程
+                    打开目录
+                  </button>
+                  <button
+                    className={localRootDirectoryRef.current ? 'ghost-button' : 'ghost-button is-disabled'}
+                    disabled={!localRootDirectoryRef.current}
+                    onClick={() => {
+                      void createLocalProjectFile();
+                    }}
+                    type="button"
+                  >
+                    新建
+                  </button>
+                  <button
+                    className={activeLocalItem?.kind === 'file' ? 'ghost-button' : 'ghost-button is-disabled'}
+                    disabled={activeLocalItem?.kind !== 'file'}
+                    onClick={() => {
+                      void renameLocalProjectItem();
+                    }}
+                    type="button"
+                  >
+                    重命名
+                  </button>
+                  <button
+                    className={activeLocalItem?.kind === 'file' ? 'ghost-button ghost-button--danger' : 'ghost-button is-disabled'}
+                    disabled={activeLocalItem?.kind !== 'file'}
+                    onClick={() => {
+                      void deleteLocalProjectItem();
+                    }}
+                    type="button"
+                  >
+                    删除
+                  </button>
+                  <button
+                    className="ghost-button"
+                    onClick={standardizeCurrentProject}
+                    type="button"
+                  >
+                    标准化
                   </button>
                 </div>
-                <p className="sidebar-copy">{activeLocalPath}</p>
-                <div className="explorer-list">
-                  {localExplorerItems.map((item) => (
-                    <button
-                      className={item.tabId === activeFileTab && activeWorkspaceSource === 'local' ? 'explorer-item is-active' : 'explorer-item'}
-                      key={item.id}
-                      onClick={() => openExplorerItem(item)}
-                      style={{ paddingLeft: `${12 + item.depth * 16}px` }}
-                      type="button"
-                    >
-                      <span className={`explorer-item__marker explorer-item__marker--${item.kind}`} />
-                      <span className="explorer-item__body">
-                        <strong>{item.label}</strong>
-                        <small>{item.meta}</small>
-                      </span>
-                    </button>
-                  ))}
-                </div>
+
+                {hasLocalProjectAccess ? (
+                  <>
+                    <div className="path-strip">
+                      <button
+                        aria-label="返回上一级"
+                        className={localBreadcrumbItems.length > 1 ? 'path-strip__up' : 'path-strip__up is-disabled'}
+                        disabled={localBreadcrumbItems.length <= 1}
+                        onClick={() => {
+                          const parent = localBreadcrumbItems[localBreadcrumbItems.length - 2];
+                          if (parent) {
+                            openExplorerItem(parent);
+                          }
+                        }}
+                        type="button"
+                      >
+                        <WorkbenchIcon name="chevron-left" />
+                      </button>
+                      <div className="path-strip__crumbs">
+                        {localBreadcrumbItems.map((item) => (
+                          <button
+                            className={item.id === activeLocalDirectoryId ? 'path-crumb is-active' : 'path-crumb'}
+                            key={item.id}
+                            onClick={() => openExplorerItem(item)}
+                            type="button"
+                          >
+                            {item.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="explorer-list explorer-list--manager">
+                      {localDirectoryEntries.map((item) => (
+                        <button
+                          className={
+                            item.id === activeLocalExplorerItemId || (
+                              item.kind !== 'file' &&
+                              item.id === activeLocalDirectoryId
+                            )
+                              ? 'explorer-item is-active'
+                              : 'explorer-item'
+                          }
+                          key={item.id}
+                          onClick={() => openExplorerItem(item)}
+                          type="button"
+                        >
+                          <span className={`explorer-item__marker explorer-item__marker--${item.kind}`} />
+                          <span className="explorer-item__body">
+                            <strong>{item.label}</strong>
+                            <small>{item.meta}</small>
+                          </span>
+                        </button>
+                      ))}
+                      {localDirectoryEntries.length === 0 ? (
+                        <div className="explorer-empty">
+                          当前目录为空
+                        </div>
+                      ) : null}
+                    </div>
+                  </>
+                ) : (
+                  <div className="explorer-empty">
+                    打开一个本地目录后，这里会以文件管理器方式显示 Markdown 工程。
+                  </div>
+                )}
               </section>
             </>
           ) : null}
 
           {leftPanel === 'graph' ? (
             <>
+              <section className="sidebar-card">
+                <div className="sidebar-card__header">
+                  <h2>导航图</h2>
+                  <span>{Math.round(documentState.layout.viewport.zoom * 100)}%</span>
+                </div>
+                {miniMapModel ? (
+                  <div className="graph-minimap">
+                    <svg
+                      className="graph-minimap__canvas"
+                      onPointerCancel={endMiniMapInteraction}
+                      onPointerDown={beginMiniMapInteraction}
+                      onPointerMove={updateMiniMapInteraction}
+                      onPointerUp={endMiniMapInteraction}
+                      viewBox={`0 0 ${miniMapModel.width} ${miniMapModel.height}`}
+                    >
+                      <rect
+                        className="graph-minimap__surface"
+                        height={miniMapModel.height}
+                        rx={10}
+                        width={miniMapModel.width}
+                      />
+                      {miniMapModel.shapes.map((shape) => (
+                        <rect
+                          key={`minimap-${shape.kind}-${shape.id}`}
+                          className={`graph-minimap__shape graph-minimap__shape--${shape.kind}${shape.selected ? ' is-selected' : ''}`}
+                          fill={shape.fill}
+                          height={shape.projected.height}
+                          rx={shape.kind === 'subgraph' ? 6 : 4}
+                          stroke={shape.stroke}
+                          strokeWidth={shape.selected ? 1.8 : 1}
+                          width={shape.projected.width}
+                          x={shape.projected.x}
+                          y={shape.projected.y}
+                        />
+                      ))}
+                      {miniMapModel.viewport ? (
+                        <rect
+                          className="graph-minimap__viewport"
+                          height={miniMapModel.viewport.height}
+                          rx={8}
+                          width={miniMapModel.viewport.width}
+                          x={miniMapModel.viewport.x}
+                          y={miniMapModel.viewport.y}
+                        />
+                      ) : null}
+                    </svg>
+                  </div>
+                ) : (
+                  <div className="graph-minimap graph-minimap--empty">暂无可导航内容</div>
+                )}
+              </section>
+
               <section className="sidebar-card">
                 <div className="sidebar-card__header">
                   <h2>图层树</h2>
@@ -4689,7 +6340,7 @@ export default function App() {
                     return;
                   }
                   const target = event.target as HTMLElement;
-                  if (target.closest('.graph-node, .edge-path, .edge-hitbox, .edge-label, .edge-label-editor')) {
+                  if (target.closest('.graph-node, .content-card, .edge-path, .edge-hitbox, .edge-label, .edge-label-editor')) {
                     return;
                   }
 
@@ -4710,6 +6361,7 @@ export default function App() {
               >
                 <div
                   className="canvas-board"
+                  ref={canvasBoardRef}
                   style={{
                     transform: `translate(${documentState.layout.viewport.x}px, ${documentState.layout.viewport.y}px) scale(${documentState.layout.viewport.zoom})`,
                   }}
@@ -4850,6 +6502,84 @@ export default function App() {
                     );
                   })}
 
+                  <div
+                    className={`content-card${selectedContent ? ' is-selected' : ''}${editingContent ? ' is-editing' : ''}${contentCardCollapsed ? ' is-collapsed' : ''}`}
+                    onDoubleClick={(event) => {
+                      event.stopPropagation();
+                      startContentInlineEdit();
+                    }}
+                    onPointerDown={startContentDrag}
+                    style={{
+                      left: contentCardRenderLayout.x,
+                      top: contentCardRenderLayout.y,
+                      width: contentCardSize.width,
+                      height: contentCardSize.height,
+                    }}
+                  >
+                    <div
+                      className="content-card__header"
+                      onPointerDown={startContentDrag}
+                    >
+                      <div className="content-card__header-copy">
+                        <span className="content-card__eyebrow">Content</span>
+                        <strong>用户内容</strong>
+                      </div>
+                      <button
+                        aria-label={contentCardLayout.collapsed ? '展开用户内容' : '折叠用户内容'}
+                        className="content-card__action"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleContentCollapsed();
+                        }}
+                        type="button"
+                      >
+                        <WorkbenchIcon name={contentCardLayout.collapsed ? 'plus' : 'minus'} />
+                      </button>
+                    </div>
+
+                    {editingContent ? (
+                      <textarea
+                        autoFocus
+                        className="content-card__editor"
+                        onBlur={commitContentInlineEdit}
+                        onChange={(event) =>
+                          setContentInspectorDraft({ markdown: event.target.value })
+                        }
+                        onDoubleClick={(event) => event.stopPropagation()}
+                        onKeyDown={(event) => {
+                          if (handleNativeSelectAllShortcut(event)) {
+                            return;
+                          }
+
+                          if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                            event.preventDefault();
+                            commitContentInlineEdit();
+                            event.currentTarget.blur();
+                            return;
+                          }
+
+                          if (event.key === 'Escape') {
+                            event.preventDefault();
+                            setEditingContent(false);
+                            setContentInspectorDraft({ markdown: contentMarkdown });
+                          }
+                        }}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        spellCheck={false}
+                        value={contentInspectorDraft.markdown}
+                      />
+                    ) : contentCardCollapsed ? (
+                      <div className="content-card__summary">
+                        <p>{contentCardSummary}</p>
+                      </div>
+                    ) : (
+                      <div
+                        className="content-card__body"
+                        dangerouslySetInnerHTML={{ __html: contentCardPreviewHtml }}
+                      />
+                    )}
+                  </div>
+
                   <svg className="edge-layer" aria-hidden="true">
                     <defs>
                       <marker
@@ -4925,6 +6655,9 @@ export default function App() {
                       );
                       const labelBorder = withAlpha(edgeBaseColor, isEdgeSelected ? 0.82 : 0.64);
                       const labelMetrics = edge.label ? measureEdgeLabelBadge(edge.label) : null;
+                      const liveEdgeLabel = editingEdgeId === edge.id ? editingEdgeLabel || ' ' : edge.label;
+                      const liveEdgeLabelMetrics = measureEdgeLabelBadge(liveEdgeLabel);
+                      const edgeLabelLines = edge.label.split(/\r?\n/);
 
                       return (
                         <g key={edge.id}>
@@ -4971,12 +6704,12 @@ export default function App() {
                           {editingEdgeId === edge.id ? (
                             <foreignObject
                               className="edge-label-editor-fo"
-                              height={44}
-                              width={164}
-                              x={geometry.label.x - 82}
-                              y={geometry.label.y - 32}
+                              height={Math.max(52, liveEdgeLabelMetrics.height + 22)}
+                              width={Math.max(164, liveEdgeLabelMetrics.width + 26)}
+                              x={geometry.label.x - Math.max(164, liveEdgeLabelMetrics.width + 26) / 2}
+                              y={geometry.label.y - Math.max(52, liveEdgeLabelMetrics.height + 22) / 2}
                             >
-                              <input
+                              <textarea
                                 autoFocus
                                 className="edge-label-editor"
                                 onBlur={() => commitEdgeInlineEdit(edge.id)}
@@ -4984,6 +6717,23 @@ export default function App() {
                                 onDoubleClick={(event) => event.stopPropagation()}
                                 onKeyDown={(event) => {
                                   if (handleNativeSelectAllShortcut(event)) {
+                                    return;
+                                  }
+
+                                  if (
+                                    event.key === 'Enter' &&
+                                    (event.shiftKey || event.ctrlKey || event.altKey)
+                                  ) {
+                                    event.preventDefault();
+                                    const textarea = event.currentTarget;
+                                    const start = textarea.selectionStart;
+                                    const end = textarea.selectionEnd;
+                                    const nextValue = `${editingEdgeLabel.slice(0, start)}\n${editingEdgeLabel.slice(end)}`;
+                                    setEditingEdgeLabel(nextValue);
+                                    window.requestAnimationFrame(() => {
+                                      textarea.selectionStart = start + 1;
+                                      textarea.selectionEnd = start + 1;
+                                    });
                                     return;
                                   }
 
@@ -5000,6 +6750,9 @@ export default function App() {
                                   }
                                 }}
                                 onPointerDown={(event) => event.stopPropagation()}
+                                rows={1}
+                                spellCheck={false}
+                                style={{ minHeight: Math.max(liveEdgeLabelMetrics.height + 10, 38) }}
                                 value={editingEdgeLabel}
                               />
                             </foreignObject>
@@ -5025,19 +6778,23 @@ export default function App() {
                               />
                               <text
                                 className={`edge-label${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
-                                dominantBaseline="middle"
                                 fill={labelTextColor}
                                 x={0}
-                                y={0}
                               >
-                                <tspan
-                                  onDoubleClick={(event) => {
-                                    event.stopPropagation();
-                                    startEdgeInlineEdit(edge);
-                                  }}
-                                >
-                                  {edge.label}
-                                </tspan>
+                                {edgeLabelLines.map((line, index) => (
+                                  <tspan
+                                    key={`${edge.id}-label-${index}`}
+                                    dominantBaseline="middle"
+                                    onDoubleClick={(event) => {
+                                      event.stopPropagation();
+                                      startEdgeInlineEdit(edge);
+                                    }}
+                                    x={0}
+                                    y={((index - (edgeLabelLines.length - 1) / 2) * 16)}
+                                  >
+                                    {line || ' '}
+                                  </tspan>
+                                ))}
                               </text>
                             </g>
                           ) : null}
@@ -5274,13 +7031,13 @@ export default function App() {
               <section className="source-pane">
                 <div className="pane-header">
                   <div>
-                    <p className="eyebrow">Markdown + Mermaid</p>
-                    <h2>源码编辑器</h2>
+                    <p className="eyebrow">Project Markdown</p>
+                    <h2>工程源码编辑器</h2>
                   </div>
                   <div className="source-pane__actions">
                     <button
                       className="ghost-button"
-                      onClick={() => setSourceDraft(documentState.source)}
+                      onClick={() => setSourceDraft(documentState.markdown ?? documentState.source)}
                       type="button"
                     >
                       回退到有效图
@@ -5314,8 +7071,8 @@ export default function App() {
                 <div className="source-status">
                   <span>
                     {sourceParseError
-                      ? '当前草稿存在语法问题，退出编辑前不会提交。'
-                      : '源码草稿会在失焦或切换模式后提交到共享图模型。'}
+                      ? '当前工程 Markdown 存在语法问题，退出编辑前不会提交。'
+                      : '工程 Markdown 草稿会在失焦或切换模式后提交到共享图模型。'}
                   </span>
                   {sourceParseError ? <strong>{sourceParseError}</strong> : null}
                   {documentState.warnings.length > 0 ? (
@@ -5332,7 +7089,7 @@ export default function App() {
                       <h2>标准 Mermaid 渲染</h2>
                     </div>
                   </div>
-                  <MermaidPreview source={sourceDraft} />
+                  <MermaidPreview source={extractMermaidFromProjectMarkdown(sourceDraft)} />
                 </section>
               ) : null}
             </div>
@@ -5493,14 +7250,23 @@ export default function App() {
               </div>
               <label className="field">
                 <span>标签</span>
-                <input
+                <textarea
                   onBlur={() => applyEdgeInspectorDraft()}
                   onChange={(event) =>
                     setEdgeInspectorDraft((current) => ({ ...current, label: event.target.value }))
                   }
                   onKeyDown={(event) => {
-                    handleNativeSelectAllShortcut(event);
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault();
+                      applyEdgeInspectorDraft();
+                      event.currentTarget.blur();
+                    }
                   }}
+                  rows={4}
                   value={edgeInspectorDraft.label}
                 />
               </label>
@@ -5607,10 +7373,126 @@ export default function App() {
             </section>
           ) : null}
 
-          {!selectedNode && !selectedEdge && !selectedSubgraph ? (
+          {selectedContent ? (
+            <section className="sidebar-card">
+              <div className="sidebar-card__header">
+                <h2>用户内容</h2>
+                <span>Content</span>
+              </div>
+              <label className="field field--inline">
+                <span>折叠</span>
+                <input
+                  checked={contentCardLayout.collapsed}
+                  onChange={(event) => toggleContentCollapsed(event.target.checked)}
+                  type="checkbox"
+                />
+              </label>
+              <label className="field">
+                <span>Markdown</span>
+                <textarea
+                  onBlur={() => applyContentInspectorDraft()}
+                  onChange={(event) =>
+                    setContentInspectorDraft({ markdown: event.target.value })
+                  }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault();
+                      applyContentInspectorDraft();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  rows={10}
+                  value={contentInspectorDraft.markdown}
+                />
+              </label>
+            </section>
+          ) : null}
+
+          {!selectedNode && !selectedEdge && !selectedSubgraph && !selectedContent ? (
             <section className="sidebar-card inspector-empty">
-              <h2>未选中对象</h2>
-              <p>选择一个节点、连线或分组后，这里只显示当前对象的属性。</p>
+              <div className="sidebar-card__header">
+                <h2>工程信息</h2>
+                <span>Project</span>
+              </div>
+              <label className="field">
+                <span>Project Name</span>
+                <input
+                  onBlur={() => applyProjectInspectorDraft()}
+                  onChange={(event) =>
+                    setProjectInspectorDraft((current) => ({
+                      ...current,
+                      projectName: event.target.value,
+                    }))
+                  }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      applyProjectInspectorDraft();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  type="text"
+                  value={projectInspectorDraft.projectName}
+                />
+              </label>
+              <label className="field">
+                <span>Summary</span>
+                <textarea
+                  onBlur={() => applyProjectInspectorDraft()}
+                  onChange={(event) =>
+                    setProjectInspectorDraft((current) => ({
+                      ...current,
+                      projectSummary: event.target.value,
+                    }))
+                  }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault();
+                      applyProjectInspectorDraft();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  rows={4}
+                  value={projectInspectorDraft.projectSummary}
+                />
+              </label>
+              <label className="field">
+                <span>Content</span>
+                <textarea
+                  onBlur={() => applyProjectInspectorDraft()}
+                  onChange={(event) =>
+                    setProjectInspectorDraft((current) => ({
+                      ...current,
+                      contentMarkdown: event.target.value,
+                    }))
+                  }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault();
+                      applyProjectInspectorDraft();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  rows={10}
+                  value={projectInspectorDraft.contentMarkdown}
+                />
+              </label>
             </section>
           ) : null}
         </aside>
@@ -5643,7 +7525,7 @@ export default function App() {
                 <WorkbenchIcon name="chevron-right" />
               </button>
             </div>
-            <MermaidPreview source={sourceDraft} />
+            <MermaidPreview source={extractMermaidFromProjectMarkdown(sourceDraft)} />
           </section>
         ) : null}
 

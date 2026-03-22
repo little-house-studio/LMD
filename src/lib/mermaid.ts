@@ -91,6 +91,19 @@ function sanitizeId(input: string) {
     .replace(/^_+|_+$/g, '') || `node_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function decodeMermaidLabel(input: string) {
+  return input
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/<br\s*\/?>/gi, '\n');
+}
+
+function encodeMermaidLabel(input: string) {
+  return input
+    .replace(/"/g, '\\"')
+    .replace(/\r?\n/g, '<br/>');
+}
+
 export function measureNodeContentSize(content: string) {
   const lines = content.split(/\r?\n/);
   const unitsPerLine = lines.map((line) =>
@@ -116,7 +129,7 @@ function inferNode(raw: string) {
     if (match) {
       return {
         id: match[1],
-        label: match[2].trim().replace(/^["']|["']$/g, ''),
+        label: decodeMermaidLabel(match[2]),
         shape: matcher.shape,
       };
     }
@@ -211,7 +224,7 @@ function parseEdgeLine(raw: string) {
       from,
       to,
       type: pattern.type,
-      label: match[3]?.trim() ?? '',
+      label: match[3] ? decodeMermaidLabel(match[3]) : '',
     };
   }
 
@@ -337,8 +350,8 @@ function buildAutoLayout(
       if (existing) {
         node.x = existing.x;
         node.y = existing.y;
-        node.width = existing.width;
-        node.height = existing.height;
+        node.width = existing.width > 0 ? existing.width : node.width;
+        node.height = existing.height > 0 ? existing.height : node.height;
         return;
       }
 
@@ -403,8 +416,8 @@ export function parseMermaidDocument(
       shape: inferred.shape,
       x: stored?.x ?? 0,
       y: stored?.y ?? 0,
-      width: stored?.width ?? size.width,
-      height: stored?.height ?? size.height,
+      width: stored && stored.width > 0 ? stored.width : size.width,
+      height: stored && stored.height > 0 ? stored.height : size.height,
       fill: defaultNodeStyle.fill,
       stroke: defaultNodeStyle.stroke,
       textColor: defaultNodeStyle.textColor,
@@ -542,7 +555,7 @@ function edgeToken(type: EdgeType) {
 }
 
 function encodeNode(node: GraphNode) {
-  const label = node.label.replace(/"/g, '\\"');
+  const label = encodeMermaidLabel(node.label);
   switch (node.shape) {
     case 'round':
       return `${node.id}([${label}])`;
@@ -605,7 +618,7 @@ export function serializeMermaidDocument(
   const normalizedEdges = edges.map(normalizeEdgeStyle);
 
   for (const edge of normalizedEdges) {
-    const label = edge.label ? `|${edge.label}|` : '';
+    const label = edge.label ? `|${encodeMermaidLabel(edge.label)}|` : '';
     lines.push(`  ${edge.from} ${edgeToken(edge.type)}${label} ${edge.to}`);
   }
 

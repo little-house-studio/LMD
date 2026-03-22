@@ -1,5 +1,4 @@
 export const storageKeys = {
-  source: 'lths-md/source',
-  sidecar: 'lths-md/sidecar',
+  project: 'lths-md/project',
   history: 'lths-md/history',
 };

@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/components/bootfallbacks.tsx","./src/lib/mermaid.ts","./src/lib/sample.ts","./src/lib/storage.ts","./src/lib/types.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/bootfallbacks.tsx","./src/lib/mermaid.ts","./src/lib/projectmarkdown.ts","./src/lib/sample.ts","./src/lib/storage.ts","./src/lib/types.ts"],"version":"5.9.3"}

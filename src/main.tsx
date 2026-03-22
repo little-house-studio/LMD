@@ -8,8 +8,7 @@ import './styles.css';
 const params = new URLSearchParams(window.location.search);
 
 if (params.has('reset')) {
-  localStorage.removeItem(storageKeys.source);
-  localStorage.removeItem(storageKeys.sidecar);
+  localStorage.removeItem(storageKeys.project);
   localStorage.removeItem(storageKeys.history);
 }
 

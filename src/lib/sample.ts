@@ -1,4 +1,4 @@
-export const sampleSource = `flowchart LR
+export const sampleMermaidSource = `flowchart LR
   Brief[产品说明]
   Review{评审完成?}
   Draft[[空间草稿]]
@@ -29,4 +29,25 @@ export const sampleSource = `flowchart LR
   style API fill:#dff6ff,stroke:#0369a1,color:#082f49
   style Docs fill:#f2f5f9,stroke:#64748b,color:#0f172a
   style Ship fill:#ffe3ea,stroke:#be123c,color:#4c0519
+`;
+
+export const sampleProjectMarkdown = `# Product Graph Workspace
+
+## Summary
+
+Internal collaborative Mermaid workspace for product graphs and structured outlines.
+
+## Diagram
+\`\`\`mermaid
+${sampleMermaidSource}
+\`\`\`
+
+## Content
+
+- This area is regular Markdown content.
+- The canvas editor will not rewrite this content.
+
+\`\`\`lths-compat
+v1
+\`\`\`
 `;
