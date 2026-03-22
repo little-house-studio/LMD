@@ -85,6 +85,106 @@ export interface GraphDocument {
   compat?: ProjectCompatLayer;
 }
 
+export interface GraphSemanticSnapshot {
+  revision: number;
+  project: {
+    name: string;
+    summary: string;
+    content: string;
+  };
+  diagram: {
+    direction: Direction;
+    nodes: Array<{
+      id: string;
+      label: string;
+      subgraphId: string | null;
+    }>;
+    edges: Array<{
+      id: string;
+      from: string;
+      to: string;
+      label: string;
+      type: EdgeType;
+    }>;
+    subgraphs: Array<{
+      id: string;
+      title: string;
+      parentId: string | null;
+      collapsed: boolean;
+    }>;
+  };
+  selection: {
+    kind: 'none' | 'node' | 'edge' | 'subgraph' | 'content';
+    ids: string[];
+  };
+}
+
+export type GraphOperation =
+  | {
+      type: 'updateProjectMeta';
+      projectName?: string;
+      projectSummary?: string;
+    }
+  | {
+      type: 'updateContentMarkdown';
+      markdown: string;
+    }
+  | {
+      type: 'createNode';
+      nodeId?: string;
+      label?: string;
+      subgraphId?: string | null;
+    }
+  | {
+      type: 'updateNodeLabel';
+      nodeId: string;
+      label: string;
+    }
+  | {
+      type: 'deleteNode';
+      nodeId: string;
+    }
+  | {
+      type: 'createEdge';
+      edgeId?: string;
+      from: string;
+      to: string;
+      label?: string;
+      edgeType?: EdgeType;
+    }
+  | {
+      type: 'updateEdgeLabel';
+      edgeId: string;
+      label: string;
+    }
+  | {
+      type: 'deleteEdge';
+      edgeId: string;
+    }
+  | {
+      type: 'createSubgraph';
+      subgraphId?: string;
+      title?: string;
+      parentId?: string | null;
+      nodeIds?: string[];
+    }
+  | {
+      type: 'updateSubgraphTitle';
+      subgraphId: string;
+      title: string;
+    }
+  | {
+      type: 'moveNodeToSubgraph';
+      nodeId: string;
+      subgraphId: string | null;
+    };
+
+export interface GraphOperationBatchResult {
+  applied: number;
+  warnings: string[];
+  revision: number;
+}
+
 export interface HistoryEntry {
   id: string;
   at: string;

@@ -2226,15 +2226,22 @@ select:focus-visible {
   z-index: 11;
 }
 
-.tool-dock {
+.tool-dock-cluster {
   position: absolute;
   left: 50%;
   bottom: 12px;
+  z-index: 15;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  transform: translateX(-50%);
+}
+
+.tool-dock {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  transform: translateX(-50%);
-  z-index: 15;
   padding: 6px 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
@@ -2278,6 +2285,148 @@ select:focus-visible {
   text-align: center;
   color: var(--ink-soft);
   font-size: 0.82rem;
+}
+
+.ai-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  background: rgba(17, 18, 22, 0.98);
+  color: var(--ink);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(10px);
+}
+
+.ai-trigger.is-active {
+  border-color: rgba(96, 165, 250, 0.44);
+  background: rgba(35, 52, 90, 0.96);
+}
+
+.ai-panel {
+  position: absolute;
+  right: 12px;
+  bottom: 56px;
+  z-index: 18;
+  display: grid;
+  gap: 10px;
+  width: min(420px, calc(100vw - 32px));
+  max-height: min(68vh, 640px);
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: rgba(12, 14, 18, 0.98);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.38);
+  overscroll-behavior: contain;
+  touch-action: pan-y pinch-zoom;
+}
+
+.ai-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-panel__header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.ai-panel__tabs {
+  display: flex;
+  gap: 8px;
+}
+
+.ai-panel__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--ink-soft);
+}
+
+.ai-panel__tab.is-active {
+  color: var(--ink);
+  border-color: rgba(96, 165, 250, 0.45);
+  background: rgba(59, 130, 246, 0.14);
+}
+
+.ai-panel__messages {
+  display: grid;
+  gap: 8px;
+  min-height: 180px;
+  max-height: 320px;
+  overflow: auto;
+  padding-right: 4px;
+  overscroll-behavior: contain;
+}
+
+.ai-message {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.ai-message strong {
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+}
+
+.ai-message p {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.55;
+}
+
+.ai-message--user {
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(59, 130, 246, 0.22);
+}
+
+.ai-message--assistant.is-error {
+  border-color: rgba(248, 113, 113, 0.28);
+  background: rgba(127, 29, 29, 0.22);
+}
+
+.ai-panel__composer {
+  display: grid;
+  gap: 8px;
+}
+
+.ai-panel__input {
+  width: 100%;
+  min-height: 88px;
+  resize: vertical;
+  overscroll-behavior: contain;
+}
+
+.ai-panel__composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink-soft);
+  font-size: 0.76rem;
+}
+
+.ai-panel__settings {
+  display: grid;
+  gap: 10px;
+  overflow: auto;
+  padding-right: 4px;
+  overscroll-behavior: contain;
 }
 
 .source-mode {
@@ -2674,10 +2823,14 @@ select:focus-visible {
     display: none;
   }
 
-  .app-shell--mobile .tool-dock {
+  .app-shell--mobile .tool-dock-cluster {
     left: 50%;
     bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+    gap: 8px;
     transform: translateX(-50%);
+  }
+
+  .app-shell--mobile .tool-dock {
     gap: 6px;
     max-width: min(calc(100% - 24px), 360px);
     justify-content: flex-start;
@@ -2697,6 +2850,12 @@ select:focus-visible {
   .app-shell--mobile .tool-dock__zoom {
     min-width: 42px;
     font-size: 0.76rem;
+  }
+
+  .app-shell--mobile .ai-trigger {
+    width: 44px;
+    height: 44px;
+    border-radius: var(--radius-lg);
   }
 
   .app-shell--mobile .tool-dock::-webkit-scrollbar {

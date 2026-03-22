@@ -35,6 +35,9 @@ import type {
   GraphDocument,
   GraphEdge,
   GraphNode,
+  GraphOperation,
+  GraphOperationBatchResult,
+  GraphSemanticSnapshot,
   GraphSubgraph,
   HistoryEntry,
   LayoutSidecar,
@@ -224,6 +227,23 @@ interface SubgraphInspectorDraft {
   textColor: string;
 }
 
+interface AiSettingsDraft {
+  apiKey: string;
+  apiUrl: string;
+  model: string;
+  contextWindow: number;
+  systemPrompt: string;
+}
+
+interface AiMessage {
+  id: string;
+  role: 'assistant' | 'user';
+  content: string;
+  status?: 'error';
+}
+
+type AiPanelTab = 'chat' | 'settings';
+
 type IconName =
   | 'menu'
   | 'files'
@@ -245,7 +265,9 @@ type IconName =
   | 'chevron-right'
   | 'link-start'
   | 'link-end'
-  | 'trash';
+  | 'trash'
+  | 'chat'
+  | 'settings';
 
 const shapeOptions: Array<{ label: string; value: NodeShape }> = [
   { label: '矩形', value: 'rect' },
@@ -400,6 +422,139 @@ const desktopCommandGroups = [
   { id: 'edit', label: '编辑' },
   { id: 'view', label: '视图' },
 ] as const;
+
+const defaultAiSettings: AiSettingsDraft = {
+  apiKey: 'sk-UiIS0INPg3p98EgKD6365410B8C240329599815bF9B0673f',
+  apiUrl: 'https://api.gpt.ge/v1/chat/completions',
+  model: 'gpt-5.4-mini',
+  contextWindow: 200000,
+  systemPrompt:
+    'You are the internal assistant for a Mermaid and Markdown workspace. Use the current graph semantic snapshot and full project markdown as the primary context. Be concise, practical, and grounded in the provided workspace state.',
+};
+
+const defaultAiMessages: AiMessage[] = [
+  {
+    id: 'ai-welcome',
+    role: 'assistant',
+    content: 'AI 验证入口已打开。现在会附带完整工程 Markdown、相对上一轮的改动、当前选中内容，并允许 AI 调用本地工具修改文档。',
+  },
+];
+
+const aiToolDefinitions = [
+  {
+    type: 'function',
+    function: {
+      name: 'get_graph_semantic_snapshot',
+      description: 'Read the current semantic graph snapshot without layout or style details.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'apply_graph_operation_batch',
+      description: 'Apply structured graph operations to nodes, edges, subgraphs, project meta, or additional information.',
+      parameters: {
+        type: 'object',
+        properties: {
+          operations: {
+            type: 'array',
+            items: {
+              type: 'object',
+            },
+          },
+          expectedRevision: {
+            type: 'number',
+          },
+          title: {
+            type: 'string',
+          },
+          detail: {
+            type: 'string',
+          },
+        },
+        required: ['operations'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_project_markdown',
+      description: 'Read the latest full project markdown file.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_project_markdown',
+      description: 'Write the full markdown file and normalize it into the current single-file project structure.',
+      parameters: {
+        type: 'object',
+        properties: {
+          markdown: {
+            type: 'string',
+          },
+        },
+        required: ['markdown'],
+        additionalProperties: false,
+      },
+    },
+  },
+] as const;
+
+const aiToolRules = [
+  'Prefer tools over guesswork whenever the user asks to change the document.',
+  'Prefer apply_graph_operation_batch for structural diagram edits.',
+  'Use set_project_markdown only for broader Markdown rewrites or when the batch tool cannot express the change cleanly.',
+  'Treat the current selection as the primary scope unless the user clearly asks for a wider change.',
+  'After editing, briefly summarize what changed.',
+].join('\n');
+
+function readStoredJson<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) {
+      return fallback;
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return fallback;
+    }
+
+    return {
+      ...(fallback as object),
+      ...(parsed as object),
+    } as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function readStoredArray<T>(key: string, fallback: T[]) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) {
+      return fallback;
+    }
+
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed as T[] : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function WorkbenchIcon({ name, className }: { name: IconName; className?: string }) {
   const props = {
@@ -559,6 +714,20 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
           <path d="M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7" />
           <path d="M7 7l.8 11.2A2 2 0 0 0 9.8 20h4.4a2 2 0 0 0 2-1.8L17 7" />
           <path d="M10 11v5M14 11v5" />
+        </svg>
+      );
+    case 'chat':
+      return (
+        <svg {...props}>
+          <path d="M5 6.5h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H11l-4.5 3v-3H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z" />
+          <path d="M8 10h8M8 13h5" />
+        </svg>
+      );
+    case 'settings':
+      return (
+        <svg {...props}>
+          <circle cx="12" cy="12" r="2.5" />
+          <path d="M19 12a7.2 7.2 0 0 0-.1-1l2-1.6-2-3.4-2.3.8a7.4 7.4 0 0 0-1.7-1L14.5 3h-5L9 5.8a7.4 7.4 0 0 0-1.7 1L5 6l-2 3.4L5 11a7 7 0 0 0 0 2l-2 1.6L5 18l2.3-.8a7.4 7.4 0 0 0 1.7 1l.5 2.8h5l.5-2.8a7.4 7.4 0 0 0 1.7-1L19 18l2-3.4-2-1.6c.1-.3.1-.7.1-1z" />
         </svg>
       );
     default:
@@ -1304,6 +1473,246 @@ function withContentCardLayout(document: GraphDocument, layout: ContentCardLayou
           : [Math.round(layout.x), Math.round(layout.y)],
       },
     },
+  };
+}
+
+function buildGraphSemanticSnapshotFromDocument(
+  document: GraphDocument,
+  selection: SelectionState,
+  revision: number,
+): GraphSemanticSnapshot {
+  return {
+    revision,
+    project: {
+      name: document.projectName?.trim() || 'Untitled Project',
+      summary: trimMultilineBlock(document.projectSummary ?? ''),
+      content: normalizeContentMarkdown(extractContentMarkdown(document.suffixMarkdown)),
+    },
+    diagram: {
+      direction: document.direction,
+      nodes: document.nodes.map((node) => ({
+        id: node.id,
+        label: node.label,
+        subgraphId: node.subgraphId,
+      })),
+      edges: document.edges.map((edge) => ({
+        id: edge.id,
+        from: edge.from,
+        to: edge.to,
+        label: edge.label,
+        type: edge.type,
+      })),
+      subgraphs: document.subgraphs.map((subgraph) => ({
+        id: subgraph.id,
+        title: subgraph.title,
+        parentId: subgraph.parentId,
+        collapsed: subgraph.collapsed,
+      })),
+    },
+    selection: {
+      kind: selection.kind,
+      ids: [...selection.ids],
+    },
+  };
+}
+
+function normalizeOpenAiMessageContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === 'string') {
+          return item;
+        }
+
+        if (item && typeof item === 'object') {
+          if ('text' in item && typeof item.text === 'string') {
+            return item.text;
+          }
+
+          if ('content' in item && typeof item.content === 'string') {
+            return item.content;
+          }
+        }
+
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+
+  return '';
+}
+
+function buildAiHistoryContext(messages: AiMessage[]) {
+  const visibleMessages = messages
+    .filter((message) => message.id !== 'ai-welcome')
+    .slice(-12);
+
+  if (visibleMessages.length === 0) {
+    return 'No earlier conversation.';
+  }
+
+  return visibleMessages
+    .map((message) => `${message.role === 'assistant' ? 'Assistant' : 'User'}: ${message.content}`)
+    .join('\n\n');
+}
+
+function buildCompactLineDiff(previous: string, current: string) {
+  const previousLines = previous.replace(/\r\n/g, '\n').split('\n');
+  const currentLines = current.replace(/\r\n/g, '\n').split('\n');
+  let prefix = 0;
+
+  while (
+    prefix < previousLines.length &&
+    prefix < currentLines.length &&
+    previousLines[prefix] === currentLines[prefix]
+  ) {
+    prefix += 1;
+  }
+
+  let previousSuffix = previousLines.length - 1;
+  let currentSuffix = currentLines.length - 1;
+  while (
+    previousSuffix >= prefix &&
+    currentSuffix >= prefix &&
+    previousLines[previousSuffix] === currentLines[currentSuffix]
+  ) {
+    previousSuffix -= 1;
+    currentSuffix -= 1;
+  }
+
+  const removed = previousLines.slice(prefix, previousSuffix + 1);
+  const added = currentLines.slice(prefix, currentSuffix + 1);
+  if (removed.length === 0 && added.length === 0) {
+    return null;
+  }
+
+  const previousBlock = removed.join('\n').trim();
+  const currentBlock = added.join('\n').trim();
+
+  return [
+    `Changed around line ${prefix + 1}.`,
+    `Before:\n${previousBlock || '<empty>'}`,
+    `After:\n${currentBlock || '<empty>'}`,
+  ].join('\n\n');
+}
+
+function buildMarkdownDeltaContext(previousMarkdown: string, currentMarkdown: string) {
+  if (!previousMarkdown || previousMarkdown === currentMarkdown) {
+    return null;
+  }
+
+  try {
+    const previousDiagram = extractMermaidFromProjectMarkdown(previousMarkdown).trim();
+    const currentDiagram = extractMermaidFromProjectMarkdown(currentMarkdown).trim();
+    if (previousDiagram !== currentDiagram) {
+      const diagramDiff = buildCompactLineDiff(previousDiagram, currentDiagram);
+      if (diagramDiff) {
+        return `Diagram changed since the previous AI turn.\n\n${diagramDiff}`;
+      }
+    }
+  } catch {
+    // Fall back to full markdown diff.
+  }
+
+  const markdownDiff = buildCompactLineDiff(previousMarkdown, currentMarkdown);
+  return markdownDiff ? `Markdown changed since the previous AI turn.\n\n${markdownDiff}` : null;
+}
+
+function buildSelectionContext(document: GraphDocument, selection: SelectionState) {
+  if (selection.kind === 'none' || selection.ids.length === 0) {
+    return 'No active selection.';
+  }
+
+  if (selection.kind === 'node') {
+    return JSON.stringify({
+      kind: 'node',
+      items: document.nodes
+        .filter((node) => selection.ids.includes(node.id))
+        .map((node) => ({
+          id: node.id,
+          label: node.label,
+          subgraphId: node.subgraphId,
+        })),
+    }, null, 2);
+  }
+
+  if (selection.kind === 'edge') {
+    return JSON.stringify({
+      kind: 'edge',
+      items: document.edges
+        .filter((edge) => selection.ids.includes(edge.id))
+        .map((edge) => ({
+          id: edge.id,
+          from: edge.from,
+          to: edge.to,
+          label: edge.label,
+          type: edge.type,
+        })),
+    }, null, 2);
+  }
+
+  if (selection.kind === 'subgraph') {
+    return JSON.stringify({
+      kind: 'subgraph',
+      items: document.subgraphs
+        .filter((subgraph) => selection.ids.includes(subgraph.id))
+        .map((subgraph) => ({
+          id: subgraph.id,
+          title: subgraph.title,
+          parentId: subgraph.parentId,
+          collapsed: subgraph.collapsed,
+          nodeIds: document.nodes
+            .filter((node) => node.subgraphId === subgraph.id)
+            .map((node) => node.id),
+        })),
+    }, null, 2);
+  }
+
+  return JSON.stringify({
+    kind: 'content',
+    title: 'Additional Information',
+    markdown: normalizeContentMarkdown(extractContentMarkdown(document.suffixMarkdown)),
+    id: CONTENT_CARD_ID,
+  }, null, 2);
+}
+
+function parseAiToolArguments(raw: unknown) {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === 'object') {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    throw new Error('Invalid tool arguments JSON.');
+  }
+
+  return {};
+}
+
+function getOperationNodePlacement(document: GraphDocument, subgraphId: string | null) {
+  const siblings = document.nodes.filter((node) => node.subgraphId === subgraphId);
+  const last = siblings.at(-1);
+  if (last) {
+    return {
+      x: last.x + last.width + 96,
+      y: last.y + (siblings.length % 2 === 0 ? 0 : 84),
+    };
+  }
+
+  const viewport = document.layout.viewport;
+  return {
+    x: Math.round((520 - viewport.x) / viewport.zoom),
+    y: Math.round((240 - viewport.y) / viewport.zoom),
   };
 }
 
@@ -2823,9 +3232,23 @@ export default function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [mobileSourcePreviewOpen, setMobileSourcePreviewOpen] = useState(false);
   const [helpDialogOpen, setHelpDialogOpen] = useState(false);
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const [aiPanelTab, setAiPanelTab] = useState<AiPanelTab>('chat');
+  const [aiSettings, setAiSettings] = useState<AiSettingsDraft>(() =>
+    readStoredJson(storageKeys.aiSettings, defaultAiSettings),
+  );
+  const [aiMessages, setAiMessages] = useState<AiMessage[]>(() =>
+    readStoredArray(storageKeys.aiChat, defaultAiMessages),
+  );
+  const [aiInput, setAiInput] = useState('');
+  const [aiSending, setAiSending] = useState(false);
+  const [aiLastMarkdown, setAiLastMarkdown] = useState(() =>
+    localStorage.getItem(storageKeys.aiLastMarkdown) ?? '',
+  );
   const [canvasHovered, setCanvasHovered] = useState(false);
   const [selection, setSelection] = useState<SelectionState>({ kind: 'none', ids: [] });
   const [history, setHistory] = useState<HistoryEntry[]>(initialWorkspace.history);
+  const [documentRevision, setDocumentRevision] = useState(1);
   const [, setUndoStack] = useState<GraphDocument[]>([]);
   const [, setRedoStack] = useState<GraphDocument[]>([]);
   const [sourceDraft, setSourceDraft] = useState(
@@ -2884,7 +3307,10 @@ export default function App() {
   const localHandleEntriesRef = useRef<Record<string, LocalHandleEntry>>({});
   const localRootDirectoryRef = useRef<LocalProjectDirectoryHandle | null>(null);
   const nodeClipboardRef = useRef<NodeClipboardState | null>(null);
+  const aiPanelRef = useRef<HTMLDivElement>(null);
   const documentRef = useRef(documentState);
+  const documentRevisionRef = useRef(documentRevision);
+  const aiLastMarkdownRef = useRef(aiLastMarkdown);
   const previousModeRef = useRef(mode);
   const gestureStateRef = useRef<GestureState | null>(null);
   const backgroundHoldRef = useRef<number | null>(null);
@@ -3211,6 +3637,10 @@ export default function App() {
     detail: string,
     previousDocument: GraphDocument = documentRef.current,
   ) => {
+    const nextRevision = documentRevisionRef.current + 1;
+    documentRevisionRef.current = nextRevision;
+    documentRef.current = nextDocument;
+    setDocumentRevision(nextRevision);
     setUndoStack((current) => [...current.slice(-39), structuredClone(previousDocument)]);
     setRedoStack([]);
     setSaveStatus('saving');
@@ -3224,6 +3654,10 @@ export default function App() {
     title: string,
     detail: string,
   ) => {
+    const nextRevision = documentRevisionRef.current + 1;
+    documentRevisionRef.current = nextRevision;
+    documentRef.current = snapshot;
+    setDocumentRevision(nextRevision);
     setSaveStatus('saving');
     setDocumentState(snapshot);
     setSourceDraft(snapshot.markdown ?? snapshot.source);
@@ -4797,6 +5231,10 @@ export default function App() {
   }, [documentState]);
 
   useEffect(() => {
+    documentRevisionRef.current = documentRevision;
+  }, [documentRevision]);
+
+  useEffect(() => {
     function syncViewportMode() {
       setIsMobileViewport(window.innerWidth <= 820);
     }
@@ -6007,6 +6445,515 @@ export default function App() {
     setEditingSubgraphTitle('');
   }, [selection.kind]);
 
+  useEffect(() => {
+    localStorage.setItem(storageKeys.aiSettings, JSON.stringify(aiSettings));
+  }, [aiSettings]);
+
+  useEffect(() => {
+    localStorage.setItem(storageKeys.aiChat, JSON.stringify(aiMessages.slice(-24)));
+  }, [aiMessages]);
+
+  useEffect(() => {
+    aiLastMarkdownRef.current = aiLastMarkdown;
+    if (aiLastMarkdown) {
+      localStorage.setItem(storageKeys.aiLastMarkdown, aiLastMarkdown);
+    } else {
+      localStorage.removeItem(storageKeys.aiLastMarkdown);
+    }
+  }, [aiLastMarkdown]);
+
+  const getProjectMarkdown = useCallback(() => (
+    documentRef.current.markdown ?? documentRef.current.source
+  ), []);
+
+  const setProjectMarkdown = useCallback((markdown: string) => {
+    const currentDocument = structuredClone(documentRef.current);
+    const parsed = parseProjectMarkdown(
+      markdown,
+      currentDocument.projectName ?? 'Untitled Project',
+      currentDocument.layout,
+    );
+    const nextDocument = materializeDocument(parsed);
+    applyCommittedDocument(
+      nextDocument,
+      '已通过接口更新 Markdown',
+      '已通过 Tool API 写入完整工程 Markdown。',
+      currentDocument,
+    );
+    return nextDocument.markdown ?? nextDocument.source;
+  }, [applyCommittedDocument]);
+
+  const getGraphSemanticSnapshot = useCallback(() => (
+    buildGraphSemanticSnapshotFromDocument(documentRef.current, selection, documentRevisionRef.current)
+  ), [selection]);
+
+  const applyGraphOperationBatch = useCallback((
+    operations: GraphOperation[],
+    options?: {
+      expectedRevision?: number;
+      title?: string;
+      detail?: string;
+    },
+  ): GraphOperationBatchResult => {
+    const currentRevision = documentRevisionRef.current;
+    const warnings: string[] = [];
+
+    if (typeof options?.expectedRevision === 'number' && options.expectedRevision !== currentRevision) {
+      return {
+        applied: 0,
+        warnings: ['Revision mismatch.'],
+        revision: currentRevision,
+      };
+    }
+
+    const current = structuredClone(documentRef.current);
+    let next = structuredClone(current);
+    let applied = 0;
+
+    const endpointExists = (endpointId: string) =>
+      next.nodes.some((node) => node.id === endpointId) ||
+      next.subgraphs.some((subgraph) => subgraph.id === endpointId);
+
+    for (const operation of operations) {
+      switch (operation.type) {
+        case 'updateProjectMeta': {
+          const nextName = operation.projectName?.trim() || next.projectName || 'Untitled Project';
+          const nextSummary = operation.projectSummary !== undefined
+            ? trimMultilineBlock(operation.projectSummary)
+            : trimMultilineBlock(next.projectSummary ?? '');
+          next = {
+            ...next,
+            projectName: nextName,
+            projectSummary: nextSummary,
+            prefixMarkdown: buildProjectPrefixMarkdown(nextName, nextSummary),
+          };
+          applied += 1;
+          break;
+        }
+        case 'updateContentMarkdown': {
+          next = {
+            ...next,
+            suffixMarkdown: buildContentSuffixMarkdown(trimMultilineBlock(operation.markdown)),
+          };
+          applied += 1;
+          break;
+        }
+        case 'createNode': {
+          const nodeId = operation.nodeId && !next.nodes.some((node) => node.id === operation.nodeId)
+            ? operation.nodeId
+            : nextNodeId(next.nodes);
+          const label = operation.label?.trim() || '新建内容';
+          const subgraphId = operation.subgraphId ?? null;
+          if (subgraphId && !next.subgraphs.some((subgraph) => subgraph.id === subgraphId)) {
+            warnings.push(`Missing subgraph: ${subgraphId}`);
+            break;
+          }
+          next = {
+            ...next,
+            nodes: [
+              ...next.nodes,
+              buildNode(nodeId, label, getOperationNodePlacement(next, subgraphId), subgraphId),
+            ],
+          };
+          applied += 1;
+          break;
+        }
+        case 'updateNodeLabel': {
+          if (!next.nodes.some((node) => node.id === operation.nodeId)) {
+            warnings.push(`Missing node: ${operation.nodeId}`);
+            break;
+          }
+          next = {
+            ...next,
+            nodes: next.nodes.map((node) =>
+              node.id === operation.nodeId ? resizeNodeToContent(node, operation.label) : node,
+            ),
+          };
+          applied += 1;
+          break;
+        }
+        case 'deleteNode': {
+          if (!next.nodes.some((node) => node.id === operation.nodeId)) {
+            warnings.push(`Missing node: ${operation.nodeId}`);
+            break;
+          }
+          next = {
+            ...next,
+            nodes: next.nodes.filter((node) => node.id !== operation.nodeId),
+            edges: next.edges.filter((edge) => edge.from !== operation.nodeId && edge.to !== operation.nodeId),
+          };
+          applied += 1;
+          break;
+        }
+        case 'createEdge': {
+          if (!endpointExists(operation.from) || !endpointExists(operation.to)) {
+            warnings.push(`Missing edge endpoint: ${operation.from} -> ${operation.to}`);
+            break;
+          }
+          next = {
+            ...next,
+            edges: [
+              ...next.edges,
+              {
+                id: operation.edgeId ?? crypto.randomUUID(),
+                from: operation.from,
+                to: operation.to,
+                label: operation.label ?? '',
+                type: operation.edgeType ?? 'solid',
+                strokeColor: defaultEdgeStyle.strokeColor,
+                strokeWidth: defaultEdgeStyle.strokeWidth,
+              },
+            ],
+          };
+          applied += 1;
+          break;
+        }
+        case 'updateEdgeLabel': {
+          if (!next.edges.some((edge) => edge.id === operation.edgeId)) {
+            warnings.push(`Missing edge: ${operation.edgeId}`);
+            break;
+          }
+          next = {
+            ...next,
+            edges: next.edges.map((edge) =>
+              edge.id === operation.edgeId ? { ...edge, label: operation.label } : edge,
+            ),
+          };
+          applied += 1;
+          break;
+        }
+        case 'deleteEdge': {
+          if (!next.edges.some((edge) => edge.id === operation.edgeId)) {
+            warnings.push(`Missing edge: ${operation.edgeId}`);
+            break;
+          }
+          next = {
+            ...next,
+            edges: next.edges.filter((edge) => edge.id !== operation.edgeId),
+          };
+          applied += 1;
+          break;
+        }
+        case 'createSubgraph': {
+          const subgraphId = operation.subgraphId && !next.subgraphs.some((subgraph) => subgraph.id === operation.subgraphId)
+            ? operation.subgraphId
+            : nextSubgraphId(next.subgraphs);
+          next = {
+            ...next,
+            subgraphs: [
+              ...next.subgraphs,
+              {
+                id: subgraphId,
+                title: operation.title?.trim() || `分组 ${next.subgraphs.length + 1}`,
+                parentId: operation.parentId ?? null,
+                collapsed: false,
+                fill: defaultSubgraphStyle.fill,
+                stroke: defaultSubgraphStyle.stroke,
+                textColor: defaultSubgraphStyle.textColor,
+              },
+            ],
+            nodes: next.nodes.map((node) =>
+              operation.nodeIds?.includes(node.id)
+                ? { ...node, subgraphId }
+                : node,
+            ),
+          };
+          applied += 1;
+          break;
+        }
+        case 'updateSubgraphTitle': {
+          if (!next.subgraphs.some((subgraph) => subgraph.id === operation.subgraphId)) {
+            warnings.push(`Missing subgraph: ${operation.subgraphId}`);
+            break;
+          }
+          next = {
+            ...next,
+            subgraphs: next.subgraphs.map((subgraph) =>
+              subgraph.id === operation.subgraphId ? { ...subgraph, title: operation.title } : subgraph,
+            ),
+          };
+          applied += 1;
+          break;
+        }
+        case 'moveNodeToSubgraph': {
+          if (!next.nodes.some((node) => node.id === operation.nodeId)) {
+            warnings.push(`Missing node: ${operation.nodeId}`);
+            break;
+          }
+          if (operation.subgraphId && !next.subgraphs.some((subgraph) => subgraph.id === operation.subgraphId)) {
+            warnings.push(`Missing subgraph: ${operation.subgraphId}`);
+            break;
+          }
+          next = {
+            ...next,
+            nodes: next.nodes.map((node) =>
+              node.id === operation.nodeId
+                ? { ...node, subgraphId: operation.subgraphId }
+                : node,
+            ),
+          };
+          applied += 1;
+          break;
+        }
+        default:
+          warnings.push('Unsupported operation.');
+      }
+    }
+
+    if (applied === 0) {
+      return {
+        applied,
+        warnings,
+        revision: currentRevision,
+      };
+    }
+
+    const nextDocument = materializeDocument(next);
+    applyCommittedDocument(
+      nextDocument,
+      options?.title ?? '已应用结构操作',
+      options?.detail ?? `已通过 Tool API 应用 ${applied} 个结构操作。`,
+      current,
+    );
+
+    return {
+      applied,
+      warnings,
+      revision: currentRevision + 1,
+    };
+  }, [applyCommittedDocument]);
+
+  const executeAiToolCall = useCallback(async (name: string, rawArguments: unknown) => {
+    const argumentsObject = parseAiToolArguments(rawArguments);
+
+    switch (name) {
+      case 'get_graph_semantic_snapshot':
+        return {
+          ok: true,
+          snapshot: getGraphSemanticSnapshot(),
+        };
+      case 'get_project_markdown':
+        return {
+          ok: true,
+          markdown: getProjectMarkdown(),
+        };
+      case 'set_project_markdown': {
+        const markdown = typeof argumentsObject.markdown === 'string' ? argumentsObject.markdown : '';
+        if (!markdown) {
+          throw new Error('markdown is required.');
+        }
+
+        const nextMarkdown = setProjectMarkdown(markdown);
+        return {
+          ok: true,
+          markdown: nextMarkdown,
+          revision: documentRevisionRef.current,
+        };
+      }
+      case 'apply_graph_operation_batch': {
+        const operations = Array.isArray(argumentsObject.operations)
+          ? argumentsObject.operations as GraphOperation[]
+          : [];
+        if (operations.length === 0) {
+          throw new Error('operations is required.');
+        }
+
+        const result = applyGraphOperationBatch(
+          operations,
+          {
+            expectedRevision:
+              typeof argumentsObject.expectedRevision === 'number'
+                ? argumentsObject.expectedRevision
+                : undefined,
+            title:
+              typeof argumentsObject.title === 'string'
+                ? argumentsObject.title
+                : '已通过 AI 应用结构操作',
+            detail:
+              typeof argumentsObject.detail === 'string'
+                ? argumentsObject.detail
+                : `AI 已应用 ${operations.length} 个结构操作。`,
+          },
+        );
+
+        return {
+          ok: true,
+          ...result,
+          markdown: getProjectMarkdown(),
+        };
+      }
+      default:
+        throw new Error(`Unsupported tool: ${name}`);
+    }
+  }, [applyGraphOperationBatch, getGraphSemanticSnapshot, getProjectMarkdown, setProjectMarkdown]);
+
+  const sendAiMessage = useCallback(async () => {
+    const prompt = aiInput.trim();
+    if (!prompt || aiSending) {
+      return;
+    }
+
+    const userMessage: AiMessage = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: prompt,
+    };
+    const conversation = [...aiMessages, userMessage];
+    const markdown = getProjectMarkdown();
+    const markdownDelta = buildMarkdownDeltaContext(aiLastMarkdownRef.current, markdown);
+    const selectionContext = buildSelectionContext(documentRef.current, selection);
+    const historyContext = buildAiHistoryContext(aiMessages);
+
+    setAiMessages(conversation);
+    setAiInput('');
+    setAiSending(true);
+
+    try {
+      const messages: Array<Record<string, unknown>> = [
+        {
+          role: 'system',
+          content: `AI rules:\n${aiSettings.systemPrompt}`,
+        },
+        {
+          role: 'system',
+          content: `Tool rules:\n${aiToolRules}`,
+        },
+        {
+          role: 'system',
+          content: `Conversation history:\n${historyContext}`,
+        },
+        {
+          role: 'system',
+          content: `Full Markdown:\n${markdown}`,
+        },
+      ];
+
+      if (markdownDelta) {
+        messages.push({
+          role: 'system',
+          content: `Markdown diff since previous AI turn:\n${markdownDelta}`,
+        });
+      }
+
+      messages.push(
+        {
+          role: 'system',
+          content: `Current selection:\n${selectionContext}`,
+        },
+        {
+          role: 'user',
+          content: prompt,
+        },
+      );
+
+      let finalAssistantContent = '';
+
+      for (let step = 0; step < 6; step += 1) {
+        const response = await fetch(aiSettings.apiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${aiSettings.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: aiSettings.model,
+            messages,
+            tools: aiToolDefinitions,
+            tool_choice: 'auto',
+          }),
+        });
+        const data = await response.json();
+        const message = data?.choices?.[0]?.message;
+        const assistantContent = normalizeOpenAiMessageContent(message?.content);
+        const toolCalls = Array.isArray(message?.tool_calls)
+          ? message.tool_calls
+          : [];
+
+        if (!response.ok || !message) {
+          throw new Error(data?.error?.message ?? 'AI 请求失败。');
+        }
+
+        if (toolCalls.length === 0) {
+          finalAssistantContent = assistantContent || '已完成当前请求。';
+          break;
+        }
+
+        messages.push({
+          role: 'assistant',
+          content: assistantContent,
+          tool_calls: toolCalls,
+        });
+
+        for (const toolCall of toolCalls) {
+          const toolName =
+            toolCall &&
+            typeof toolCall === 'object' &&
+            'function' in toolCall &&
+            toolCall.function &&
+            typeof toolCall.function === 'object' &&
+            'name' in toolCall.function &&
+            typeof toolCall.function.name === 'string'
+              ? toolCall.function.name
+              : '';
+          const rawArguments =
+            toolCall &&
+            typeof toolCall === 'object' &&
+            'function' in toolCall &&
+            toolCall.function &&
+            typeof toolCall.function === 'object' &&
+            'arguments' in toolCall.function
+              ? toolCall.function.arguments
+              : '';
+          const toolCallId =
+            toolCall &&
+            typeof toolCall === 'object' &&
+            'id' in toolCall &&
+            typeof toolCall.id === 'string'
+              ? toolCall.id
+              : crypto.randomUUID();
+
+          let toolResult: Record<string, unknown>;
+          try {
+            toolResult = await executeAiToolCall(toolName, rawArguments);
+          } catch (toolError) {
+            toolResult = {
+              ok: false,
+              error: toolError instanceof Error ? toolError.message : 'Tool execution failed.',
+            };
+          }
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCallId,
+            content: JSON.stringify(toolResult),
+          });
+        }
+      }
+
+      setAiMessages((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: finalAssistantContent || '已完成当前请求。',
+        },
+      ]);
+      setAiLastMarkdown(getProjectMarkdown());
+    } catch (error) {
+      setAiMessages((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: error instanceof Error ? error.message : 'AI 请求失败。',
+          status: 'error',
+        },
+      ]);
+    } finally {
+      setAiSending(false);
+    }
+  }, [aiInput, aiMessages, aiSending, aiSettings, executeAiToolCall, getProjectMarkdown, selection]);
+
   // External Control API - allows external tools to control the editor
   useEffect(() => {
     const api = {
@@ -6014,6 +6961,10 @@ export default function App() {
         setSourceDraft(code);
       },
       getSource: () => sourceDraft,
+      getGraphSemanticSnapshot,
+      applyGraphOperationBatch,
+      getProjectMarkdown,
+      setProjectMarkdown,
       render: async () => {
         // trigger re-render by updating source draft
         setSourceDraft((s) => s);
@@ -6032,17 +6983,30 @@ export default function App() {
       if (!event.data || event.data.type !== 'mermaid-editor') return;
       const { action, payload } = event.data;
       let responsePayload: unknown = null;
-      if (action === 'setSource' && typeof payload === 'string') {
-        api.setSource(payload);
-      } else if (action === 'getSource') {
-        responsePayload = api.getSource();
-      } else if (action === 'render') {
-        void api.render();
-      } else if (action === 'getSvg') {
-        responsePayload = api.getSvg();
+      let responseError: string | null = null;
+      try {
+        if (action === 'setSource' && typeof payload === 'string') {
+          api.setSource(payload);
+        } else if (action === 'getSource') {
+          responsePayload = api.getSource();
+        } else if (action === 'getGraphSemanticSnapshot') {
+          responsePayload = api.getGraphSemanticSnapshot();
+        } else if (action === 'applyGraphOperationBatch' && Array.isArray(payload)) {
+          responsePayload = api.applyGraphOperationBatch(payload);
+        } else if (action === 'getProjectMarkdown') {
+          responsePayload = api.getProjectMarkdown();
+        } else if (action === 'setProjectMarkdown' && typeof payload === 'string') {
+          responsePayload = api.setProjectMarkdown(payload);
+        } else if (action === 'render') {
+          void api.render();
+        } else if (action === 'getSvg') {
+          responsePayload = api.getSvg();
+        }
+      } catch (error) {
+        responseError = error instanceof Error ? error.message : 'Tool API request failed.';
       }
       event.source?.postMessage(
-        { type: 'mermaid-editor-response', action, payload: responsePayload },
+        { type: 'mermaid-editor-response', action, payload: responsePayload, error: responseError },
         { targetOrigin: event.origin }
       );
     };
@@ -6052,7 +7016,7 @@ export default function App() {
       window.removeEventListener('message', handleMessage);
       delete (window as unknown as Record<string, unknown>).MermaidEditor;
     };
-  }, [sourceDraft]);
+  }, [applyGraphOperationBatch, getGraphSemanticSnapshot, getProjectMarkdown, setProjectMarkdown, sourceDraft]);
 
   return (
     <div className={appShellClassName}>
@@ -7323,88 +8287,271 @@ export default function App() {
                   />
                 ) : null}
 
-                <div className="tool-dock" role="toolbar" aria-label="画布工具">
+                <div className="tool-dock-cluster">
+                  <div className="tool-dock" role="toolbar" aria-label="画布工具">
+                    <button
+                      aria-label="选择"
+                      className="tool-dock__button has-tooltip is-active"
+                      data-tooltip="选择"
+                      type="button"
+                    >
+                      <WorkbenchIcon name="cursor" />
+                    </button>
+                    <button
+                      aria-label="新建节点"
+                      className="tool-dock__button has-tooltip"
+                      data-tooltip="新建节点"
+                      onClick={() => {
+                        const viewport = documentState.layout.viewport;
+                        createNodeAt({
+                          x: (540 - viewport.x) / viewport.zoom,
+                          y: (260 - viewport.y) / viewport.zoom,
+                        });
+                      }}
+                      type="button"
+                    >
+                      <WorkbenchIcon name="node" />
+                    </button>
+                    <button
+                      aria-label="创建分组"
+                      className={canGroupSelection ? 'tool-dock__button has-tooltip' : 'tool-dock__button has-tooltip is-disabled'}
+                      data-tooltip="创建分组"
+                      disabled={!canGroupSelection}
+                      onClick={wrapSelectionInSubgraph}
+                      type="button"
+                    >
+                      <WorkbenchIcon name="group" />
+                    </button>
+                    <button
+                      aria-label="重置视口"
+                      className="tool-dock__button has-tooltip"
+                      data-tooltip="重置视口"
+                      onClick={() => {
+                        updateViewport(() => ({ x: 120, y: 90, zoom: 1 }));
+                        setHistory((current) => [
+                          createHistoryEntry('视口已重置', '已重置画布视角。'),
+                          ...current,
+                        ].slice(0, 40));
+                      }}
+                      type="button"
+                    >
+                      <WorkbenchIcon name="reset" />
+                    </button>
+
+                    <span className="tool-dock__divider" />
+
+                    <button
+                      aria-label="缩小"
+                      className="tool-dock__button has-tooltip"
+                      data-tooltip="缩小"
+                      onClick={() =>
+                        updateViewport((viewport) => ({
+                          ...viewport,
+                          zoom: clamp(viewport.zoom - 0.1, 0.35, 2.8),
+                        }))
+                      }
+                      type="button"
+                    >
+                      <WorkbenchIcon name="minus" />
+                    </button>
+                    <span className="tool-dock__zoom">{Math.round(documentState.layout.viewport.zoom * 100)}%</span>
+                    <button
+                      aria-label="放大"
+                      className="tool-dock__button has-tooltip"
+                      data-tooltip="放大"
+                      onClick={() =>
+                        updateViewport((viewport) => ({
+                          ...viewport,
+                          zoom: clamp(viewport.zoom + 0.1, 0.35, 2.8),
+                        }))
+                      }
+                      type="button"
+                    >
+                      <WorkbenchIcon name="plus" />
+                    </button>
+                  </div>
+
                   <button
-                    aria-label="选择"
-                    className="tool-dock__button has-tooltip is-active"
-                    data-tooltip="选择"
-                    type="button"
-                  >
-                    <WorkbenchIcon name="cursor" />
-                  </button>
-                  <button
-                    aria-label="新建节点"
-                    className="tool-dock__button has-tooltip"
-                    data-tooltip="新建节点"
+                    aria-label="打开 AI 助手"
+                    className={aiPanelOpen ? 'ai-trigger has-tooltip is-active' : 'ai-trigger has-tooltip'}
+                    data-tooltip="AI 助手"
                     onClick={() => {
-                      const viewport = documentState.layout.viewport;
-                      createNodeAt({
-                        x: (540 - viewport.x) / viewport.zoom,
-                        y: (260 - viewport.y) / viewport.zoom,
-                      });
+                      setAiPanelOpen((current) => !current);
+                      setAiPanelTab('chat');
                     }}
                     type="button"
                   >
-                    <WorkbenchIcon name="node" />
-                  </button>
-                  <button
-                    aria-label="创建分组"
-                    className={canGroupSelection ? 'tool-dock__button has-tooltip' : 'tool-dock__button has-tooltip is-disabled'}
-                    data-tooltip="创建分组"
-                    disabled={!canGroupSelection}
-                    onClick={wrapSelectionInSubgraph}
-                    type="button"
-                  >
-                    <WorkbenchIcon name="group" />
-                  </button>
-                  <button
-                    aria-label="重置视口"
-                    className="tool-dock__button has-tooltip"
-                    data-tooltip="重置视口"
-                    onClick={() => {
-                      updateViewport(() => ({ x: 120, y: 90, zoom: 1 }));
-                      setHistory((current) => [
-                        createHistoryEntry('视口已重置', '已重置画布视角。'),
-                        ...current,
-                      ].slice(0, 40));
-                    }}
-                    type="button"
-                  >
-                    <WorkbenchIcon name="reset" />
-                  </button>
-
-                  <span className="tool-dock__divider" />
-
-                  <button
-                    aria-label="缩小"
-                    className="tool-dock__button has-tooltip"
-                    data-tooltip="缩小"
-                    onClick={() =>
-                      updateViewport((viewport) => ({
-                        ...viewport,
-                        zoom: clamp(viewport.zoom - 0.1, 0.35, 2.8),
-                      }))
-                    }
-                    type="button"
-                  >
-                    <WorkbenchIcon name="minus" />
-                  </button>
-                  <span className="tool-dock__zoom">{Math.round(documentState.layout.viewport.zoom * 100)}%</span>
-                  <button
-                    aria-label="放大"
-                    className="tool-dock__button has-tooltip"
-                    data-tooltip="放大"
-                    onClick={() =>
-                      updateViewport((viewport) => ({
-                        ...viewport,
-                        zoom: clamp(viewport.zoom + 0.1, 0.35, 2.8),
-                      }))
-                    }
-                    type="button"
-                  >
-                    <WorkbenchIcon name="plus" />
+                    <WorkbenchIcon name="chat" />
                   </button>
                 </div>
+
+                {aiPanelOpen ? (
+                  <section
+                    aria-label="AI 测试面板"
+                    className="ai-panel"
+                    onPointerDownCapture={(event) => event.stopPropagation()}
+                    onTouchEndCapture={(event) => event.stopPropagation()}
+                    onTouchMoveCapture={(event) => event.stopPropagation()}
+                    onTouchStartCapture={(event) => event.stopPropagation()}
+                    onWheelCapture={(event) => event.stopPropagation()}
+                    ref={aiPanelRef}
+                  >
+                    <div className="ai-panel__header">
+                      <div>
+                        <p className="eyebrow">AI Sandbox</p>
+                        <h2>AI 助手</h2>
+                      </div>
+                      <button
+                        aria-label="关闭 AI 助手"
+                        className="panel-icon-button"
+                        onClick={() => setAiPanelOpen(false)}
+                        type="button"
+                      >
+                        <WorkbenchIcon name="chevron-right" />
+                      </button>
+                    </div>
+
+                    <div className="ai-panel__tabs" role="tablist" aria-label="AI 面板页签">
+                      <button
+                        className={aiPanelTab === 'chat' ? 'ai-panel__tab is-active' : 'ai-panel__tab'}
+                        onClick={() => setAiPanelTab('chat')}
+                        type="button"
+                      >
+                        <WorkbenchIcon name="chat" />
+                        <span>聊天</span>
+                      </button>
+                      <button
+                        className={aiPanelTab === 'settings' ? 'ai-panel__tab is-active' : 'ai-panel__tab'}
+                        onClick={() => setAiPanelTab('settings')}
+                        type="button"
+                      >
+                        <WorkbenchIcon name="settings" />
+                        <span>设置</span>
+                      </button>
+                    </div>
+
+                    {aiPanelTab === 'chat' ? (
+                      <>
+                        <div
+                          className="ai-panel__messages"
+                          onWheelCapture={(event) => event.stopPropagation()}
+                        >
+                          {aiMessages.map((message) => (
+                            <article
+                              className={
+                                message.status === 'error'
+                                  ? `ai-message ai-message--${message.role} is-error`
+                                  : `ai-message ai-message--${message.role}`
+                              }
+                              key={message.id}
+                            >
+                              <strong>{message.role === 'assistant' ? 'AI' : '你'}</strong>
+                              <p>{message.content}</p>
+                            </article>
+                          ))}
+                          {aiSending ? (
+                            <article className="ai-message ai-message--assistant">
+                              <strong>AI</strong>
+                              <p>正在思考当前工程上下文...</p>
+                            </article>
+                          ) : null}
+                        </div>
+                        <div className="ai-panel__composer">
+                          <textarea
+                            className="ai-panel__input"
+                            onChange={(event) => setAiInput(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (handleNativeSelectAllShortcut(event)) {
+                                return;
+                              }
+
+                              if (event.key === 'Enter' && !event.shiftKey) {
+                                event.preventDefault();
+                                void sendAiMessage();
+                              }
+                            }}
+                            onWheelCapture={(event) => event.stopPropagation()}
+                            placeholder="直接提问，当前图结构和完整 Markdown 会自动带入上下文。"
+                            rows={4}
+                            value={aiInput}
+                          />
+                          <div className="ai-panel__composer-bar">
+                            <span>Enter 发送，Shift + Enter 换行</span>
+                            <button
+                              className="solid-button"
+                              disabled={aiSending || !aiInput.trim()}
+                              onClick={() => {
+                                void sendAiMessage();
+                              }}
+                              type="button"
+                            >
+                              发送
+                            </button>
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <div
+                        className="ai-panel__settings"
+                        onWheelCapture={(event) => event.stopPropagation()}
+                      >
+                        <label className="field">
+                          <span>API URL</span>
+                          <input
+                            onChange={(event) =>
+                              setAiSettings((current) => ({ ...current, apiUrl: event.target.value }))
+                            }
+                            type="url"
+                            value={aiSettings.apiUrl}
+                          />
+                        </label>
+                        <label className="field">
+                          <span>API Key</span>
+                          <input
+                            onChange={(event) =>
+                              setAiSettings((current) => ({ ...current, apiKey: event.target.value }))
+                            }
+                            type="password"
+                            value={aiSettings.apiKey}
+                          />
+                        </label>
+                        <label className="field">
+                          <span>Model</span>
+                          <input
+                            onChange={(event) =>
+                              setAiSettings((current) => ({ ...current, model: event.target.value }))
+                            }
+                            type="text"
+                            value={aiSettings.model}
+                          />
+                        </label>
+                        <label className="field">
+                          <span>Context Window</span>
+                          <input
+                            onChange={(event) =>
+                              setAiSettings((current) => ({
+                                ...current,
+                                contextWindow: Number.parseInt(event.target.value, 10) || current.contextWindow,
+                              }))
+                            }
+                            type="number"
+                            value={aiSettings.contextWindow}
+                          />
+                        </label>
+                        <label className="field">
+                          <span>System Prompt</span>
+                          <textarea
+                            onChange={(event) =>
+                              setAiSettings((current) => ({ ...current, systemPrompt: event.target.value }))
+                            }
+                            rows={6}
+                            value={aiSettings.systemPrompt}
+                          />
+                        </label>
+                      </div>
+                    )}
+                  </section>
+                ) : null}
               </div>
             </div>
           ) : null}
