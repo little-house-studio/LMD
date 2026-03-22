@@ -1770,7 +1770,7 @@ function duplicateNodesWithEdges(document: GraphDocument, sourceIds: string[], o
     });
 
   const duplicatedEdges = document.edges
-    .filter((edge) => ids.has(edge.from) && ids.has(edge.to))
+    .filter((edge) => ids.has(edge.from) || ids.has(edge.to))
     .map((edge) => ({
       ...edge,
       id: crypto.randomUUID(),
@@ -7125,16 +7125,25 @@ export default function App() {
                           ) : edge.label ? (
                             <g
                               className={`edge-label-group${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                selectSingle('edge', edge.id, event.shiftKey);
+                              }}
                               onDoubleClick={(event) => {
                                 event.stopPropagation();
                                 startEdgeInlineEdit(edge);
                               }}
+                              onPointerDown={(event) => event.stopPropagation()}
                               transform={`translate(${geometry.label.x}, ${geometry.label.y})`}
                             >
                               <rect
                                 className={`edge-label-badge${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
                                 fill={labelBackground}
                                 height={labelMetrics?.height ?? 22}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  selectSingle('edge', edge.id, event.shiftKey);
+                                }}
                                 rx={11}
                                 stroke={labelBorder}
                                 strokeWidth={isEdgeSelected ? 1.6 : 1}
@@ -7145,12 +7154,20 @@ export default function App() {
                               <text
                                 className={`edge-label${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
                                 fill={labelTextColor}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  selectSingle('edge', edge.id, event.shiftKey);
+                                }}
                                 x={0}
                               >
                                 {edgeLabelLines.map((line, index) => (
                                   <tspan
                                     key={`${edge.id}-label-${index}`}
                                     dominantBaseline="middle"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      selectSingle('edge', edge.id, event.shiftKey);
+                                    }}
                                     onDoubleClick={(event) => {
                                       event.stopPropagation();
                                       startEdgeInlineEdit(edge);
