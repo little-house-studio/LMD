@@ -14,6 +14,7 @@ import type {
 } from 'react';
 import {
   createDefaultLayout,
+  defaultSubgraphStyle,
   defaultEdgeStyle,
   measureNodeContentSize,
   normalizeEdgeStyle,
@@ -76,6 +77,7 @@ interface DragState {
 interface BoxState {
   origin: Point;
   current: Point;
+  toggle: boolean;
 }
 
 interface PanState {
@@ -85,6 +87,7 @@ interface PanState {
 
 interface ConnectingState {
   fromId: string;
+  fromIds: string[];
   origin: Point;
   current: Point;
   edgeType: GraphEdge['type'];
@@ -136,6 +139,11 @@ interface MiniMapDragState {
   pointerId: number;
   grabOffsetX: number;
   grabOffsetY: number;
+}
+
+interface NodeClipboardState {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
 }
 
 const PINCH_RESPONSE = 1.3;
@@ -211,6 +219,9 @@ interface EdgeInspectorDraft {
 interface SubgraphInspectorDraft {
   title: string;
   collapsed: boolean;
+  fill: string;
+  stroke: string;
+  textColor: string;
 }
 
 type IconName =
@@ -259,17 +270,19 @@ const nodeStylePresets = [
   { id: 'night', label: '夜幕', fill: '#0f172a', stroke: '#60a5fa', textColor: '#f8fafc' },
 ] as const;
 
-const subgraphVisualStyle = {
-  fill: '#d7efff',
-  stroke: '#38bdf8',
-  textColor: '#083344',
-} as const;
-
 const collaboratorPresets = [
   { id: 'lin', name: 'Lin', role: '画布', color: '#f97316' },
   { id: 'mina', name: 'Mina', role: '源码', color: '#22c55e' },
   { id: 'kai', name: 'Kai', role: '评审', color: '#38bdf8' },
 ] as const;
+
+function getSubgraphStyle(subgraph: Pick<GraphSubgraph, 'fill' | 'stroke' | 'textColor'> | null | undefined) {
+  return {
+    fill: subgraph?.fill ?? defaultSubgraphStyle.fill,
+    stroke: subgraph?.stroke ?? defaultSubgraphStyle.stroke,
+    textColor: subgraph?.textColor ?? defaultSubgraphStyle.textColor,
+  };
+}
 
 const workspaceTabs: Array<{ id: WorkspaceTabId; label: string; detail: string }> = [
   { id: 'diagram', label: 'diagram.md', detail: '主图' },
@@ -1031,6 +1044,12 @@ function buildContentSuffixMarkdown(content: string) {
   return trimmed ? `## Content\n\n${trimmed}` : '## Content';
 }
 
+function normalizeContentMarkdown(markdown: string) {
+  return markdown
+    .replace(/&lt;br\s*\/?&gt;/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n');
+}
+
 function buildProjectPrefixMarkdown(projectName: string, projectSummary: string) {
   const normalizedName = projectName.trim() || 'Untitled Project';
   const normalizedSummary = trimMultilineBlock(projectSummary);
@@ -1055,9 +1074,9 @@ function stripMarkdownToPlainText(markdown: string) {
 }
 
 function buildContentCardSummary(markdown: string) {
-  const plain = stripMarkdownToPlainText(markdown);
+  const plain = stripMarkdownToPlainText(normalizeContentMarkdown(markdown));
   if (!plain) {
-    return '暂无用户内容';
+    return '暂无附加信息';
   }
 
   return plain.length > 30 ? `${plain.slice(0, 30)}…` : plain;
@@ -1072,15 +1091,19 @@ function measureContentCard(markdown: string, collapsed = false) {
     };
   }
 
-  const content = markdown.trim();
+  const normalizedMarkdown = normalizeContentMarkdown(markdown);
+  const content = normalizedMarkdown.trim();
   if (!content) {
     return {
-      width: 260,
-      height: 132,
+      width: 360,
+      height: 220,
     };
   }
 
-  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const lines = normalizedMarkdown.replace(/\r\n/g, '\n').split('\n');
+  const hasStructuredBlocks = lines.some((line) =>
+    /^(#{1,3}\s|[-*+]\s|\d+\.\s|>\s|```)/.test(line.trim()),
+  );
   const wrappedLines = lines.reduce((total, line) => {
     const plain = stripMarkdownToPlainText(line);
     return total + Math.max(1, Math.ceil((plain.length || 1) / 26));
@@ -1089,10 +1112,17 @@ function measureContentCard(markdown: string, collapsed = false) {
     const plain = stripMarkdownToPlainText(line);
     return Math.max(max, plain.length);
   }, 0);
+  const blockCount = normalizedMarkdown
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean).length;
 
   return {
-    width: clamp(220 + longestLine * 5.8, 260, 460),
-    height: clamp(82 + wrappedLines * 22, 132, 520),
+    width: clamp(320 + longestLine * 5.8, 400, 760),
+    height: Math.max(
+      220,
+      104 + wrappedLines * 26 + Math.max(0, blockCount - 1) * 18 + (hasStructuredBlocks ? 20 : 0),
+    ),
   };
 }
 
@@ -1117,7 +1147,7 @@ function renderMarkdownInline(value: string) {
 }
 
 function renderMarkdownPreviewHtml(markdown: string) {
-  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const lines = normalizeContentMarkdown(markdown).replace(/\r\n/g, '\n').split('\n');
   const html: string[] = [];
   const paragraph: string[] = [];
   let listItems: string[] = [];
@@ -1222,7 +1252,7 @@ function renderMarkdownPreviewHtml(markdown: string) {
   flushCode();
 
   if (html.length === 0) {
-    return '<p class="content-card__empty">暂无用户内容。</p>';
+    return '<p class="content-card__empty">暂无附加信息。</p>';
   }
 
   return html.join('');
@@ -1756,6 +1786,24 @@ function duplicateNodesWithEdges(document: GraphDocument, sourceIds: string[], o
 
 function selectionContains(selection: SelectionState, id: string) {
   return selection.ids.includes(id);
+}
+
+function toggleSelectionIds(
+  current: SelectionState,
+  kind: Exclude<SelectionState['kind'], 'none'>,
+  ids: string[],
+) {
+  const nextSet = new Set(current.kind === kind ? current.ids : []);
+  ids.forEach((id) => {
+    if (nextSet.has(id)) {
+      nextSet.delete(id);
+    } else {
+      nextSet.add(id);
+    }
+  });
+
+  const nextIds = [...nextSet];
+  return nextIds.length > 0 ? { kind, ids: nextIds } : { kind: 'none' as const, ids: [] };
 }
 
 function rectFromPoints(left: Point, right: Point) {
@@ -2774,6 +2822,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [mobileSourcePreviewOpen, setMobileSourcePreviewOpen] = useState(false);
+  const [helpDialogOpen, setHelpDialogOpen] = useState(false);
   const [canvasHovered, setCanvasHovered] = useState(false);
   const [selection, setSelection] = useState<SelectionState>({ kind: 'none', ids: [] });
   const [history, setHistory] = useState<HistoryEntry[]>(initialWorkspace.history);
@@ -2803,6 +2852,9 @@ export default function App() {
   const [subgraphInspectorDraft, setSubgraphInspectorDraft] = useState<SubgraphInspectorDraft>({
     title: '',
     collapsed: false,
+    fill: defaultSubgraphStyle.fill,
+    stroke: defaultSubgraphStyle.stroke,
+    textColor: defaultSubgraphStyle.textColor,
   });
   const [contentInspectorDraft, setContentInspectorDraft] = useState<ContentInspectorDraft>({
     markdown: '',
@@ -2831,6 +2883,7 @@ export default function App() {
   const canvasBoardRef = useRef<HTMLDivElement>(null);
   const localHandleEntriesRef = useRef<Record<string, LocalHandleEntry>>({});
   const localRootDirectoryRef = useRef<LocalProjectDirectoryHandle | null>(null);
+  const nodeClipboardRef = useRef<NodeClipboardState | null>(null);
   const documentRef = useRef(documentState);
   const previousModeRef = useRef(mode);
   const gestureStateRef = useRef<GestureState | null>(null);
@@ -2929,14 +2982,17 @@ export default function App() {
           stroke: node.stroke,
           selected: selection.kind === 'node' && selectionContains(selection, node.id),
         })),
-        ...subgraphFrames.map((frame) => ({
-          id: frame.id,
-          kind: 'subgraph' as const,
-          rect: { x: frame.x, y: frame.y, width: frame.width, height: frame.height },
-          fill: 'rgba(96, 165, 250, 0.08)',
-          stroke: subgraphVisualStyle.stroke,
-          selected: selection.kind === 'subgraph' && selectionContains(selection, frame.id),
-        })),
+        ...subgraphFrames.map((frame) => {
+          const style = getSubgraphStyle(documentState.subgraphs.find((entry) => entry.id === frame.id));
+          return {
+            id: frame.id,
+            kind: 'subgraph' as const,
+            rect: { x: frame.x, y: frame.y, width: frame.width, height: frame.height },
+            fill: withAlpha(style.fill, 0.22),
+            stroke: style.stroke,
+            selected: selection.kind === 'subgraph' && selectionContains(selection, frame.id),
+          };
+        }),
         {
           id: CONTENT_CARD_ID,
           kind: 'content' as const,
@@ -2950,6 +3006,7 @@ export default function App() {
     );
   }, [
     contentCardRect,
+    documentState.subgraphs,
     documentState.layout.viewport,
     previewNodes,
     selection,
@@ -2971,19 +3028,22 @@ export default function App() {
         stroke: node.stroke,
         textColor: node.textColor,
       })),
-      ...subgraphFrames.map((frame) => ({
-        id: frame.id,
-        kind: 'subgraph' as const,
-        x: frame.x,
-        y: frame.y,
-        width: frame.width,
-        height: frame.height,
-        fill: subgraphVisualStyle.fill,
-        stroke: subgraphVisualStyle.stroke,
-        textColor: subgraphVisualStyle.textColor,
-      })),
+      ...subgraphFrames.map((frame) => {
+        const style = getSubgraphStyle(documentState.subgraphs.find((entry) => entry.id === frame.id));
+        return {
+          id: frame.id,
+          kind: 'subgraph' as const,
+          x: frame.x,
+          y: frame.y,
+          width: frame.width,
+          height: frame.height,
+          fill: style.fill,
+          stroke: style.stroke,
+          textColor: style.textColor,
+        };
+      }),
     ],
-    [subgraphFrames, visibleNodes],
+    [documentState.subgraphs, subgraphFrames, visibleNodes],
   );
   const edgeEndpointMap = useMemo(
     () => new Map(edgeEndpoints.map((endpoint) => [endpoint.id, endpoint])),
@@ -3234,8 +3294,12 @@ export default function App() {
     }
   }, [activeLocalItem, applyCommittedDocument, sourceDraft]);
 
-  const selectSingle = useCallback((kind: SelectionState['kind'], id: string) => {
-    setSelection({ kind, ids: [id] });
+  const selectSingle = useCallback((
+    kind: Exclude<SelectionState['kind'], 'none'>,
+    id: string,
+    toggle = false,
+  ) => {
+    setSelection((current) => (toggle ? toggleSelectionIds(current, kind, [id]) : { kind, ids: [id] }));
   }, []);
 
   const clearSelection = useCallback(() => {
@@ -3457,17 +3521,20 @@ export default function App() {
           stroke: node.stroke,
           textColor: node.textColor,
         })),
-        ...liveFrames.map((frame) => ({
-          id: frame.id,
-          kind: 'subgraph' as const,
-          x: frame.x,
-          y: frame.y,
-          width: frame.width,
-          height: frame.height,
-          fill: subgraphVisualStyle.fill,
-          stroke: subgraphVisualStyle.stroke,
-          textColor: subgraphVisualStyle.textColor,
-        })),
+        ...liveFrames.map((frame) => {
+          const style = getSubgraphStyle(documentState.subgraphs.find((entry) => entry.id === frame.id));
+          return {
+            id: frame.id,
+            kind: 'subgraph' as const,
+            x: frame.x,
+            y: frame.y,
+            width: frame.width,
+            height: frame.height,
+            fill: style.fill,
+            stroke: style.stroke,
+            textColor: style.textColor,
+          };
+        }),
       ];
       const liveEndpointMap = new Map<string, EdgeEndpointBox>(
         liveEndpoints.map((entry) => [entry.id, entry] as const),
@@ -3691,6 +3758,9 @@ export default function App() {
                 ...subgraph,
                 title: draft.title,
                 collapsed: draft.collapsed,
+                fill: draft.fill,
+                stroke: draft.stroke,
+                textColor: draft.textColor,
               }
             : subgraph,
         ),
@@ -3704,14 +3774,14 @@ export default function App() {
     const current = documentRef.current;
     setEditingContent(true);
     setContentInspectorDraft({
-      markdown: extractContentMarkdown(current.suffixMarkdown),
+      markdown: normalizeContentMarkdown(extractContentMarkdown(current.suffixMarkdown)),
     });
     setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
     if (contentCardLayout.collapsed) {
       commitDocument(
         (document) => withContentCardLayout(document, { ...contentCardLayout, collapsed: false }),
-        '已展开用户内容',
-        '已展开用户内容框。',
+        '已展开附加信息',
+        '已展开附加信息框。',
       );
     }
   }, [commitDocument, contentCardLayout]);
@@ -3724,8 +3794,8 @@ export default function App() {
 
     commitDocument(
       (current) => withContentCardLayout(current, { ...contentCardLayout, collapsed }),
-      collapsed ? '已折叠用户内容' : '已展开用户内容',
-      collapsed ? '已折叠用户内容框。' : '已展开用户内容框。',
+      collapsed ? '已折叠附加信息' : '已展开附加信息',
+      collapsed ? '已折叠附加信息框。' : '已展开附加信息框。',
     );
   }, [commitDocument, contentCardLayout, editingContent]);
 
@@ -3735,8 +3805,8 @@ export default function App() {
         ...current,
         suffixMarkdown: buildContentSuffixMarkdown(draft.markdown),
       }),
-      '已更新用户内容',
-      '已更新工程 Markdown 的用户内容层。',
+      '已更新附加信息',
+      '已更新工程 Markdown 的附加信息层。',
     );
   }, [commitDocument, contentInspectorDraft]);
 
@@ -3771,7 +3841,7 @@ export default function App() {
         suffixMarkdown: buildContentSuffixMarkdown(normalizedContent),
       }),
       '已更新工程信息',
-      '已更新 Project Name、Summary 与 Content。',
+      '已更新 Project Name、Summary 与附加信息。',
     );
   }, [commitDocument, projectInspectorDraft]);
 
@@ -3847,9 +3917,9 @@ export default function App() {
     );
   }, [commitDocument]);
 
-  const createNodeAt = useCallback((
+  const createNodeAtForSources = useCallback((
     point: Point,
-    sourceNodeId?: string,
+    sourceIds: string[],
     edgeType: GraphEdge['type'] = 'solid',
     forcedSubgraphId?: string | null,
   ) => {
@@ -3871,11 +3941,17 @@ export default function App() {
         subgraphExclusions,
         contentCardRect,
       ),
-      sourceNodeId
-        ? {
-            x: point.x - (documentState.nodes.find((node) => node.id === sourceNodeId)?.x ?? point.x),
-            y: point.y - (documentState.nodes.find((node) => node.id === sourceNodeId)?.y ?? point.y),
-          }
+      sourceIds[0]
+        ? (() => {
+            const sourceEndpoint = edgeEndpointMap.get(sourceIds[0]);
+            const sourceCenter = sourceEndpoint
+              ? getNodeCenter(sourceEndpoint)
+              : null;
+            return {
+              x: point.x - (sourceCenter?.x ?? point.x),
+              y: point.y - (sourceCenter?.y ?? point.y),
+            };
+          })()
         : { x: 1, y: 0 },
       targetFrame
         ? {
@@ -3896,100 +3972,142 @@ export default function App() {
       (current) => ({
         ...current,
         nodes: [...current.nodes, newNode],
-        edges: sourceNodeId
+        edges: sourceIds.length > 0
           ? [
               ...current.edges,
-              {
+              ...sourceIds.map((sourceId) => ({
                 id: crypto.randomUUID(),
-                from: sourceNodeId,
+                from: sourceId,
                 to: id,
                 label: '',
                 type: edgeType,
                 strokeColor: defaultEdgeStyle.strokeColor,
                 strokeWidth: defaultEdgeStyle.strokeWidth,
-              },
+              })),
             ]
           : current.edges,
       }),
       '已创建节点',
-      sourceNodeId
-        ? `已创建 ${id}，并从 ${sourceNodeId} 建立连接。`
+      sourceIds.length > 1
+        ? `已创建 ${id}，并汇集 ${sourceIds.length} 个来源建立连接。`
+        : sourceIds.length === 1
+          ? `已创建 ${id}，并从 ${sourceIds[0]} 建立连接。`
         : targetSubgraphId
           ? `已在 ${targetSubgraphId} 中创建 ${id}。`
           : `已在画布中创建 ${id}。`,
     );
 
     setSelection({ kind: 'node', ids: [id] });
-  }, [allSubgraphFrameMap, commitDocument, contentCardRect, documentState, fullSubgraphLookup, selection]);
+  }, [
+    allSubgraphFrameMap,
+    commitDocument,
+    contentCardRect,
+    documentState,
+    edgeEndpointMap,
+    fullSubgraphLookup,
+    selection,
+  ]);
 
-  const createNodeFromShortcut = useCallback((
-    sourceNode: GraphNode,
+  const createNodeAt = useCallback((
+    point: Point,
+    sourceNodeId?: string,
+    edgeType: GraphEdge['type'] = 'solid',
+    forcedSubgraphId?: string | null,
+  ) => {
+    createNodeAtForSources(
+      point,
+      sourceNodeId ? [sourceNodeId] : [],
+      edgeType,
+      forcedSubgraphId,
+    );
+  }, [createNodeAtForSources]);
+
+  const createNodesFromShortcut = useCallback((
+    sourceNodes: GraphNode[],
     relation: 'linked' | 'sibling',
   ) => {
-    const id = nextNodeId(documentState.nodes);
-    const desiredPoint = getShortcutNodePlacement(sourceNode, documentState.direction, relation);
-    const draftNode = buildNode(id, '新建内容', desiredPoint, sourceNode.subgraphId);
-    const subgraphExclusions = getSubgraphAncestryIds(sourceNode.subgraphId, fullSubgraphLookup);
-    const targetFrame = sourceNode.subgraphId
-      ? allSubgraphFrameMap.get(sourceNode.subgraphId) ?? null
-      : null;
-    const safeRect = searchFreeRect(
-      getNodeRectAt(draftNode, desiredPoint),
-      buildCollisionObstacles(
-        documentState,
-        documentState.nodes,
-        new Set<string>(),
-        subgraphExclusions,
-        contentCardRect,
-      ),
-      {
-        x: desiredPoint.x - sourceNode.x,
-        y: desiredPoint.y - sourceNode.y,
-      },
-      targetFrame
-        ? {
-            x: targetFrame.x + 18,
-            y: targetFrame.y + targetFrame.headerHeight + 10,
-            width: targetFrame.width - 36,
-            height: targetFrame.height - targetFrame.headerHeight - 22,
-          }
-        : null,
-    );
-    const newNode = {
-      ...draftNode,
-      x: safeRect.x,
-      y: safeRect.y,
-    };
+    if (sourceNodes.length === 0) {
+      return;
+    }
+
+    const workingNodes = [...documentState.nodes];
+    const newNodes: GraphNode[] = [];
+    const newEdges: GraphEdge[] = [];
+
+    sourceNodes.forEach((sourceNode) => {
+      const id = nextNodeId(workingNodes);
+      const desiredPoint = getShortcutNodePlacement(sourceNode, documentState.direction, relation);
+      const draftNode = buildNode(id, '新建内容', desiredPoint, sourceNode.subgraphId);
+      const subgraphExclusions = getSubgraphAncestryIds(sourceNode.subgraphId, fullSubgraphLookup);
+      const targetFrame = sourceNode.subgraphId
+        ? allSubgraphFrameMap.get(sourceNode.subgraphId) ?? null
+        : null;
+      const collisionNodes = workingNodes;
+      const safeRect = searchFreeRect(
+        getNodeRectAt(draftNode, desiredPoint),
+        buildCollisionObstacles(
+          { ...documentState, nodes: collisionNodes },
+          collisionNodes,
+          new Set<string>(),
+          subgraphExclusions,
+          contentCardRect,
+        ),
+        {
+          x: desiredPoint.x - sourceNode.x,
+          y: desiredPoint.y - sourceNode.y,
+        },
+        targetFrame
+          ? {
+              x: targetFrame.x + 18,
+              y: targetFrame.y + targetFrame.headerHeight + 10,
+              width: targetFrame.width - 36,
+              height: targetFrame.height - targetFrame.headerHeight - 22,
+            }
+          : null,
+      );
+      const newNode = {
+        ...draftNode,
+        x: safeRect.x,
+        y: safeRect.y,
+      };
+
+      newNodes.push(newNode);
+      workingNodes.push(newNode);
+
+      if (relation === 'linked') {
+        newEdges.push({
+          id: crypto.randomUUID(),
+          from: sourceNode.id,
+          to: id,
+          label: '',
+          type: 'solid',
+          strokeColor: defaultEdgeStyle.strokeColor,
+          strokeWidth: defaultEdgeStyle.strokeWidth,
+        });
+      }
+    });
 
     commitDocument(
       (current) => ({
         ...current,
-        nodes: [...current.nodes, newNode],
-        edges:
-          relation === 'linked'
-            ? [
-                ...current.edges,
-                {
-                  id: crypto.randomUUID(),
-                  from: sourceNode.id,
-                  to: id,
-                  label: '',
-                  type: 'solid',
-                  strokeColor: defaultEdgeStyle.strokeColor,
-                  strokeWidth: defaultEdgeStyle.strokeWidth,
-                },
-              ]
-            : current.edges,
+        nodes: [...current.nodes, ...newNodes],
+        edges: relation === 'linked' ? [...current.edges, ...newEdges] : current.edges,
       }),
       relation === 'linked' ? '已创建节点' : '已创建同级节点',
-      relation === 'linked'
-        ? `已创建 ${id}，并从 ${sourceNode.id} 建立连接。`
-        : `已在 ${sourceNode.id} 同层级创建 ${id}。`,
+      sourceNodes.length > 1
+        ? relation === 'linked'
+          ? `已为 ${sourceNodes.length} 个选中节点分别创建并连接新节点。`
+          : `已为 ${sourceNodes.length} 个选中节点分别创建同级节点。`
+        : relation === 'linked'
+          ? `已创建 ${newNodes[0]?.id ?? '新节点'}，并从 ${sourceNodes[0]?.id ?? '当前节点'} 建立连接。`
+          : `已在 ${sourceNodes[0]?.id ?? '当前节点'} 同层级创建 ${newNodes[0]?.id ?? '新节点'}。`,
     );
 
-    setSelection({ kind: 'node', ids: [id] });
-    setEditingNodeId(id);
-    setEditingLabel(newNode.label);
+    setSelection({ kind: 'node', ids: newNodes.map((node) => node.id) });
+    if (newNodes.length === 1) {
+      setEditingNodeId(newNodes[0].id);
+      setEditingLabel(newNodes[0].label);
+    }
   }, [allSubgraphFrameMap, commitDocument, contentCardRect, documentState, fullSubgraphLookup]);
 
   const deleteSelection = useCallback(() => {
@@ -4076,6 +4194,68 @@ export default function App() {
     });
   }, [commitDocument, documentState.edges, documentState.nodes, selection]);
 
+  const copySelection = useCallback(() => {
+    if (selection.kind !== 'node' || selection.ids.length === 0) {
+      return;
+    }
+
+    const ids = new Set(selection.ids);
+    nodeClipboardRef.current = {
+      nodes: documentState.nodes
+        .filter((node) => ids.has(node.id))
+        .map((node) => structuredClone(node)),
+      edges: documentState.edges
+        .filter((edge) => ids.has(edge.from) && ids.has(edge.to))
+        .map((edge) => structuredClone(edge)),
+    };
+  }, [documentState.edges, documentState.nodes, selection]);
+
+  const pasteSelection = useCallback(() => {
+    const clipboard = nodeClipboardRef.current;
+    if (!clipboard || clipboard.nodes.length === 0) {
+      return;
+    }
+
+    const idMap = new Map<string, string>();
+    const workingNodes = [...documentState.nodes];
+    const pastedNodes = clipboard.nodes.map((node) => {
+      const nextId = nextNodeId(workingNodes);
+      idMap.set(node.id, nextId);
+      const nextNode = {
+        ...resizeNodeToContent(node, node.label),
+        id: nextId,
+        x: node.x + 40,
+        y: node.y + 40,
+      };
+      workingNodes.push(nextNode);
+      return nextNode;
+    });
+
+    const pastedEdges = clipboard.edges
+      .filter((edge) => idMap.has(edge.from) && idMap.has(edge.to))
+      .map((edge) => ({
+        ...edge,
+        id: crypto.randomUUID(),
+        from: idMap.get(edge.from) ?? edge.from,
+        to: idMap.get(edge.to) ?? edge.to,
+      }));
+
+    commitDocument(
+      (current) => ({
+        ...current,
+        nodes: [...current.nodes, ...pastedNodes],
+        edges: [...current.edges, ...pastedEdges],
+      }),
+      '已粘贴节点',
+      `已粘贴 ${pastedNodes.length} 个节点。`,
+    );
+
+    setSelection({
+      kind: 'node',
+      ids: pastedNodes.map((node) => node.id),
+    });
+  }, [commitDocument, documentState.nodes]);
+
   const wrapSelectionInSubgraph = useCallback(() => {
     if (selection.kind !== 'node' || selection.ids.length < 2) {
       return;
@@ -4099,6 +4279,9 @@ export default function App() {
             title: `分组 ${current.subgraphs.length + 1}`,
             parentId,
             collapsed: false,
+            fill: defaultSubgraphStyle.fill,
+            stroke: defaultSubgraphStyle.stroke,
+            textColor: defaultSubgraphStyle.textColor,
           },
         ],
         nodes: current.nodes.map((node) =>
@@ -4782,6 +4965,10 @@ export default function App() {
         return;
       }
 
+      if (helpDialogOpen && event.key !== 'Escape') {
+        return;
+      }
+
       const canvasHasFocus =
         mode === 'canvas' &&
         (canvasHovered ||
@@ -4814,16 +5001,22 @@ export default function App() {
         selection.kind === 'node' && selection.ids.length === 1
           ? documentState.nodes.find((node) => node.id === selection.ids[0]) ?? null
           : null;
+      const selectedNodesForShortcut =
+        selection.kind === 'node' && selection.ids.length > 0
+          ? selection.ids
+              .map((id) => documentState.nodes.find((node) => node.id === id) ?? null)
+              .filter((node): node is GraphNode => node !== null)
+          : [];
 
       if (
         canvasHasFocus &&
-        selectedNodeForShortcut &&
+        selectedNodesForShortcut.length > 0 &&
         !editingNodeId &&
         !editingEdgeId &&
         event.key === 'Tab'
       ) {
         event.preventDefault();
-        createNodeFromShortcut(selectedNodeForShortcut, 'linked');
+        createNodesFromShortcut(selectedNodesForShortcut, 'linked');
         return;
       }
 
@@ -4835,7 +5028,7 @@ export default function App() {
         event.code === 'Space'
       ) {
         event.preventDefault();
-        createNodeFromShortcut(selectedNodeForShortcut, 'sibling');
+        createNodesFromShortcut([selectedNodeForShortcut], 'sibling');
         return;
       }
 
@@ -4848,6 +5041,18 @@ export default function App() {
           event.preventDefault();
           const ids = visibleNodes.map((node) => node.id);
           setSelection(ids.length > 0 ? { kind: 'node', ids } : { kind: 'none', ids: [] });
+          return;
+        }
+
+        if (lowerKey === 'c' && selection.kind === 'node' && selection.ids.length > 0) {
+          event.preventDefault();
+          copySelection();
+          return;
+        }
+
+        if (lowerKey === 'v') {
+          event.preventDefault();
+          pasteSelection();
           return;
         }
 
@@ -4902,6 +5107,7 @@ export default function App() {
 
       if (event.key === 'Escape') {
         event.preventDefault();
+        setHelpDialogOpen(false);
         setEditingNodeId(null);
         setEditingLabel('');
         setEditingEdgeId(null);
@@ -4975,18 +5181,21 @@ export default function App() {
   }, [
     canvasHovered,
     clearSelection,
-    createNodeFromShortcut,
+    copySelection,
+    createNodesFromShortcut,
     documentState.nodes,
     deleteSelection,
     duplicateSelection,
     documentState.edges,
     editingEdgeId,
     editingNodeId,
+    helpDialogOpen,
     goToMode,
     mode,
     redoDocument,
     selection.ids,
     selection.kind,
+    pasteSelection,
     startEdgeInlineEdit,
     startContentInlineEdit,
     startInlineEdit,
@@ -5060,6 +5269,7 @@ export default function App() {
             ? {
                 ...current,
                 current: { x, y },
+                toggle: event.shiftKey,
               }
             : null,
         );
@@ -5086,6 +5296,7 @@ export default function App() {
             ? {
                 ...current,
                 current: { x, y },
+                edgeType: event.ctrlKey || event.metaKey ? 'line' : 'solid',
               }
             : null,
         );
@@ -5111,8 +5322,8 @@ export default function App() {
                   y: (dragState.initialPositions[CONTENT_CARD_ID]?.y ?? contentCardLayout.y) + deltaY,
                   collapsed: contentCardLayout.collapsed,
                 }),
-              '已移动用户内容',
-              '已调整用户内容框位置。',
+              '已移动附加信息',
+              '已调整附加信息框位置。',
             );
           }
           setDragState(null);
@@ -5174,29 +5385,55 @@ export default function App() {
         const rect = rectFromPoints(boxState.origin, boxState.current);
         const nextNodeIds = visibleNodes.filter((node) => intersects(rect, node)).map((node) => node.id);
         if (nextNodeIds.length > 0) {
-          setSelection({ kind: 'node', ids: nextNodeIds });
-        } else if (intersects(rect, contentCardRect)) {
-          setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
+          setSelection((current) =>
+            boxState.toggle ? toggleSelectionIds(current, 'node', nextNodeIds) : { kind: 'node', ids: nextNodeIds },
+          );
         } else {
-          const nextEdgeIds = visibleEdges
-            .filter((edge) => {
-              const fromNode = edgeEndpointMap.get(edge.from);
-              const toNode = edgeEndpointMap.get(edge.to);
-              if (!fromNode || !toNode) {
-                return false;
-              }
+          const nextSubgraphIds = subgraphFrames
+            .filter((frame) => intersects(rect, frame))
+            .map((frame) => frame.id);
 
-              const geometry = buildEdgeGeometry(
-                fromNode,
-                toNode,
-                edgeLaneMap.get(edge.id) ?? 0,
-                edgeEndpointOffsetMap.get(edge.id),
-              );
-              return edgeIntersectsRect(rect, geometry);
-            })
-            .map((edge) => edge.id);
+          if (nextSubgraphIds.length > 0) {
+            setSelection((current) =>
+              boxState.toggle
+                ? toggleSelectionIds(current, 'subgraph', nextSubgraphIds)
+                : { kind: 'subgraph', ids: nextSubgraphIds },
+            );
+          } else if (intersects(rect, contentCardRect)) {
+            setSelection((current) =>
+              boxState.toggle
+                ? toggleSelectionIds(current, 'content', [CONTENT_CARD_ID])
+                : { kind: 'content', ids: [CONTENT_CARD_ID] },
+            );
+          } else {
+            const nextEdgeIds = visibleEdges
+              .filter((edge) => {
+                const fromNode = edgeEndpointMap.get(edge.from);
+                const toNode = edgeEndpointMap.get(edge.to);
+                if (!fromNode || !toNode) {
+                  return false;
+                }
 
-          setSelection(nextEdgeIds.length > 0 ? { kind: 'edge', ids: nextEdgeIds } : { kind: 'none', ids: [] });
+                const geometry = buildEdgeGeometry(
+                  fromNode,
+                  toNode,
+                  edgeLaneMap.get(edge.id) ?? 0,
+                  edgeEndpointOffsetMap.get(edge.id),
+                );
+                return edgeIntersectsRect(rect, geometry);
+              })
+              .map((edge) => edge.id);
+
+            setSelection((current) =>
+              nextEdgeIds.length > 0
+                ? (
+                  boxState.toggle
+                    ? toggleSelectionIds(current, 'edge', nextEdgeIds)
+                    : { kind: 'edge', ids: nextEdgeIds }
+                )
+                : (boxState.toggle ? current : { kind: 'none', ids: [] }),
+            );
+          }
         }
         setBoxState(null);
       }
@@ -5222,38 +5459,42 @@ export default function App() {
           connectingState.current.x - connectingState.origin.x,
           connectingState.current.y - connectingState.origin.y,
         );
+        const sourceIds = connectingState.fromIds.length > 0
+          ? connectingState.fromIds
+          : [connectingState.fromId];
 
-        if (targetId && targetId !== connectingState.fromId) {
-          const nextEdgeId = crypto.randomUUID();
+        if (targetId && sourceIds.some((sourceId) => sourceId !== targetId)) {
+          const nextEdges = sourceIds
+            .filter((sourceId) => sourceId !== targetId)
+            .map((sourceId) => ({
+              id: crypto.randomUUID(),
+              from: sourceId,
+              to: targetId,
+              label: '',
+              type: connectingState.edgeType,
+              strokeColor: defaultEdgeStyle.strokeColor,
+              strokeWidth: defaultEdgeStyle.strokeWidth,
+            }));
           commitDocument(
             (current) => ({
               ...current,
-              edges: [
-                ...current.edges,
-                {
-                  id: nextEdgeId,
-                  from: connectingState.fromId,
-                  to: targetId,
-                  label: '',
-                  type: connectingState.edgeType,
-                  strokeColor: defaultEdgeStyle.strokeColor,
-                  strokeWidth: defaultEdgeStyle.strokeWidth,
-                },
-              ],
+              edges: [...current.edges, ...nextEdges],
             }),
             '已创建连线',
-            `已将 ${connectingState.fromId} 连接到 ${targetId}。`,
+            sourceIds.length > 1
+              ? `已将 ${sourceIds.length} 个来源汇聚连接到 ${targetId}。`
+              : `已将 ${connectingState.fromId} 连接到 ${targetId}。`,
           );
-          setSelection({ kind: 'edge', ids: [nextEdgeId] });
+          setSelection({ kind: 'edge', ids: nextEdges.map((edge) => edge.id) });
         } else if (dragDistance > 6) {
           const point = pointFromClient(event.clientX, event.clientY);
           if (!point) {
             setConnectingState(null);
             return;
           }
-          createNodeAt(
+          createNodeAtForSources(
             point,
-            connectingState.fromId,
+            sourceIds,
             connectingState.edgeType,
             resolveSubgraphAtPoint(point),
           );
@@ -5291,8 +5532,7 @@ export default function App() {
     contentCardLayout.y,
     contentCardRect,
     connectingState,
-    createNodeAt,
-    createNodeFromShortcut,
+    createNodeAtForSources,
     documentState.layout.viewport,
     documentState.nodes,
     dragState,
@@ -5302,6 +5542,7 @@ export default function App() {
     edgeLaneMap,
     edgeEndpointOffsetMap,
     allSubgraphFrames,
+    subgraphFrames,
     fullSubgraphLookup,
     panState,
     pointFromClient,
@@ -5339,6 +5580,15 @@ export default function App() {
   }
 
   function startBackgroundInteraction(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button === 1) {
+      event.preventDefault();
+      setPanState({
+        origin: { x: event.clientX, y: event.clientY },
+        initialViewport: { ...documentState.layout.viewport },
+      });
+      return;
+    }
+
     if (event.button !== 0) {
       return;
     }
@@ -5362,7 +5612,9 @@ export default function App() {
       return;
     }
 
-    clearSelection();
+    if (!event.shiftKey) {
+      clearSelection();
+    }
     if (isMobileViewport || event.pointerType === 'touch') {
       clearPendingBackgroundInteraction();
       pendingBackgroundRef.current = {
@@ -5374,6 +5626,7 @@ export default function App() {
         setBoxState({
           origin: point,
           current: point,
+          toggle: event.shiftKey,
         });
         clearPendingBackgroundInteraction();
       }, 220);
@@ -5383,11 +5636,22 @@ export default function App() {
     setBoxState({
       origin: point,
       current: point,
+      toggle: event.shiftKey,
     });
   }
 
   function startNodeDrag(event: ReactPointerEvent<HTMLDivElement>, node: GraphNode) {
-    if (event.button !== 0 || editingNodeId) {
+    if (editingNodeId) {
+      return;
+    }
+
+    if (event.button === 1) {
+      event.preventDefault();
+      event.stopPropagation();
+      setPanState({
+        origin: { x: event.clientX, y: event.clientY },
+        initialViewport: { ...documentState.layout.viewport },
+      });
       return;
     }
 
@@ -5398,9 +5662,27 @@ export default function App() {
       return;
     }
 
-    let activeIds = selection.kind === 'node' && selectionContains(selection, node.id)
+    const activeIds = selection.kind === 'node' && selectionContains(selection, node.id)
       ? selection.ids
       : [node.id];
+
+    if (event.button === 2) {
+      event.preventDefault();
+      setSelection({ kind: 'node', ids: activeIds });
+      setConnectingState({
+        fromId: activeIds[0],
+        fromIds: activeIds,
+        origin: point,
+        current: point,
+        edgeType: event.ctrlKey || event.metaKey ? 'line' : 'solid',
+        handleSide: event.clientX < node.x + node.width / 2 ? 'left' : 'right',
+      });
+      return;
+    }
+
+    if (event.button !== 0) {
+      return;
+    }
 
     if (event.altKey) {
       const currentDocument = structuredClone(documentRef.current);
@@ -5434,17 +5716,12 @@ export default function App() {
     }
 
     if (event.shiftKey) {
-      const nextSet = new Set(selection.ids);
-      if (nextSet.has(node.id)) {
-        nextSet.delete(node.id);
-      } else {
-        nextSet.add(node.id);
-      }
-      activeIds = [...nextSet];
-      setSelection(activeIds.length > 0 ? { kind: 'node', ids: activeIds } : { kind: 'none', ids: [] });
-    } else {
-      setSelection({ kind: 'node', ids: activeIds });
+      const nextSelection = toggleSelectionIds(selection, 'node', [node.id]);
+      setSelection(nextSelection);
+      return;
     }
+
+    setSelection({ kind: 'node', ids: activeIds });
 
     const initialPositions = Object.fromEntries(
       documentState.nodes
@@ -5462,7 +5739,7 @@ export default function App() {
   }
 
   function startContentDrag(event: ReactPointerEvent<HTMLDivElement>) {
-    if (event.button !== 0 || editingContent) {
+    if (editingContent) {
       return;
     }
 
@@ -5471,7 +5748,26 @@ export default function App() {
       return;
     }
 
+    if (event.button === 1) {
+      event.preventDefault();
+      event.stopPropagation();
+      setPanState({
+        origin: { x: event.clientX, y: event.clientY },
+        initialViewport: { ...documentState.layout.viewport },
+      });
+      return;
+    }
+
+    if (event.button !== 0) {
+      return;
+    }
+
     event.stopPropagation();
+    if (event.shiftKey) {
+      setSelection((current) => toggleSelectionIds(current, 'content', [CONTENT_CARD_ID]));
+      return;
+    }
+
     const point = pointFromClient(event.clientX, event.clientY);
     if (!point) {
       return;
@@ -5496,7 +5792,7 @@ export default function App() {
     event: ReactPointerEvent<HTMLDivElement>,
     subgraphId: string,
   ) {
-    if (event.button !== 0 || editingSubgraphId) {
+    if (editingSubgraphId) {
       return;
     }
 
@@ -5505,9 +5801,43 @@ export default function App() {
       return;
     }
 
+    if (event.button === 1) {
+      event.preventDefault();
+      event.stopPropagation();
+      setPanState({
+        origin: { x: event.clientX, y: event.clientY },
+        initialViewport: { ...documentState.layout.viewport },
+      });
+      return;
+    }
+
     event.stopPropagation();
     const point = pointFromClient(event.clientX, event.clientY);
     if (!point) {
+      return;
+    }
+
+    if (event.button === 2) {
+      event.preventDefault();
+      const frame = allSubgraphFrameMap.get(subgraphId);
+      setSelection({ kind: 'subgraph', ids: [subgraphId] });
+      setConnectingState({
+        fromId: subgraphId,
+        fromIds: [subgraphId],
+        origin: point,
+        current: point,
+        edgeType: event.ctrlKey || event.metaKey ? 'line' : 'solid',
+        handleSide: event.clientX < ((frame?.x ?? 0) + (frame?.width ?? 0) / 2) ? 'left' : 'right',
+      });
+      return;
+    }
+
+    if (event.button !== 0) {
+      return;
+    }
+
+    if (event.shiftKey) {
+      setSelection((current) => toggleSelectionIds(current, 'subgraph', [subgraphId]));
       return;
     }
 
@@ -5532,7 +5862,7 @@ export default function App() {
   }
 
   function beginConnection(
-    event: ReactPointerEvent<HTMLButtonElement>,
+    event: ReactPointerEvent<HTMLElement>,
     endpoint: Pick<EdgeEndpointBox, 'id' | 'x' | 'y' | 'width' | 'height'>,
     handleSide: 'left' | 'right',
   ) {
@@ -5548,6 +5878,7 @@ export default function App() {
     }
     setConnectingState({
       fromId: endpoint.id,
+      fromIds: [endpoint.id],
       origin: current,
       current,
       edgeType: event.ctrlKey || event.metaKey ? 'line' : 'solid',
@@ -5631,6 +5962,9 @@ export default function App() {
     setSubgraphInspectorDraft({
       title: selectedSubgraph.title,
       collapsed: selectedSubgraph.collapsed,
+      fill: selectedSubgraph.fill,
+      stroke: selectedSubgraph.stroke,
+      textColor: selectedSubgraph.textColor,
     });
   }, [selectedSubgraph]);
 
@@ -5734,7 +6068,14 @@ export default function App() {
               <WorkbenchIcon name="menu" />
             </button>
           ) : null}
-          <div className="topbar__mark">MD</div>
+          <button
+            aria-label="查看操作说明"
+            className="topbar__mark"
+            onClick={() => setHelpDialogOpen(true)}
+            type="button"
+          >
+            MD
+          </button>
         </div>
 
         <div className="workbench-tabs" aria-label="已打开文件">
@@ -6333,6 +6674,7 @@ export default function App() {
 
               <div
                 className={`canvas-surface${spacePressed ? ' is-panning' : ''}`}
+                onContextMenu={(event) => event.preventDefault()}
                 onMouseEnter={() => setCanvasHovered(true)}
                 onMouseLeave={() => setCanvasHovered(false)}
                 onDoubleClick={(event) => {
@@ -6371,6 +6713,7 @@ export default function App() {
                     if (!subgraph) {
                       return null;
                     }
+                    const subgraphStyle = getSubgraphStyle(subgraph);
 
                     return (
                       <div
@@ -6384,7 +6727,7 @@ export default function App() {
                           }
 
                           event.stopPropagation();
-                          selectSingle('subgraph', frame.id);
+                          selectSingle('subgraph', frame.id, event.shiftKey);
                         }}
                         style={{
                           left: frame.x,
@@ -6392,6 +6735,11 @@ export default function App() {
                           width: frame.width,
                           height: frame.height,
                           '--depth': String(frame.depth),
+                          '--subgraph-fill': subgraphStyle.fill,
+                          '--subgraph-fill-soft': withAlpha(subgraphStyle.fill, 0.16),
+                          '--subgraph-fill-faint': withAlpha(subgraphStyle.fill, 0.08),
+                          '--subgraph-stroke': subgraphStyle.stroke,
+                          '--subgraph-text': subgraphStyle.textColor,
                         } as CSSProperties}
                       >
                         <div
@@ -6508,7 +6856,24 @@ export default function App() {
                       event.stopPropagation();
                       startContentInlineEdit();
                     }}
-                    onPointerDown={startContentDrag}
+                    onPointerDown={(event) => {
+                      const target = event.target as HTMLElement;
+                      if (target.closest('.content-card__action, .content-card__editor')) {
+                        return;
+                      }
+
+                      if (target.closest('.content-card__header')) {
+                        startContentDrag(event);
+                        return;
+                      }
+
+                      event.stopPropagation();
+                      if (event.shiftKey) {
+                        setSelection((current) => toggleSelectionIds(current, 'content', [CONTENT_CARD_ID]));
+                        return;
+                      }
+                      setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
+                    }}
                     style={{
                       left: contentCardRenderLayout.x,
                       top: contentCardRenderLayout.y,
@@ -6521,11 +6886,11 @@ export default function App() {
                       onPointerDown={startContentDrag}
                     >
                       <div className="content-card__header-copy">
-                        <span className="content-card__eyebrow">Content</span>
-                        <strong>用户内容</strong>
+                        <span className="content-card__eyebrow">Additional</span>
+                        <strong>附加信息</strong>
                       </div>
                       <button
-                        aria-label={contentCardLayout.collapsed ? '展开用户内容' : '折叠用户内容'}
+                        aria-label={contentCardLayout.collapsed ? '展开附加信息' : '折叠附加信息'}
                         className="content-card__action"
                         onClick={(event) => {
                           event.stopPropagation();
@@ -6565,6 +6930,7 @@ export default function App() {
                           }
                         }}
                         onPointerDown={(event) => event.stopPropagation()}
+                        rows={Math.max(8, contentInspectorDraft.markdown.split(/\r?\n/).length + 2)}
                         spellCheck={false}
                         value={contentInspectorDraft.markdown}
                       />
@@ -6693,7 +7059,7 @@ export default function App() {
                             d={geometry.path}
                             onClick={(event) => {
                               event.stopPropagation();
-                              selectSingle('edge', edge.id);
+                              selectSingle('edge', edge.id, event.shiftKey);
                             }}
                             onDoubleClick={(event) => {
                               event.stopPropagation();
@@ -7370,14 +7736,87 @@ export default function App() {
                   type="checkbox"
                 />
               </label>
+              <div className="field">
+                <span>样式预设</span>
+                <div className="node-style-presets" role="list">
+                  {nodeStylePresets.map((preset) => (
+                    <button
+                      key={`subgraph-${preset.id}`}
+                      className={
+                        subgraphInspectorDraft.fill === preset.fill &&
+                        subgraphInspectorDraft.stroke === preset.stroke &&
+                        subgraphInspectorDraft.textColor === preset.textColor
+                          ? 'node-style-preset is-active'
+                          : 'node-style-preset'
+                      }
+                      onClick={() => {
+                        const nextDraft = {
+                          ...subgraphInspectorDraft,
+                          fill: preset.fill,
+                          stroke: preset.stroke,
+                          textColor: preset.textColor,
+                        };
+                        setSubgraphInspectorDraft(nextDraft);
+                        applySubgraphInspectorDraft(nextDraft);
+                      }}
+                      type="button"
+                    >
+                      <span className="node-style-preset__swatches" aria-hidden="true">
+                        <span style={{ background: preset.fill }} />
+                        <span style={{ background: preset.stroke }} />
+                        <span style={{ background: preset.textColor }} />
+                      </span>
+                      <span className="node-style-preset__label">{preset.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="color-grid">
+                <label className="field">
+                  <span>填充</span>
+                  <input
+                    onChange={(event) => {
+                      const nextDraft = { ...subgraphInspectorDraft, fill: event.target.value };
+                      setSubgraphInspectorDraft(nextDraft);
+                      applySubgraphInspectorDraft(nextDraft);
+                    }}
+                    type="color"
+                    value={subgraphInspectorDraft.fill}
+                  />
+                </label>
+                <label className="field">
+                  <span>描边</span>
+                  <input
+                    onChange={(event) => {
+                      const nextDraft = { ...subgraphInspectorDraft, stroke: event.target.value };
+                      setSubgraphInspectorDraft(nextDraft);
+                      applySubgraphInspectorDraft(nextDraft);
+                    }}
+                    type="color"
+                    value={subgraphInspectorDraft.stroke}
+                  />
+                </label>
+                <label className="field">
+                  <span>文字</span>
+                  <input
+                    onChange={(event) => {
+                      const nextDraft = { ...subgraphInspectorDraft, textColor: event.target.value };
+                      setSubgraphInspectorDraft(nextDraft);
+                      applySubgraphInspectorDraft(nextDraft);
+                    }}
+                    type="color"
+                    value={subgraphInspectorDraft.textColor}
+                  />
+                </label>
+              </div>
             </section>
           ) : null}
 
           {selectedContent ? (
             <section className="sidebar-card">
               <div className="sidebar-card__header">
-                <h2>用户内容</h2>
-                <span>Content</span>
+                <h2>附加信息</h2>
+                <span>Additional</span>
               </div>
               <label className="field field--inline">
                 <span>折叠</span>
@@ -7405,7 +7844,7 @@ export default function App() {
                       event.currentTarget.blur();
                     }
                   }}
-                  rows={10}
+                  rows={Math.max(12, contentInspectorDraft.markdown.split(/\r?\n/).length + 3)}
                   value={contentInspectorDraft.markdown}
                 />
               </label>
@@ -7469,7 +7908,7 @@ export default function App() {
                 />
               </label>
               <label className="field">
-                <span>Content</span>
+                <span>附加信息</span>
                 <textarea
                   onBlur={() => applyProjectInspectorDraft()}
                   onChange={(event) =>
@@ -7489,7 +7928,7 @@ export default function App() {
                       event.currentTarget.blur();
                     }
                   }}
-                  rows={10}
+                  rows={Math.max(12, projectInspectorDraft.contentMarkdown.split(/\r?\n/).length + 3)}
                   value={projectInspectorDraft.contentMarkdown}
                 />
               </label>
@@ -7565,6 +8004,64 @@ export default function App() {
           </div>
         ) : null}
       </main>
+
+      {helpDialogOpen ? (
+        <div
+          aria-label="操作说明"
+          className="help-dialog-backdrop"
+          onClick={() => setHelpDialogOpen(false)}
+          role="presentation"
+        >
+          <section
+            aria-modal="true"
+            className="help-dialog"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <div className="help-dialog__header">
+              <div>
+                <p className="eyebrow">Quick Guide</p>
+                <h2>操作说明</h2>
+              </div>
+              <button
+                aria-label="关闭操作说明"
+                className="panel-icon-button"
+                onClick={() => setHelpDialogOpen(false)}
+                type="button"
+              >
+                <WorkbenchIcon name="chevron-right" />
+              </button>
+            </div>
+
+            <div className="help-dialog__grid">
+              <article className="help-card">
+                <strong>🖱️ 画布</strong>
+                <p>左键空白框选，左键拖节点移动，中键按住平移；`Shift + Click` 和 `Shift + Drag` 都能加选/减选；滚轮直接缩放，触控板双指捏合缩放、双指拖拽平移，`Space + Drag` 也能临时平移。</p>
+              </article>
+              <article className="help-card">
+                <strong>🔗 连线</strong>
+                <p>右键从节点或分组直接拖出连线；按住 `Ctrl/Cmd` 再拖会创建普通线。多选节点后右拖会汇聚指向同一目标。</p>
+              </article>
+              <article className="help-card">
+                <strong>⌨️ 快捷键</strong>
+                <p>`Delete` 删除，`Ctrl/Cmd + G` 分组，`Ctrl/Cmd + C / V` 复制粘贴，`Alt + Drag` 复制并拖拽，`Ctrl/Cmd + Z` 撤回。</p>
+              </article>
+              <article className="help-card">
+                <strong>✍️ 编辑</strong>
+                <p>双击节点/连线或选中后按 `Enter` 进入编辑；编辑时 `Enter` 保存，`Shift/Ctrl/Alt + Enter` 换行。</p>
+              </article>
+              <article className="help-card">
+                <strong>🌿 快速新建</strong>
+                <p>双击空白会创建一个未链接的新节点；如果双击发生在组内，就直接创建在该组里。选中节点按 `Tab` 会在旁边快速新建并自动连线；多选时会为每个节点各建一个新节点。</p>
+              </article>
+              <article className="help-card">
+                <strong>📦 分组层级</strong>
+                <p>按住 `Ctrl/Cmd` 拖拽节点可以放入组或拖出组；中途再按下 `Ctrl/Cmd` 也会切到改层级模式。</p>
+              </article>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

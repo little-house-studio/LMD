@@ -339,12 +339,81 @@ select:focus-visible {
   place-items: center;
   width: 32px;
   height: 32px;
+  padding: 0;
+  border: 0;
   border-radius: var(--radius-sm);
   background: linear-gradient(140deg, rgba(59, 130, 246, 0.94), rgba(249, 115, 22, 0.94));
   color: white;
   font-size: 0.72rem;
   font-weight: 800;
   letter-spacing: 0.04em;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+}
+
+.topbar__mark:hover {
+  transform: translateY(-1px);
+}
+
+.help-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(7, 10, 16, 0.62);
+  backdrop-filter: blur(12px);
+}
+
+.help-dialog {
+  width: min(760px, 100%);
+  max-height: min(80vh, 760px);
+  display: grid;
+  gap: 14px;
+  overflow: auto;
+  padding: 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  background: rgba(16, 19, 24, 0.96);
+  box-shadow: 0 28px 68px rgba(0, 0, 0, 0.36);
+}
+
+.help-dialog__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.help-dialog__header h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.help-dialog__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.help-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.help-card strong {
+  font-size: 0.86rem;
+}
+
+.help-card p {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 0.78rem;
+  line-height: 1.55;
 }
 .sidebar-card h2,
 .pane-header h2 {
@@ -1438,12 +1507,12 @@ select:focus-visible {
   display: flex;
   flex-direction: column;
   border-radius: calc(var(--radius-lg) + 2px);
-  border: 1px solid rgba(148, 163, 184, 0.22);
+  border: 1px solid color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 34%, transparent);
   background:
-    linear-gradient(180deg, rgba(59, 130, 246, 0.08), rgba(15, 23, 42, 0.04)),
+    linear-gradient(180deg, var(--subgraph-fill-soft, rgba(59, 130, 246, 0.16)), rgba(15, 23, 42, 0.04)),
     rgba(11, 18, 32, 0.56);
   text-align: left;
-  color: var(--ink);
+  color: var(--subgraph-text, var(--ink));
   box-shadow:
     0 18px 42px rgba(2, 6, 23, 0.26),
     inset 0 1px 0 rgba(255, 255, 255, 0.04);
@@ -1453,22 +1522,22 @@ select:focus-visible {
 }
 
 .subgraph-frame.is-selected {
-  border-color: rgba(125, 211, 252, 0.96);
+  border-color: var(--subgraph-stroke, rgba(125, 211, 252, 0.96));
   transform: translateY(-2px);
   box-shadow:
     0 26px 52px rgba(2, 6, 23, 0.38),
-    0 0 0 2px rgba(56, 189, 248, 0.46),
-    0 0 0 8px rgba(56, 189, 248, 0.12),
+    0 0 0 2px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 62%, transparent),
+    0 0 0 8px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 18%, transparent),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
 .subgraph-frame.is-drop-target {
-  border-color: rgba(96, 165, 250, 0.9);
+  border-color: var(--subgraph-stroke, rgba(96, 165, 250, 0.9));
   box-shadow:
-    0 0 0 1px rgba(96, 165, 250, 0.42),
-    0 24px 56px rgba(37, 99, 235, 0.22);
+    0 0 0 1px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 46%, transparent),
+    0 24px 56px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 22%, transparent);
   background:
-    linear-gradient(180deg, rgba(59, 130, 246, 0.16), rgba(15, 23, 42, 0.08)),
+    linear-gradient(180deg, color-mix(in srgb, var(--subgraph-fill, #d7efff) 26%, transparent), rgba(15, 23, 42, 0.08)),
     rgba(11, 18, 32, 0.68);
 }
 
@@ -1479,8 +1548,8 @@ select:focus-visible {
   gap: 12px;
   min-height: 42px;
   padding: 10px 12px 10px 15px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(15, 23, 42, 0.04));
+  border-bottom: 1px solid color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 16%, transparent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--subgraph-fill, #d7efff) 16%, rgba(255,255,255,0.06)), rgba(15, 23, 42, 0.04));
   cursor: grab;
   user-select: none;
 }
@@ -1503,7 +1572,7 @@ select:focus-visible {
   white-space: nowrap;
   font-size: 0.96rem;
   font-weight: 700;
-  color: #f8fafc;
+  color: var(--subgraph-text, #f8fafc);
 }
 
 .subgraph-frame__title-input {
@@ -1543,7 +1612,7 @@ select:focus-visible {
 }
 
 .subgraph-frame__connector:hover {
-  border-color: rgba(96, 165, 250, 0.42);
+  border-color: color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 42%, transparent);
   background: rgba(30, 41, 59, 0.72);
   color: #f8fafc;
 }
@@ -1944,8 +2013,8 @@ select:focus-visible {
   color: #0f172a;
   box-shadow: 0 16px 28px rgba(0, 0, 0, 0.24);
   user-select: none;
-  cursor: grab;
-  overflow: hidden;
+  cursor: default;
+  overflow: visible;
   z-index: 5;
   transition:
     transform 140ms ease,
@@ -1953,10 +2022,6 @@ select:focus-visible {
     border-color 140ms ease,
     width 120ms ease,
     height 120ms ease;
-}
-
-.content-card:active {
-  cursor: grabbing;
 }
 
 .content-card:hover {
@@ -1980,6 +2045,11 @@ select:focus-visible {
   padding-bottom: 8px;
   border-bottom: 1px solid rgba(15, 23, 42, 0.08);
   color: #0f172a;
+  cursor: grab;
+}
+
+.content-card__header:active {
+  cursor: grabbing;
 }
 
 .content-card__header-copy {
@@ -2002,12 +2072,13 @@ select:focus-visible {
 }
 
 .content-card__body {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
+  flex: none;
+  min-height: 120px;
+  overflow: visible;
   font-size: 0.9rem;
   line-height: 1.55;
   color: #0f172a;
+  overflow-wrap: anywhere;
 }
 
 .content-card__body h1,
@@ -2077,9 +2148,9 @@ select:focus-visible {
 
 .content-card__summary {
   display: flex;
-  align-items: center;
-  min-height: 0;
-  flex: 1;
+  align-items: flex-start;
+  min-height: 80px;
+  flex: none;
   padding: 2px 0 0;
 }
 
@@ -2088,6 +2159,7 @@ select:focus-visible {
   font-size: 0.88rem;
   line-height: 1.45;
   color: #334155;
+  overflow-wrap: anywhere;
 }
 
 .content-card__empty {
@@ -2095,14 +2167,19 @@ select:focus-visible {
 }
 
 .content-card__editor {
-  flex: 1;
-  min-height: 0;
+  display: block;
+  width: 100%;
+  flex: none;
+  min-height: 180px;
+  overflow: hidden;
+  padding: 2px 0 8px;
   border: 0;
   resize: none;
   background: transparent;
   color: #0f172a;
   font: 500 0.9rem/1.55 ui-monospace, 'SFMono-Regular', 'SF Mono', Consolas, monospace;
   outline: none;
+  overflow-wrap: anywhere;
 }
 
 .content-card__action {
@@ -2139,8 +2216,12 @@ select:focus-visible {
 
 .selection-box {
   position: absolute;
-  border: 1.5px dashed rgba(96, 165, 250, 0.88);
-  background: rgba(59, 130, 246, 0.12);
+  border: 2px solid rgba(56, 189, 248, 0.96);
+  background: rgba(14, 165, 233, 0.18);
+  box-shadow:
+    0 0 0 1px rgba(14, 165, 233, 0.42),
+    0 0 24px rgba(56, 189, 248, 0.18),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
   pointer-events: none;
   z-index: 11;
 }
@@ -2485,6 +2566,15 @@ select:focus-visible {
     justify-content: flex-start;
     flex-wrap: wrap;
     max-width: calc(100% - 24px);
+  }
+
+  .help-dialog {
+    padding: 16px;
+    max-height: min(84vh, 760px);
+  }
+
+  .help-dialog__grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

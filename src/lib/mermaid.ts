@@ -16,6 +16,12 @@ const defaultNodeStyle = {
   textColor: '#12212c',
 };
 
+export const defaultSubgraphStyle = {
+  fill: '#d7efff',
+  stroke: '#38bdf8',
+  textColor: '#083344',
+};
+
 export const defaultEdgeStyle = {
   strokeColor: '#bfd2de',
   strokeWidth: 1,
@@ -201,6 +207,15 @@ function parseStyleLine(raw: string) {
     fill: styleMap.fill,
     stroke: styleMap.stroke,
     color: styleMap.color,
+  };
+}
+
+function normalizeSubgraphStyle(subgraph: GraphSubgraph): GraphSubgraph {
+  return {
+    ...subgraph,
+    fill: subgraph.fill ?? defaultSubgraphStyle.fill,
+    stroke: subgraph.stroke ?? defaultSubgraphStyle.stroke,
+    textColor: subgraph.textColor ?? defaultSubgraphStyle.textColor,
   };
 }
 
@@ -450,6 +465,9 @@ export function parseMermaidDocument(
         title: parsed.title,
         parentId: subgraphStack[subgraphStack.length - 1] ?? null,
         collapsed: layout.subgraphs[parsed.id]?.collapsed ?? false,
+        fill: defaultSubgraphStyle.fill,
+        stroke: defaultSubgraphStyle.stroke,
+        textColor: defaultSubgraphStyle.textColor,
       };
       subgraphs.push(nextSubgraph);
       subgraphStack.push(nextSubgraph.id);
@@ -463,11 +481,22 @@ export function parseMermaidDocument(
 
     const parsedStyle = parseStyleLine(line);
     if (parsedStyle) {
-      const target = ensureNode({ id: parsedStyle.id, label: parsedStyle.id, shape: 'rect' });
-      if (target) {
-        target.fill = parsedStyle.fill ?? target.fill;
-        target.stroke = parsedStyle.stroke ?? target.stroke;
-        target.textColor = parsedStyle.color ?? target.textColor;
+      const existingNode = nodeMap.get(parsedStyle.id);
+      if (existingNode) {
+        const target = ensureNode({ id: parsedStyle.id, label: parsedStyle.id, shape: 'rect' });
+        if (target) {
+          target.fill = parsedStyle.fill ?? target.fill;
+          target.stroke = parsedStyle.stroke ?? target.stroke;
+          target.textColor = parsedStyle.color ?? target.textColor;
+        }
+        continue;
+      }
+
+      const targetSubgraph = subgraphs.find((subgraph) => subgraph.id === parsedStyle.id);
+      if (targetSubgraph) {
+        targetSubgraph.fill = parsedStyle.fill ?? targetSubgraph.fill;
+        targetSubgraph.stroke = parsedStyle.stroke ?? targetSubgraph.stroke;
+        targetSubgraph.textColor = parsedStyle.color ?? targetSubgraph.textColor;
       }
       continue;
     }
@@ -654,6 +683,25 @@ export function serializeMermaidDocument(
   for (const node of styledNodes) {
     lines.push(
       `  style ${node.id} fill:${node.fill},stroke:${node.stroke},color:${node.textColor}`,
+    );
+  }
+
+  const styledSubgraphs = subgraphs
+    .map(normalizeSubgraphStyle)
+    .filter(
+      (subgraph) =>
+        subgraph.fill !== defaultSubgraphStyle.fill ||
+        subgraph.stroke !== defaultSubgraphStyle.stroke ||
+        subgraph.textColor !== defaultSubgraphStyle.textColor,
+    );
+
+  if (styledSubgraphs.length > 0 && styledNodes.length === 0) {
+    lines.push('');
+  }
+
+  for (const subgraph of styledSubgraphs) {
+    lines.push(
+      `  style ${subgraph.id} fill:${subgraph.fill},stroke:${subgraph.stroke},color:${subgraph.textColor}`,
     );
   }
 

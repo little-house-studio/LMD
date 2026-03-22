@@ -45,6 +45,9 @@ export interface GraphSubgraph {
   title: string;
   parentId: string | null;
   collapsed: boolean;
+  fill: string;
+  stroke: string;
+  textColor: string;
 }
 
 export interface LayoutSidecar {
