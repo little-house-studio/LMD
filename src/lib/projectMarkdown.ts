@@ -8,6 +8,7 @@ import type {
   GraphNode,
   GraphSubgraph,
   LayoutSidecar,
+  ProjectCompatExtras,
   ProjectCompatLayer,
 } from './types';
 
@@ -16,6 +17,8 @@ const PROJECT_VERSION = 1;
 const DEFAULT_VIEWPORT = createDefaultLayout().viewport;
 const EMPTY_PROJECT_MERMAID = `flowchart LR
   Start[Start]`;
+const CONTENT_SECTION_TITLE = 'Content';
+const NODE_ANNOTATIONS_SECTION_TITLE = 'Node Annotations';
 
 function normalizeLineEndings(value: string) {
   return value.replace(/\r\n/g, '\n');
@@ -188,7 +191,123 @@ function stripLeadingSummaryParagraph(source: string, summary: string) {
 
 function buildContentSection(content: string) {
   const trimmed = trimBlock(content);
-  return trimmed ? `## Content\n\n${trimmed}` : '## Content';
+  return trimmed ? `## ${CONTENT_SECTION_TITLE}\n\n${trimmed}` : `## ${CONTENT_SECTION_TITLE}`;
+}
+
+function parseNodeAnnotationsSection(markdown: string) {
+  const normalized = trimBlock(markdown);
+  if (!normalized) {
+    return {} as Record<string, string>;
+  }
+
+  const headingPattern = /^###\s+`?([^\n`]+?)`?\s*$/gm;
+  const matches = [...normalized.matchAll(headingPattern)];
+  if (matches.length > 0) {
+    return Object.fromEntries(
+      matches.flatMap((match, index) => {
+        const nodeId = trimBlock(match[1] ?? '');
+        if (!nodeId) {
+          return [];
+        }
+
+        const headingStart = match.index ?? 0;
+        const headingEnd = headingStart + match[0].length;
+        const nextStart = matches[index + 1]?.index ?? normalized.length;
+        const body = trimBlock(normalized.slice(headingEnd, nextStart).replace(/^\n+/, ''));
+        return body ? [[nodeId, body]] : [];
+      }),
+    );
+  }
+
+  return Object.fromEntries(
+    normalized
+      .split('\n')
+      .map((line) => line.match(/^\s*-\s+`?([^:`\n]+?)`?\s*:\s*(.+)$/))
+      .flatMap((match) => {
+        if (!match) {
+          return [];
+        }
+
+        const nodeId = trimBlock(match[1] ?? '');
+        const note = trimBlock(match[2] ?? '');
+        return nodeId && note ? [[nodeId, note]] : [];
+      }),
+  );
+}
+
+function buildNodeAnnotationsSection(nodeAnnotations: Record<string, string>) {
+  const entries = Object.entries(nodeAnnotations)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].trim().length > 0)
+    .sort((left, right) => left[0].localeCompare(right[0]));
+
+  if (entries.length === 0) {
+    return '';
+  }
+
+  const lines = [`## ${NODE_ANNOTATIONS_SECTION_TITLE}`, ''];
+  entries.forEach(([nodeId, note], index) => {
+    if (index > 0) {
+      lines.push('');
+    }
+    lines.push(`### \`${nodeId}\``);
+    lines.push('');
+    lines.push(trimBlock(note));
+  });
+
+  return lines.join('\n');
+}
+
+function extractSuffixSections(
+  suffixMarkdown: string,
+  legacyNodeNotes?: Record<string, string>,
+) {
+  const normalized = trimBlock(suffixMarkdown);
+  const { preamble, sections } = splitTopLevelSections(normalized);
+  const contentFragments: string[] = [];
+  const nodeAnnotations = {
+    ...(legacyNodeNotes ?? {}),
+  } as Record<string, string>;
+
+  if (preamble) {
+    contentFragments.push(preamble);
+  }
+
+  sections.forEach((section) => {
+    const key = section.title.trim().toLowerCase();
+    if (key === CONTENT_SECTION_TITLE.toLowerCase()) {
+      if (section.body) {
+        contentFragments.push(section.body);
+      }
+      return;
+    }
+
+    if (key === NODE_ANNOTATIONS_SECTION_TITLE.toLowerCase()) {
+      Object.assign(nodeAnnotations, parseNodeAnnotationsSection(section.body));
+      return;
+    }
+
+    contentFragments.push(rebuildSection(section.title, section.body));
+  });
+
+  return {
+    contentMarkdown: trimBlock(contentFragments.filter(Boolean).join('\n\n')),
+    nodeAnnotations: Object.fromEntries(
+      Object.entries(nodeAnnotations).filter((entry): entry is [string, string] =>
+        typeof entry[0] === 'string' &&
+        typeof entry[1] === 'string' &&
+        entry[1].trim().length > 0,
+      ),
+    ),
+  };
+}
+
+export function buildProjectSuffixMarkdown(content: string, nodeAnnotations: Record<string, string> = {}) {
+  const blocks = [buildContentSection(content)];
+  const annotationsSection = buildNodeAnnotationsSection(nodeAnnotations);
+  if (annotationsSection) {
+    blocks.push(annotationsSection);
+  }
+  return blocks.filter(Boolean).join('\n\n');
 }
 
 function createEmptyCompatLayer(fallbackLayout?: LayoutSidecar): ProjectCompatLayer {
@@ -286,7 +405,7 @@ function normalizeCompactCompatLayer(
   };
   let version = PROJECT_VERSION;
   let localFileActionsEnabled = true;
-  let extras: Record<string, unknown> | undefined;
+  let extras: ProjectCompatExtras | undefined;
 
   const segments = compactRaw.split(';').filter(Boolean);
   for (const segment of segments) {
@@ -336,6 +455,44 @@ function normalizeCompactCompatLayer(
       continue;
     }
 
+    if (segment.startsWith('cb=')) {
+      const values = segment.slice(3).split(',').map((value) => Number.parseFloat(value));
+      const [x, y, collapsed] = values;
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        extras = { ...(extras ?? {}), contentBox: Number.isFinite(collapsed) && collapsed >= 1 ? [x, y, 1] : [x, y] };
+      }
+      continue;
+    }
+
+    if (segment.startsWith('a=')) {
+      const entries = segment.slice(2).split('|').filter(Boolean);
+      const nodeNotes = Object.fromEntries(
+        entries.flatMap((entry) => {
+          const separatorIndex = entry.indexOf('~');
+          if (separatorIndex <= 0) {
+            return [];
+          }
+
+          const id = entry.slice(0, separatorIndex);
+          const encoded = entry.slice(separatorIndex + 1);
+          try {
+            const value = decodeURIComponent(encoded);
+            return value.trim() ? [[id, value]] : [];
+          } catch {
+            return [];
+          }
+        }),
+      );
+
+      if (Object.keys(nodeNotes).length > 0) {
+        extras = {
+          ...(extras ?? {}),
+          nodeNotes,
+        };
+      }
+      continue;
+    }
+
     if (segment.startsWith('e=')) {
       localFileActionsEnabled = segment.slice(2) !== '0';
       continue;
@@ -343,9 +500,12 @@ function normalizeCompactCompatLayer(
 
     if (segment.startsWith('j=')) {
       try {
-        extras = JSON.parse(decodeURIComponent(segment.slice(2))) as Record<string, unknown>;
+        extras = {
+          ...(extras ?? {}),
+          ...(JSON.parse(decodeURIComponent(segment.slice(2))) as ProjectCompatExtras),
+        };
       } catch {
-        extras = undefined;
+        extras = extras ?? undefined;
       }
     }
   }
@@ -420,12 +580,28 @@ function serializeCompactCompatLayer(input: {
     parts.push(`g=${collapsedGroups.join('|')}`);
   }
 
+  if (Array.isArray(input.compat.extras?.contentBox) && input.compat.extras.contentBox.length >= 2) {
+    const [x, y, collapsed] = input.compat.extras.contentBox;
+    parts.push(
+      `cb=${formatCompatNumber(x)},${formatCompatNumber(y)}${collapsed === 1 ? ',1' : ''}`,
+    );
+  }
+
   if (input.compat.editor?.localFileActions?.enabled === false) {
     parts.push('e=0');
   }
 
-  if (input.compat.extras && Object.keys(input.compat.extras).length > 0) {
-    parts.push(`j=${encodeURIComponent(JSON.stringify(input.compat.extras))}`);
+  const extraEntries = input.compat.extras
+    ? Object.fromEntries(
+      Object.entries(input.compat.extras).filter(([key, value]) =>
+        key !== 'contentBox' &&
+        value !== undefined,
+      ),
+    )
+    : {};
+
+  if (Object.keys(extraEntries).length > 0) {
+    parts.push(`j=${encodeURIComponent(JSON.stringify(extraEntries))}`);
   }
 
   return parts.join(';');
@@ -460,11 +636,20 @@ export function parseProjectMarkdown(
   }
 
   const prefixMarkdown = trimBlock(markdownWithoutCompat.slice(0, mermaidBlock.start));
-  const suffixMarkdown = trimBlock(markdownWithoutCompat.slice(mermaidBlock.end));
+  const legacyNodeNotes = compat.extras?.nodeNotes && typeof compat.extras.nodeNotes === 'object'
+    ? compat.extras.nodeNotes
+    : undefined;
+  const suffixSections = extractSuffixSections(trimBlock(markdownWithoutCompat.slice(mermaidBlock.end)), legacyNodeNotes);
+  const suffixMarkdown = buildProjectSuffixMarkdown(suffixSections.contentMarkdown, suffixSections.nodeAnnotations);
   const mermaidSource = mermaidBlock.body;
   const parsed = parseMermaidDocument(mermaidSource, compat.layout);
   const projectName = inferProjectName(prefixMarkdown, fallbackName);
   const projectSummary = inferProjectSummary(prefixMarkdown);
+  const compatExtras = compat.extras
+    ? Object.fromEntries(
+      Object.entries(compat.extras).filter(([key]) => key !== 'nodeNotes'),
+    )
+    : undefined;
 
   return {
     ...parsed,
@@ -478,6 +663,7 @@ export function parseProjectMarkdown(
       compat: {
         ...compat,
         layout: parsed.layout,
+        extras: compatExtras,
       },
       nodes: parsed.nodes,
       subgraphs: parsed.subgraphs,
@@ -486,9 +672,12 @@ export function parseProjectMarkdown(
     projectSummary,
     prefixMarkdown: prefixMarkdown || buildDefaultPrefix(projectName, projectSummary),
     suffixMarkdown,
+    contentMarkdown: suffixSections.contentMarkdown,
+    nodeAnnotations: suffixSections.nodeAnnotations,
     compat: {
       ...compat,
       layout: parsed.layout,
+      extras: compatExtras,
     },
   };
 }
@@ -515,10 +704,12 @@ export function standardizeProjectMarkdown(
   const summarySections = normalizedSections.filter((section) => section.key === 'summary');
   const diagramSections = normalizedSections.filter((section) => section.key === 'diagram');
   const contentSections = normalizedSections.filter((section) => section.key === 'content');
+  const annotationSections = normalizedSections.filter((section) => section.key === 'node annotations');
   const extraSections = normalizedSections.filter((section) =>
     section.key !== 'summary' &&
     section.key !== 'diagram' &&
-    section.key !== 'content',
+    section.key !== 'content' &&
+    section.key !== 'node annotations',
   );
 
   let mermaidSource = '';
@@ -585,6 +776,16 @@ export function standardizeProjectMarkdown(
     }
   });
 
+  const legacyNodeNotes = compat.extras?.nodeNotes && typeof compat.extras.nodeNotes === 'object'
+    ? compat.extras.nodeNotes
+    : undefined;
+  const nodeAnnotations = {
+    ...(legacyNodeNotes ?? {}),
+  } as Record<string, string>;
+  annotationSections.forEach((section) => {
+    Object.assign(nodeAnnotations, parseNodeAnnotationsSection(section.body));
+  });
+
   extraSections.forEach((section) => {
     contentFragments.push(rebuildSection(section.title, section.body));
   });
@@ -599,9 +800,14 @@ export function standardizeProjectMarkdown(
     projectName,
     projectSummary,
     prefixMarkdown: buildDefaultPrefix(projectName, projectSummary),
-    suffixMarkdown: buildContentSection(contentMarkdown),
+    suffixMarkdown: buildProjectSuffixMarkdown(contentMarkdown, nodeAnnotations),
     mermaidSource,
-    compat,
+    compat: {
+      ...compat,
+      extras: compat.extras
+        ? Object.fromEntries(Object.entries(compat.extras).filter(([key]) => key !== 'nodeNotes'))
+        : undefined,
+    },
     nodes: [],
     subgraphs: [],
   });
@@ -614,6 +820,8 @@ export function serializeProjectMarkdown(input: {
   projectSummary: string;
   prefixMarkdown?: string;
   suffixMarkdown?: string;
+  contentMarkdown?: string;
+  nodeAnnotations?: Record<string, string>;
   mermaidSource: string;
   compat: ProjectCompatLayer;
   nodes?: GraphNode[];
@@ -623,7 +831,17 @@ export function serializeProjectMarkdown(input: {
     input.projectName,
     input.projectSummary,
   );
-  const suffix = trimBlock(input.suffixMarkdown ?? '');
+  const normalizedNodeAnnotations = Object.fromEntries(
+    Object.entries(input.nodeAnnotations ?? {}).filter((entry): entry is [string, string] =>
+      typeof entry[0] === 'string' &&
+      typeof entry[1] === 'string' &&
+      entry[1].trim().length > 0,
+    ),
+  );
+  const suffixSource = input.contentMarkdown !== undefined || Object.keys(normalizedNodeAnnotations).length > 0
+    ? buildProjectSuffixMarkdown(input.contentMarkdown ?? '', normalizedNodeAnnotations)
+    : trimBlock(input.suffixMarkdown ?? '');
+  const suffix = trimBlock(suffixSource);
   const compat = {
     version: input.compat.version ?? PROJECT_VERSION,
     layout: input.compat.layout,
@@ -669,7 +887,8 @@ export function createProjectMarkdownTemplate(projectName: string, mermaidSource
     projectName,
     projectSummary,
     prefixMarkdown: buildDefaultPrefix(projectName, projectSummary),
-    suffixMarkdown: '## Content\n',
+    contentMarkdown: '',
+    nodeAnnotations: {},
     mermaidSource,
     compat,
     nodes: [],

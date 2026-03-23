@@ -57,6 +57,12 @@ export interface LayoutSidecar {
   subgraphs: Record<string, { collapsed: boolean }>;
 }
 
+export interface ProjectCompatExtras {
+  contentBox?: [number, number] | [number, number, 1];
+  nodeNotes?: Record<string, string>;
+  [key: string]: unknown;
+}
+
 export interface ProjectCompatLayer {
   version: number;
   layout: LayoutSidecar;
@@ -65,7 +71,7 @@ export interface ProjectCompatLayer {
       enabled: boolean;
     };
   };
-  extras?: Record<string, unknown>;
+  extras?: ProjectCompatExtras;
 }
 
 export interface GraphDocument {
@@ -82,6 +88,8 @@ export interface GraphDocument {
   projectSummary?: string;
   prefixMarkdown?: string;
   suffixMarkdown?: string;
+  contentMarkdown?: string;
+  nodeAnnotations?: Record<string, string>;
   compat?: ProjectCompatLayer;
 }
 
@@ -98,6 +106,7 @@ export interface GraphSemanticSnapshot {
       id: string;
       label: string;
       subgraphId: string | null;
+      annotation?: string;
     }>;
     edges: Array<{
       id: string;
@@ -139,6 +148,11 @@ export type GraphOperation =
       type: 'updateNodeLabel';
       nodeId: string;
       label: string;
+    }
+  | {
+      type: 'updateNodeAnnotation';
+      nodeId: string;
+      annotation: string;
     }
   | {
       type: 'deleteNode';

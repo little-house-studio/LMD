@@ -21,6 +21,7 @@ import {
   serializeMermaidDocument,
 } from './lib/mermaid';
 import {
+  buildProjectSuffixMarkdown,
   createProjectMarkdownTemplate,
   extractMermaidFromProjectMarkdown,
   parseProjectMarkdown,
@@ -42,6 +43,7 @@ import type {
   HistoryEntry,
   LayoutSidecar,
   NodeShape,
+  ProjectCompatExtras,
   SelectionState,
   ViewportState,
 } from './lib/types';
@@ -75,6 +77,7 @@ interface DragState {
   current: Point;
   ids: string[];
   initialPositions: Record<string, Point>;
+  entityId?: string | null;
 }
 
 interface BoxState {
@@ -144,6 +147,12 @@ interface MiniMapDragState {
   grabOffsetY: number;
 }
 
+interface PanelResizeState {
+  side: 'left' | 'right';
+  startX: number;
+  startWidth: number;
+}
+
 interface NodeClipboardState {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -151,6 +160,14 @@ interface NodeClipboardState {
 
 const PINCH_RESPONSE = 1.3;
 const WHEEL_PINCH_DIVISOR = 360;
+const NAV_RAIL_WIDTH = 38;
+const DEFAULT_SIDEBAR_WIDTH = 188;
+const DEFAULT_INSPECTOR_WIDTH = 176;
+const MIN_SIDEBAR_WIDTH = 164;
+const MIN_INSPECTOR_WIDTH = 156;
+const MAX_SIDEBAR_WIDTH = 280;
+const MAX_INSPECTOR_WIDTH = 248;
+const MIN_WORKSPACE_CENTER_WIDTH = 360;
 const SUBGRAPH_HEADER_HEIGHT = 42;
 const SUBGRAPH_MIN_WIDTH = 284;
 const SUBGRAPH_MIN_HEIGHT = 176;
@@ -206,6 +223,7 @@ interface LocalHandleEntry {
 
 interface NodeInspectorDraft {
   label: string;
+  annotation: string;
   shape: NodeShape;
   fill: string;
   stroke: string;
@@ -233,6 +251,10 @@ interface AiSettingsDraft {
   model: string;
   contextWindow: number;
   systemPrompt: string;
+  lockProjectMeta: boolean;
+  lockAdditionalInfo: boolean;
+  lockAnnotations: boolean;
+  lockDiagram: boolean;
 }
 
 interface AiMessage {
@@ -243,6 +265,7 @@ interface AiMessage {
 }
 
 type AiPanelTab = 'chat' | 'settings';
+type InspectorView = 'properties' | 'ai';
 
 type IconName =
   | 'menu'
@@ -424,28 +447,39 @@ const desktopCommandGroups = [
 ] as const;
 
 const defaultAiSettings: AiSettingsDraft = {
-  apiKey: 'sk-UiIS0INPg3p98EgKD6365410B8C240329599815bF9B0673f',
+  apiKey: '',
   apiUrl: 'https://api.gpt.ge/v1/chat/completions',
   model: 'gpt-5.4-mini',
   contextWindow: 200000,
   systemPrompt:
-    'You are the internal assistant for a Mermaid and Markdown workspace. Use the current graph semantic snapshot and full project markdown as the primary context. Be concise, practical, and grounded in the provided workspace state.',
+    'You are the internal assistant for an LMD workspace. LMD is a single-file Markdown format for Mermaid-based projects. Use the current graph semantic snapshot and the latest full LMD document as the primary context. Be concise, practical, and grounded in the provided workspace state. Unless the request requires it, avoid changing already-written text. Prefer targeted edits over refactors. Prefer creating groups, and nested groups when they improve clarity. If node annotations exist, preserve them unless the request clearly requires updating them.',
+  lockProjectMeta: true,
+  lockAdditionalInfo: true,
+  lockAnnotations: true,
+  lockDiagram: false,
 };
 
 const defaultAiMessages: AiMessage[] = [
   {
     id: 'ai-welcome',
     role: 'assistant',
-    content: 'AI 验证入口已打开。现在会附带完整工程 Markdown、相对上一轮的改动、当前选中内容，并允许 AI 调用本地工具修改文档。',
+    content: 'AI 验证入口已打开。现在会附带完整 LMD 文档、Node Annotations、相对上一轮的改动、当前选中内容，并允许 AI 调用本地工具修改文档。',
   },
 ];
+
+const aiLockControls = [
+  { key: 'lockProjectMeta', label: '标题 / 简介', unlocked: '允许修改标题与简介' },
+  { key: 'lockAdditionalInfo', label: '附加信息', unlocked: '允许修改附加信息' },
+  { key: 'lockAnnotations', label: '节点注释', unlocked: '允许修改节点注释' },
+  { key: 'lockDiagram', label: '流程图', unlocked: '允许修改流程图' },
+] as const;
 
 const aiToolDefinitions = [
   {
     type: 'function',
     function: {
       name: 'get_graph_semantic_snapshot',
-      description: 'Read the current semantic graph snapshot without layout or style details.',
+      description: 'Read the current semantic LMD project snapshot, including Project Name, Summary, Additional Information, nodes, edges, subgraphs, current selection, and node annotations, without layout or style details.',
       parameters: {
         type: 'object',
         properties: {},
@@ -457,7 +491,7 @@ const aiToolDefinitions = [
     type: 'function',
     function: {
       name: 'apply_graph_operation_batch',
-      description: 'Apply structured graph operations to nodes, edges, subgraphs, project meta, or additional information.',
+      description: 'Apply structured semantic operations to the current LMD document. Supported operations include project meta updates, Additional Information updates, node label updates, node annotation updates, edge label updates, subgraph updates, and node/subgraph structural edits.',
       parameters: {
         type: 'object',
         properties: {
@@ -486,7 +520,7 @@ const aiToolDefinitions = [
     type: 'function',
     function: {
       name: 'get_project_markdown',
-      description: 'Read the latest full project markdown file.',
+      description: 'Read the latest full LMD document, including Project Name, Summary, Diagram, Additional Information, Node Annotations, and lths-compat.',
       parameters: {
         type: 'object',
         properties: {},
@@ -498,7 +532,7 @@ const aiToolDefinitions = [
     type: 'function',
     function: {
       name: 'set_project_markdown',
-      description: 'Write the full markdown file and normalize it into the current single-file project structure.',
+      description: 'Write the full LMD document and normalize it into the current structure: Project Name, Summary, Diagram, Content, Node Annotations, and lths-compat.',
       parameters: {
         type: 'object',
         properties: {
@@ -516,9 +550,28 @@ const aiToolDefinitions = [
 const aiToolRules = [
   'Prefer tools over guesswork whenever the user asks to change the document.',
   'Prefer apply_graph_operation_batch for structural diagram edits.',
+  'Use updateNodeAnnotation operations when the request is specifically about node annotations.',
+  'Treat the project as an LMD document: a single Markdown file with the sections Project Name, Summary, Diagram, Content, Node Annotations, and a final lths-compat block.',
+  'Prefer the smallest valid layer: graph operations first, section-preserving Markdown edits second, full rewrites last.',
+  'Do not invent new top-level sections unless the user explicitly asks for them.',
+  'Prefer preserving the existing section structure instead of rewriting the whole file.',
   'Use set_project_markdown only for broader Markdown rewrites or when the batch tool cannot express the change cleanly.',
   'Treat the current selection as the primary scope unless the user clearly asks for a wider change.',
   'After editing, briefly summarize what changed.',
+].join('\n');
+
+const aiProjectFormatGuide = [
+  'LMD document format:',
+  'LMD stands for a single-file Markdown document used by this editor.',
+  '1. `# Project Name`',
+  '2. `## Summary`',
+  '3. `## Diagram` with one standard ```mermaid``` block',
+  '4. `## Content` for Additional Information Markdown',
+  '5. `## Node Annotations` for node-level notes, keyed by `### `NodeId`` headings',
+  '6. final ```lths-compat``` block for editor-only layout state',
+  'The Mermaid block should stay standard Mermaid syntax.',
+  'Node annotations live in Markdown, not inside Mermaid node syntax.',
+  'Edit the smallest valid layer possible. Prefer section-preserving changes over full rewrites.',
 ].join('\n');
 
 function readStoredJson<T>(key: string, fallback: T): T {
@@ -551,6 +604,20 @@ function readStoredArray<T>(key: string, fallback: T[]) {
 
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed as T[] : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function readStoredNumber(key: string, fallback: number) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) {
+      return fallback;
+    }
+
+    const parsed = Number.parseFloat(raw);
+    return Number.isFinite(parsed) ? parsed : fallback;
   } catch {
     return fallback;
   }
@@ -879,6 +946,9 @@ function materializeDocument(candidate: GraphDocument): GraphDocument {
   );
   const projectName = candidate.projectName ?? 'Untitled Project';
   const projectSummary = candidate.projectSummary ?? '';
+  const contentMarkdown = normalizeContentMarkdown(candidate.contentMarkdown ?? extractContentMarkdown(candidate.suffixMarkdown));
+  const nodeAnnotations = sanitizeNodeAnnotations(candidate.nodeAnnotations ?? getNodeAnnotationMap(candidate), candidate.nodes);
+  const extras = sanitizeCompatExtras(candidate.compat?.extras, candidate.nodes);
   const compat = {
     version: candidate.compat?.version ?? 1,
     layout,
@@ -887,13 +957,14 @@ function materializeDocument(candidate: GraphDocument): GraphDocument {
         enabled: candidate.compat?.editor?.localFileActions?.enabled ?? true,
       },
     },
-    extras: candidate.compat?.extras,
+    extras,
   };
   const markdown = serializeProjectMarkdown({
     projectName,
     projectSummary,
     prefixMarkdown: candidate.prefixMarkdown,
-    suffixMarkdown: candidate.suffixMarkdown,
+    contentMarkdown,
+    nodeAnnotations,
     mermaidSource: source,
     compat,
     nodes: candidate.nodes,
@@ -909,7 +980,9 @@ function materializeDocument(candidate: GraphDocument): GraphDocument {
     projectName,
     projectSummary,
     prefixMarkdown: candidate.prefixMarkdown ?? '',
-    suffixMarkdown: candidate.suffixMarkdown ?? '',
+    suffixMarkdown: buildProjectSuffixMarkdown(contentMarkdown, nodeAnnotations),
+    contentMarkdown,
+    nodeAnnotations,
     compat,
   };
 }
@@ -1208,11 +1281,6 @@ function extractContentMarkdown(suffixMarkdown?: string) {
   return trimMultilineBlock(match?.[1] ?? normalized);
 }
 
-function buildContentSuffixMarkdown(content: string) {
-  const trimmed = trimMultilineBlock(content);
-  return trimmed ? `## Content\n\n${trimmed}` : '## Content';
-}
-
 function normalizeContentMarkdown(markdown: string) {
   return markdown
     .replace(/&lt;br\s*\/?&gt;/gi, '\n')
@@ -1431,26 +1499,84 @@ function getContentCardLayout(document: GraphDocument, size: { width: number; he
   const raw = document.compat?.extras && typeof document.compat.extras === 'object'
     ? (document.compat.extras as Record<string, unknown>).contentBox
     : null;
-
-  if (Array.isArray(raw) && raw.length >= 2) {
-    const [x, y, collapsed] = raw;
-    if (typeof x === 'number' && typeof y === 'number') {
-      return { x, y, collapsed: collapsed === 1 || collapsed === true };
-    }
-  }
+  const collapsed = Array.isArray(raw) && raw.length >= 3 && (raw[2] === 1 || raw[2] === true);
 
   if (document.nodes.length === 0) {
-    return { x: 120, y: 120, collapsed: false };
+    return { x: 56, y: 56, collapsed };
   }
 
-  const maxX = Math.max(...document.nodes.map((node) => node.x + node.width));
+  const minX = Math.min(...document.nodes.map((node) => node.x));
   const minY = Math.min(...document.nodes.map((node) => node.y));
 
   return {
-    x: Math.max(60, maxX + 120),
-    y: Math.max(60, minY - Math.min(40, size.height * 0.15)),
-    collapsed: false,
+    x: Math.min(56, Math.max(32, minX - size.width - 68)),
+    y: Math.min(56, Math.max(32, minY - 24)),
+    collapsed,
   };
+}
+
+function getNodeAnnotationMap(document: GraphDocument) {
+  const raw = document.nodeAnnotations ?? document.compat?.extras?.nodeNotes;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {} as Record<string, string>;
+  }
+
+  return Object.fromEntries(
+    Object.entries(raw).filter((entry): entry is [string, string] =>
+      typeof entry[0] === 'string' &&
+      typeof entry[1] === 'string' &&
+      entry[1].trim().length > 0,
+    ),
+  );
+}
+
+function sanitizeNodeAnnotations(
+  nodeAnnotations: Record<string, string> | undefined,
+  nodes: GraphNode[],
+) {
+  if (!nodeAnnotations) {
+    return {} as Record<string, string>;
+  }
+
+  const existingNodeIds = new Set(nodes.map((node) => node.id));
+  return Object.fromEntries(
+    Object.entries(nodeAnnotations).filter((entry): entry is [string, string] =>
+      existingNodeIds.has(entry[0]) &&
+      typeof entry[1] === 'string' &&
+      entry[1].trim().length > 0,
+    ),
+  );
+}
+
+function sanitizeCompatExtras(
+  extras: ProjectCompatExtras | undefined,
+  nodes: GraphNode[],
+): ProjectCompatExtras | undefined {
+  if (!extras) {
+    return undefined;
+  }
+
+  const nextExtras: ProjectCompatExtras = {};
+
+  if (Array.isArray(extras.contentBox)) {
+    nextExtras.contentBox = extras.contentBox;
+  }
+
+  if (extras.nodeNotes && typeof extras.nodeNotes === 'object' && !Array.isArray(extras.nodeNotes)) {
+    const filteredNodeNotes = sanitizeNodeAnnotations(extras.nodeNotes, nodes);
+    if (Object.keys(filteredNodeNotes).length > 0) {
+      nextExtras.nodeNotes = filteredNodeNotes;
+    }
+  }
+
+  Object.entries(extras).forEach(([key, value]) => {
+    if (key === 'contentBox' || key === 'nodeNotes') {
+      return;
+    }
+    nextExtras[key] = value;
+  });
+
+  return Object.keys(nextExtras).length > 0 ? nextExtras : undefined;
 }
 
 function withContentCardLayout(document: GraphDocument, layout: ContentCardLayout): GraphDocument {
@@ -1468,9 +1594,7 @@ function withContentCardLayout(document: GraphDocument, layout: ContentCardLayou
       ...compat,
       extras: {
         ...(compat.extras ?? {}),
-        contentBox: layout.collapsed
-          ? [Math.round(layout.x), Math.round(layout.y), 1]
-          : [Math.round(layout.x), Math.round(layout.y)],
+        contentBox: layout.collapsed ? [56, 56, 1] : [56, 56],
       },
     },
   };
@@ -1481,12 +1605,13 @@ function buildGraphSemanticSnapshotFromDocument(
   selection: SelectionState,
   revision: number,
 ): GraphSemanticSnapshot {
+  const nodeNotes = getNodeAnnotationMap(document);
   return {
     revision,
     project: {
       name: document.projectName?.trim() || 'Untitled Project',
       summary: trimMultilineBlock(document.projectSummary ?? ''),
-      content: normalizeContentMarkdown(extractContentMarkdown(document.suffixMarkdown)),
+      content: normalizeContentMarkdown(document.contentMarkdown ?? extractContentMarkdown(document.suffixMarkdown)),
     },
     diagram: {
       direction: document.direction,
@@ -1494,6 +1619,7 @@ function buildGraphSemanticSnapshotFromDocument(
         id: node.id,
         label: node.label,
         subgraphId: node.subgraphId,
+        annotation: nodeNotes[node.id],
       })),
       edges: document.edges.map((edge) => ({
         id: edge.id,
@@ -1560,6 +1686,105 @@ function buildAiHistoryContext(messages: AiMessage[]) {
   return visibleMessages
     .map((message) => `${message.role === 'assistant' ? 'Assistant' : 'User'}: ${message.content}`)
     .join('\n\n');
+}
+
+function buildAiLockRules(settings: AiSettingsDraft) {
+  const lines = [
+    settings.lockProjectMeta
+      ? 'Do not modify Project Name or Summary.'
+      : 'Project Name and Summary may be modified if needed.',
+    settings.lockAdditionalInfo
+      ? 'Do not modify Additional Information.'
+      : 'Additional Information may be modified if needed.',
+    settings.lockAnnotations
+      ? 'Do not modify node annotations except to remove annotations of nodes that are deleted.'
+      : 'Node annotations may be modified if needed.',
+    settings.lockDiagram
+      ? 'Do not modify the flowchart structure.'
+      : 'The flowchart structure may be modified if needed.',
+  ];
+
+  return lines.join('\n');
+}
+
+function isDiagramOperation(operation: GraphOperation) {
+  return (
+    operation.type !== 'updateProjectMeta' &&
+    operation.type !== 'updateContentMarkdown' &&
+    operation.type !== 'updateNodeAnnotation'
+  );
+}
+
+function filterGraphOperationsByAiLocks(
+  operations: GraphOperation[],
+  settings: AiSettingsDraft,
+) {
+  const warnings: string[] = [];
+  const nextOperations = operations.filter((operation) => {
+    if (settings.lockProjectMeta && operation.type === 'updateProjectMeta') {
+      warnings.push('Blocked project title/summary update because the Project Meta lock is enabled.');
+      return false;
+    }
+
+    if (settings.lockAdditionalInfo && operation.type === 'updateContentMarkdown') {
+      warnings.push('Blocked Additional Information update because the Additional Information lock is enabled.');
+      return false;
+    }
+
+    if (settings.lockAnnotations && operation.type === 'updateNodeAnnotation') {
+      warnings.push('Blocked node annotation update because the Node Annotation lock is enabled.');
+      return false;
+    }
+
+    if (settings.lockDiagram && isDiagramOperation(operation)) {
+      warnings.push(`Blocked ${operation.type} because the Flowchart lock is enabled.`);
+      return false;
+    }
+
+    return true;
+  });
+
+  return {
+    operations: nextOperations,
+    warnings,
+  };
+}
+
+function applyAiLocksToMarkdown(
+  parsed: GraphDocument,
+  current: GraphDocument,
+  settings: AiSettingsDraft,
+) {
+  const nextCandidate = structuredClone(parsed);
+
+  if (settings.lockProjectMeta) {
+    nextCandidate.projectName = current.projectName;
+    nextCandidate.projectSummary = current.projectSummary;
+    nextCandidate.prefixMarkdown = buildProjectPrefixMarkdown(
+      current.projectName ?? 'Untitled Project',
+      current.projectSummary ?? '',
+    );
+  }
+
+  if (settings.lockAdditionalInfo) {
+    nextCandidate.contentMarkdown = current.contentMarkdown;
+  }
+
+  if (settings.lockAnnotations) {
+    nextCandidate.nodeAnnotations = sanitizeNodeAnnotations(current.nodeAnnotations, nextCandidate.nodes);
+  }
+
+  if (settings.lockDiagram) {
+    nextCandidate.direction = current.direction;
+    nextCandidate.nodes = structuredClone(current.nodes);
+    nextCandidate.edges = structuredClone(current.edges);
+    nextCandidate.subgraphs = structuredClone(current.subgraphs);
+    nextCandidate.warnings = structuredClone(current.warnings);
+    nextCandidate.unsupportedLines = structuredClone(current.unsupportedLines);
+    nextCandidate.layout = structuredClone(current.layout);
+  }
+
+  return nextCandidate;
 }
 
 function buildCompactLineDiff(previous: string, current: string) {
@@ -1630,6 +1855,7 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
   }
 
   if (selection.kind === 'node') {
+    const nodeAnnotations = getNodeAnnotationMap(document);
     return JSON.stringify({
       kind: 'node',
       items: document.nodes
@@ -1638,6 +1864,7 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
           id: node.id,
           label: node.label,
           subgraphId: node.subgraphId,
+          annotation: nodeAnnotations[node.id] ?? '',
         })),
     }, null, 2);
   }
@@ -1677,7 +1904,7 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
   return JSON.stringify({
     kind: 'content',
     title: 'Additional Information',
-    markdown: normalizeContentMarkdown(extractContentMarkdown(document.suffixMarkdown)),
+    markdown: normalizeContentMarkdown(document.contentMarkdown ?? extractContentMarkdown(document.suffixMarkdown)),
     id: CONTENT_CARD_ID,
   }, null, 2);
 }
@@ -2792,6 +3019,270 @@ function findSubgraphDropTarget(
     })[0]?.id ?? null;
 }
 
+function findNodeDropTarget(
+  nodes: GraphNode[],
+  point: Point,
+  excludedIds: string[] = [],
+) {
+  const excluded = new Set(excludedIds);
+
+  return [...nodes]
+    .filter((node) => !excluded.has(node.id))
+    .filter((node) => pointInRect(point, node, 8))
+    .sort((left, right) => left.width * left.height - right.width * right.height)[0]?.id ?? null;
+}
+
+function distancePointToSegment(point: Point, start: Point, end: Point) {
+  const deltaX = end.x - start.x;
+  const deltaY = end.y - start.y;
+  const lengthSquared = deltaX * deltaX + deltaY * deltaY;
+
+  if (lengthSquared === 0) {
+    return Math.hypot(point.x - start.x, point.y - start.y);
+  }
+
+  const ratio = clamp(
+    ((point.x - start.x) * deltaX + (point.y - start.y) * deltaY) / lengthSquared,
+    0,
+    1,
+  );
+  const projection = {
+    x: start.x + deltaX * ratio,
+    y: start.y + deltaY * ratio,
+  };
+
+  return Math.hypot(point.x - projection.x, point.y - projection.y);
+}
+
+function distancePointToEdgeGeometry(
+  point: Point,
+  geometry: ReturnType<typeof buildEdgeGeometry>,
+) {
+  const samples = sampleCubic(
+    geometry.start,
+    geometry.controlA,
+    geometry.controlB,
+    geometry.end,
+    20,
+  );
+
+  let minDistance = Number.POSITIVE_INFINITY;
+  for (let index = 1; index < samples.length; index += 1) {
+    minDistance = Math.min(
+      minDistance,
+      distancePointToSegment(point, samples[index - 1], samples[index]),
+    );
+  }
+
+  return minDistance;
+}
+
+function findEdgeDropTarget(
+  point: Point,
+  edges: GraphEdge[],
+  endpointMap: Map<string, EdgeEndpointBox>,
+  laneMap: Map<string, number>,
+  endpointOffsets: Map<string, { from: number; to: number }>,
+  excludedEndpointIds: string[] = [],
+) {
+  const excluded = new Set(excludedEndpointIds);
+  let bestMatch: { edgeId: string; distance: number } | null = null;
+
+  for (const edge of edges) {
+    if (excluded.has(edge.from) || excluded.has(edge.to)) {
+      continue;
+    }
+
+    const fromEndpoint = endpointMap.get(edge.from);
+    const toEndpoint = endpointMap.get(edge.to);
+    if (!fromEndpoint || !toEndpoint) {
+      continue;
+    }
+
+    const geometry = buildEdgeGeometry(
+      fromEndpoint,
+      toEndpoint,
+      laneMap.get(edge.id) ?? 0,
+      endpointOffsets.get(edge.id),
+    );
+    const distance = distancePointToEdgeGeometry(point, geometry);
+    if (distance > 18) {
+      continue;
+    }
+
+    if (!bestMatch || distance < bestMatch.distance) {
+      bestMatch = { edgeId: edge.id, distance };
+    }
+  }
+
+  return bestMatch?.edgeId ?? null;
+}
+
+function offsetMovedNodes(
+  nodes: GraphNode[],
+  movedIds: string[],
+  offsetX: number,
+  offsetY: number,
+) {
+  const movedSet = new Set(movedIds);
+  return nodes.map((node) =>
+    movedSet.has(node.id)
+      ? {
+          ...node,
+          x: Math.round(node.x + offsetX),
+          y: Math.round(node.y + offsetY),
+        }
+      : node,
+  );
+}
+
+function centerMovedNodesOnPoint(
+  nodes: GraphNode[],
+  movedIds: string[],
+  point: Point,
+) {
+  const movedSet = new Set(movedIds);
+  const movedNodes = nodes.filter((node) => movedSet.has(node.id));
+  const bounds = buildSelectionBounds(movedNodes);
+  if (!bounds) {
+    return nodes;
+  }
+
+  const offsetX = point.x - (bounds.x + bounds.width / 2);
+  const offsetY = point.y - (bounds.y + bounds.height / 2);
+  return offsetMovedNodes(nodes, movedIds, offsetX, offsetY);
+}
+
+function createSubgraphFromNode(node: GraphNode): GraphSubgraph {
+  return {
+    id: node.id,
+    title: node.label,
+    parentId: node.subgraphId,
+    collapsed: false,
+    fill: node.fill,
+    stroke: node.stroke,
+    textColor: node.textColor,
+  };
+}
+
+function createNodeFromSubgraph(
+  subgraph: GraphSubgraph,
+  frame: Pick<SubgraphFrame, 'x' | 'y' | 'width' | 'height'>,
+): GraphNode {
+  const size = measureNodeContentSize(subgraph.title);
+  return {
+    id: subgraph.id,
+    label: subgraph.title,
+    shape: 'rect',
+    x: Math.round(frame.x + (frame.width - size.width) / 2),
+    y: Math.round(frame.y + (frame.height - size.height) / 2),
+    width: size.width,
+    height: size.height,
+    fill: subgraph.fill,
+    stroke: subgraph.stroke,
+    textColor: subgraph.textColor,
+    subgraphId: subgraph.parentId,
+  };
+}
+
+function maybeConvertSourceSubgraphsToNodes(
+  previousDocument: GraphDocument,
+  nextDocument: GraphDocument,
+  movedNodeIds: string[],
+) {
+  const candidateIds = [...new Set(
+    previousDocument.nodes
+      .filter((node) => movedNodeIds.includes(node.id))
+      .map((node) => node.subgraphId)
+      .filter((value): value is string => Boolean(value)),
+  )];
+
+  if (candidateIds.length === 0) {
+    return nextDocument;
+  }
+
+  const previousLookup = getVisibleSubgraphIds(previousDocument.subgraphs);
+  const previousFrameMap = new Map(
+    buildSubgraphFrames(previousDocument, previousDocument.nodes).map((frame) => [frame.id, frame]),
+  );
+  let workingDocument = nextDocument;
+
+  candidateIds.forEach((subgraphId) => {
+    const previousSubgraph = previousDocument.subgraphs.find((entry) => entry.id === subgraphId);
+    if (!previousSubgraph) {
+      return;
+    }
+
+    if (previousDocument.subgraphs.some((entry) => entry.parentId === subgraphId)) {
+      return;
+    }
+
+    if (countNodesInSubgraph(previousDocument.nodes, subgraphId, previousLookup) !== 1) {
+      return;
+    }
+
+    const workingLookup = getVisibleSubgraphIds(workingDocument.subgraphs);
+    if (
+      !workingDocument.subgraphs.some((entry) => entry.id === subgraphId) ||
+      countNodesInSubgraph(workingDocument.nodes, subgraphId, workingLookup) !== 0
+    ) {
+      return;
+    }
+
+    const frame = previousFrameMap.get(subgraphId);
+    if (!frame) {
+      return;
+    }
+
+    workingDocument = {
+      ...workingDocument,
+      subgraphs: workingDocument.subgraphs.filter((entry) => entry.id !== subgraphId),
+      nodes: [
+        ...workingDocument.nodes,
+        createNodeFromSubgraph(previousSubgraph, frame),
+      ],
+    };
+  });
+
+  return workingDocument;
+}
+
+function insertDraggedEndpointIntoEdge(
+  document: GraphDocument,
+  edgeId: string,
+  insertedId: string,
+) {
+  const targetEdge = document.edges.find((edge) => edge.id === edgeId);
+  if (!targetEdge || targetEdge.from === insertedId || targetEdge.to === insertedId) {
+    return document;
+  }
+
+  const nextEdges = document.edges.flatMap((edge) => {
+    if (edge.id !== edgeId) {
+      return [edge];
+    }
+
+    return [
+      {
+        ...edge,
+        to: insertedId,
+      },
+      {
+        ...edge,
+        id: crypto.randomUUID(),
+        from: insertedId,
+        to: edge.to,
+        label: '',
+      },
+    ];
+  });
+
+  return {
+    ...document,
+    edges: nextEdges,
+  };
+}
+
 function buildCollisionObstacles(
   document: GraphDocument,
   nodes: GraphNode[],
@@ -2859,6 +3350,636 @@ function searchFreeRect(
   }
 
   return desired;
+}
+
+function isPrimaryVertical(direction: Direction) {
+  return direction === 'TD' || direction === 'BT';
+}
+
+function isPrimaryReversed(direction: Direction) {
+  return direction === 'RL' || direction === 'BT';
+}
+
+function getNodePrimaryStart(node: GraphNode, direction: Direction) {
+  return isPrimaryVertical(direction) ? node.y : node.x;
+}
+
+function getNodeMinorStart(node: GraphNode, direction: Direction) {
+  return isPrimaryVertical(direction) ? node.x : node.y;
+}
+
+function getNodePrimarySize(node: GraphNode, direction: Direction) {
+  return isPrimaryVertical(direction) ? node.height : node.width;
+}
+
+function getNodeMinorSize(node: GraphNode, direction: Direction) {
+  return isPrimaryVertical(direction) ? node.width : node.height;
+}
+
+function withNodeAxisPosition(node: GraphNode, direction: Direction, primary: number, minor: number) {
+  return isPrimaryVertical(direction)
+    ? { ...node, x: Math.round(minor), y: Math.round(primary) }
+    : { ...node, x: Math.round(primary), y: Math.round(minor) };
+}
+
+function buildSubgraphPathKey(
+  subgraphId: string | null,
+  lookup: Map<string, GraphSubgraph>,
+) {
+  const path: string[] = [];
+  let current = subgraphId;
+
+  while (current) {
+    const subgraph = lookup.get(current);
+    if (!subgraph) {
+      break;
+    }
+    path.unshift(subgraph.title || subgraph.id);
+    current = subgraph.parentId;
+  }
+
+  return path.join(' / ');
+}
+
+function buildNodeDegreeMap(document: GraphDocument) {
+  const degrees = new Map(document.nodes.map((node) => [node.id, 0]));
+  const nodeIdSet = new Set(document.nodes.map((node) => node.id));
+
+  document.edges.forEach((edge) => {
+    if (nodeIdSet.has(edge.from)) {
+      degrees.set(edge.from, (degrees.get(edge.from) ?? 0) + 1);
+    }
+    if (nodeIdSet.has(edge.to)) {
+      degrees.set(edge.to, (degrees.get(edge.to) ?? 0) + 1);
+    }
+  });
+
+  return degrees;
+}
+
+function buildSemanticLayoutEdges(document: GraphDocument) {
+  const nodeIdSet = new Set(document.nodes.map((node) => node.id));
+  const subgraphLookup = getVisibleSubgraphIds(document.subgraphs);
+  const degreeMap = buildNodeDegreeMap(document);
+  const representativeCache = new Map<string, string | null>();
+  const direction = document.direction;
+
+  const resolveEndpointNode = (endpointId: string) => {
+    if (nodeIdSet.has(endpointId)) {
+      return endpointId;
+    }
+
+    if (representativeCache.has(endpointId)) {
+      return representativeCache.get(endpointId) ?? null;
+    }
+
+    const candidates = document.nodes
+      .filter((node) => belongsToSubgraph(node, endpointId, subgraphLookup))
+      .sort((left, right) => {
+        const degreeDelta = (degreeMap.get(right.id) ?? 0) - (degreeMap.get(left.id) ?? 0);
+        if (degreeDelta !== 0) {
+          return degreeDelta;
+        }
+
+        const primaryDelta = getNodePrimaryStart(left, direction) - getNodePrimaryStart(right, direction);
+        if (primaryDelta !== 0) {
+          return primaryDelta;
+        }
+
+        const minorDelta = getNodeMinorStart(left, direction) - getNodeMinorStart(right, direction);
+        if (minorDelta !== 0) {
+          return minorDelta;
+        }
+
+        return left.id.localeCompare(right.id);
+      });
+
+    const representative = candidates[0]?.id ?? null;
+    representativeCache.set(endpointId, representative);
+    return representative;
+  };
+
+  const deduped = new Map<string, { from: string; to: string }>();
+
+  document.edges.forEach((edge) => {
+    const from = resolveEndpointNode(edge.from);
+    const to = resolveEndpointNode(edge.to);
+    if (!from || !to || from === to) {
+      return;
+    }
+
+    deduped.set(`${from}->${to}`, { from, to });
+  });
+
+  return [...deduped.values()];
+}
+
+function computeStronglyConnectedComponents(nodeIds: string[], edges: Array<{ from: string; to: string }>) {
+  const adjacency = new Map(nodeIds.map((nodeId) => [nodeId, [] as string[]]));
+  edges.forEach((edge) => {
+    adjacency.get(edge.from)?.push(edge.to);
+  });
+
+  const indexMap = new Map<string, number>();
+  const lowLinkMap = new Map<string, number>();
+  const stack: string[] = [];
+  const stackMembers = new Set<string>();
+  const components: string[][] = [];
+  let index = 0;
+
+  const visit = (nodeId: string) => {
+    indexMap.set(nodeId, index);
+    lowLinkMap.set(nodeId, index);
+    index += 1;
+    stack.push(nodeId);
+    stackMembers.add(nodeId);
+
+    (adjacency.get(nodeId) ?? []).forEach((nextId) => {
+      if (!indexMap.has(nextId)) {
+        visit(nextId);
+        lowLinkMap.set(
+          nodeId,
+          Math.min(lowLinkMap.get(nodeId) ?? Number.POSITIVE_INFINITY, lowLinkMap.get(nextId) ?? Number.POSITIVE_INFINITY),
+        );
+        return;
+      }
+
+      if (stackMembers.has(nextId)) {
+        lowLinkMap.set(
+          nodeId,
+          Math.min(lowLinkMap.get(nodeId) ?? Number.POSITIVE_INFINITY, indexMap.get(nextId) ?? Number.POSITIVE_INFINITY),
+        );
+      }
+    });
+
+    if (lowLinkMap.get(nodeId) !== indexMap.get(nodeId)) {
+      return;
+    }
+
+    const component: string[] = [];
+    let current: string | undefined;
+    do {
+      current = stack.pop();
+      if (!current) {
+        break;
+      }
+      stackMembers.delete(current);
+      component.push(current);
+    } while (current !== nodeId);
+
+    components.push(component);
+  };
+
+  nodeIds.forEach((nodeId) => {
+    if (!indexMap.has(nodeId)) {
+      visit(nodeId);
+    }
+  });
+
+  const componentOf = new Map<string, number>();
+  components.forEach((component, componentIndex) => {
+    component.forEach((nodeId) => componentOf.set(nodeId, componentIndex));
+  });
+
+  return { components, componentOf };
+}
+
+function buildTopologicalRankMap(document: GraphDocument, semanticEdges: Array<{ from: string; to: string }>) {
+  const sortedNodes = [...document.nodes].sort((left, right) => {
+    const primaryDelta = getNodePrimaryStart(left, document.direction) - getNodePrimaryStart(right, document.direction);
+    if (primaryDelta !== 0) {
+      return primaryDelta;
+    }
+    return getNodeMinorStart(left, document.direction) - getNodeMinorStart(right, document.direction);
+  });
+  const nodeIds = sortedNodes.map((node) => node.id);
+  const { components, componentOf } = computeStronglyConnectedComponents(nodeIds, semanticEdges);
+  const componentPrimaryAnchor = new Map<number, number>();
+
+  components.forEach((component, componentIndex) => {
+    const anchor = Math.min(
+      ...component.map((nodeId) =>
+        getNodePrimaryStart(document.nodes.find((node) => node.id === nodeId) ?? document.nodes[0], document.direction),
+      ),
+    );
+    componentPrimaryAnchor.set(componentIndex, anchor);
+  });
+
+  const outgoing = new Map<number, Set<number>>();
+  const incomingCount = new Map<number, number>();
+  components.forEach((_, index) => {
+    outgoing.set(index, new Set());
+    incomingCount.set(index, 0);
+  });
+
+  semanticEdges.forEach((edge) => {
+    const fromComponent = componentOf.get(edge.from);
+    const toComponent = componentOf.get(edge.to);
+    if (
+      fromComponent === undefined ||
+      toComponent === undefined ||
+      fromComponent === toComponent ||
+      outgoing.get(fromComponent)?.has(toComponent)
+    ) {
+      return;
+    }
+
+    outgoing.get(fromComponent)?.add(toComponent);
+    incomingCount.set(toComponent, (incomingCount.get(toComponent) ?? 0) + 1);
+  });
+
+  const componentRank = new Map<number, number>();
+  const ready = [...components.keys()]
+    .filter((componentIndex) => (incomingCount.get(componentIndex) ?? 0) === 0)
+    .sort((left, right) => (componentPrimaryAnchor.get(left) ?? 0) - (componentPrimaryAnchor.get(right) ?? 0));
+
+  while (ready.length > 0) {
+    const componentIndex = ready.shift();
+    if (componentIndex === undefined) {
+      break;
+    }
+
+    const nextRank = componentRank.get(componentIndex) ?? 0;
+    (outgoing.get(componentIndex) ?? new Set()).forEach((nextComponent) => {
+      componentRank.set(nextComponent, Math.max(componentRank.get(nextComponent) ?? 0, nextRank + 1));
+      incomingCount.set(nextComponent, (incomingCount.get(nextComponent) ?? 1) - 1);
+      if ((incomingCount.get(nextComponent) ?? 0) === 0) {
+        ready.push(nextComponent);
+        ready.sort((left, right) => (componentPrimaryAnchor.get(left) ?? 0) - (componentPrimaryAnchor.get(right) ?? 0));
+      }
+    });
+  }
+
+  const rankMap = new Map<string, number>();
+  components.forEach((component, componentIndex) => {
+    component.forEach((nodeId) => {
+      rankMap.set(nodeId, componentRank.get(componentIndex) ?? 0);
+    });
+  });
+
+  const incidentNodeIds = new Set<string>();
+  semanticEdges.forEach((edge) => {
+    incidentNodeIds.add(edge.from);
+    incidentNodeIds.add(edge.to);
+  });
+  const isolatedNodes = document.nodes
+    .filter((node) => !incidentNodeIds.has(node.id))
+    .sort((left, right) => getNodePrimaryStart(left, document.direction) - getNodePrimaryStart(right, document.direction));
+  let isolatedRank = Math.max(0, ...rankMap.values()) + 1;
+  isolatedNodes.forEach((node) => {
+    rankMap.set(node.id, isolatedRank);
+    isolatedRank += 1;
+  });
+
+  return rankMap;
+}
+
+function layoutDisconnectedNodes(document: GraphDocument) {
+  const sortedNodes = [...document.nodes].sort((left, right) => {
+    const primaryDelta = getNodePrimaryStart(left, document.direction) - getNodePrimaryStart(right, document.direction);
+    if (primaryDelta !== 0) {
+      return primaryDelta;
+    }
+    return getNodeMinorStart(left, document.direction) - getNodeMinorStart(right, document.direction);
+  });
+  const laneCount = Math.max(1, Math.ceil(Math.sqrt(sortedNodes.length || 1)));
+  const primaryGap = isPrimaryVertical(document.direction) ? 104 : 124;
+  const minorGap = isPrimaryVertical(document.direction) ? 88 : 82;
+  const bounds = buildSelectionBounds(document.nodes);
+  const center = bounds
+    ? { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 }
+    : { x: 0, y: 0 };
+  const nextPositions = new Map<string, Point>();
+  const laneMinorOffsets = new Array(laneCount).fill(0);
+  const lanePrimaryOffsets = new Array(laneCount).fill(0);
+
+  sortedNodes.forEach((node, index) => {
+    const laneIndex = index % laneCount;
+    const laneStep = Math.floor(index / laneCount);
+    const primary = laneStep * (getNodePrimarySize(node, document.direction) + primaryGap);
+    const minor = laneIndex * (getNodeMinorSize(node, document.direction) + minorGap);
+    laneMinorOffsets[laneIndex] = Math.max(laneMinorOffsets[laneIndex], minor);
+    lanePrimaryOffsets[laneIndex] = Math.max(lanePrimaryOffsets[laneIndex], primary);
+    nextPositions.set(
+      node.id,
+      isPrimaryVertical(document.direction)
+        ? { x: minor, y: primary }
+        : { x: primary, y: minor },
+    );
+  });
+
+  const rawNodes = sortedNodes.map((node) => {
+    const position = nextPositions.get(node.id) ?? { x: node.x, y: node.y };
+    return { ...node, ...position };
+  });
+  const rawBounds = buildSelectionBounds(rawNodes);
+  if (!rawBounds) {
+    return document.nodes;
+  }
+
+  const offset = {
+    x: Math.round(center.x - (rawBounds.x + rawBounds.width / 2)),
+    y: Math.round(center.y - (rawBounds.y + rawBounds.height / 2)),
+  };
+
+  return document.nodes.map((node) => {
+    const position = nextPositions.get(node.id);
+    if (!position) {
+      return node;
+    }
+    return {
+      ...node,
+      x: Math.round(position.x + offset.x),
+      y: Math.round(position.y + offset.y),
+    };
+  });
+}
+
+function barycenterForNode(
+  nodeId: string,
+  neighbors: Map<string, string[]>,
+  orderIndex: Map<string, number>,
+) {
+  const linked = neighbors.get(nodeId) ?? [];
+  if (linked.length === 0) {
+    return Number.NaN;
+  }
+
+  const values = linked
+    .map((neighborId) => orderIndex.get(neighborId))
+    .filter((value): value is number => typeof value === 'number');
+
+  if (values.length === 0) {
+    return Number.NaN;
+  }
+
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function layoutDocumentNodes(document: GraphDocument) {
+  const semanticEdges = buildSemanticLayoutEdges(document);
+  if (semanticEdges.length === 0) {
+    return layoutDisconnectedNodes(document);
+  }
+
+  const direction = document.direction;
+  const rankMap = buildTopologicalRankMap(document, semanticEdges);
+  const subgraphLookup = getVisibleSubgraphIds(document.subgraphs);
+  const incomingNeighbors = new Map<string, string[]>();
+  const outgoingNeighbors = new Map<string, string[]>();
+  const allNeighbors = new Map<string, string[]>();
+
+  document.nodes.forEach((node) => {
+    incomingNeighbors.set(node.id, []);
+    outgoingNeighbors.set(node.id, []);
+    allNeighbors.set(node.id, []);
+  });
+
+  semanticEdges.forEach((edge) => {
+    incomingNeighbors.get(edge.to)?.push(edge.from);
+    outgoingNeighbors.get(edge.from)?.push(edge.to);
+    allNeighbors.set(edge.from, [...(allNeighbors.get(edge.from) ?? []), edge.to]);
+    allNeighbors.set(edge.to, [...(allNeighbors.get(edge.to) ?? []), edge.from]);
+  });
+
+  const groups = new Map<number, GraphNode[]>();
+  document.nodes.forEach((node) => {
+    const rank = rankMap.get(node.id) ?? 0;
+    groups.set(rank, [...(groups.get(rank) ?? []), node]);
+  });
+
+  const sortedRanks = [...groups.keys()].sort((left, right) => left - right);
+  const orderIndex = new Map<string, number>();
+
+  sortedRanks.forEach((rank) => {
+    const group = [...(groups.get(rank) ?? [])].sort((left, right) => {
+      const leftSubgraph = buildSubgraphPathKey(left.subgraphId, subgraphLookup);
+      const rightSubgraph = buildSubgraphPathKey(right.subgraphId, subgraphLookup);
+      if (leftSubgraph !== rightSubgraph) {
+        return leftSubgraph.localeCompare(rightSubgraph);
+      }
+      const minorDelta = getNodeMinorStart(left, direction) - getNodeMinorStart(right, direction);
+      if (minorDelta !== 0) {
+        return minorDelta;
+      }
+      return left.id.localeCompare(right.id);
+    });
+    groups.set(rank, group);
+    group.forEach((node, index) => orderIndex.set(node.id, index));
+  });
+
+  for (let sweep = 0; sweep < 4; sweep += 1) {
+    const ascending = sweep % 2 === 0;
+    const ranks = ascending ? sortedRanks : [...sortedRanks].reverse();
+    ranks.forEach((rank) => {
+      const group = [...(groups.get(rank) ?? [])];
+      group.sort((left, right) => {
+        const leftBarycenter = barycenterForNode(
+          left.id,
+          ascending ? incomingNeighbors : outgoingNeighbors,
+          orderIndex,
+        );
+        const rightBarycenter = barycenterForNode(
+          right.id,
+          ascending ? incomingNeighbors : outgoingNeighbors,
+          orderIndex,
+        );
+
+        if (Number.isFinite(leftBarycenter) && Number.isFinite(rightBarycenter) && leftBarycenter !== rightBarycenter) {
+          return leftBarycenter - rightBarycenter;
+        }
+        if (Number.isFinite(leftBarycenter) && !Number.isFinite(rightBarycenter)) {
+          return -1;
+        }
+        if (!Number.isFinite(leftBarycenter) && Number.isFinite(rightBarycenter)) {
+          return 1;
+        }
+
+        const leftSubgraph = buildSubgraphPathKey(left.subgraphId, subgraphLookup);
+        const rightSubgraph = buildSubgraphPathKey(right.subgraphId, subgraphLookup);
+        if (leftSubgraph !== rightSubgraph) {
+          return leftSubgraph.localeCompare(rightSubgraph);
+        }
+
+        const currentMinorDelta = getNodeMinorStart(left, direction) - getNodeMinorStart(right, direction);
+        if (currentMinorDelta !== 0) {
+          return currentMinorDelta;
+        }
+
+        return left.id.localeCompare(right.id);
+      });
+      groups.set(rank, group);
+      group.forEach((node, index) => orderIndex.set(node.id, index));
+    });
+  }
+
+  const primaryGap = isPrimaryVertical(direction) ? 110 : 124;
+  const minorGap = isPrimaryVertical(direction) ? 82 : 76;
+  const physicalRanks = isPrimaryReversed(direction) ? [...sortedRanks].reverse() : sortedRanks;
+  const rankPrimaryStart = new Map<number, number>();
+  let primaryCursor = 0;
+  physicalRanks.forEach((rank) => {
+    rankPrimaryStart.set(rank, primaryCursor);
+    const group = groups.get(rank) ?? [];
+    const majorSize = group.length > 0
+      ? Math.max(...group.map((node) => getNodePrimarySize(node, direction)))
+      : 0;
+    primaryCursor += majorSize + primaryGap;
+  });
+
+  const rawPositions = new Map<string, Point>();
+  sortedRanks.forEach((rank) => {
+    const group = groups.get(rank) ?? [];
+    const totalMinorSpan = group.reduce((sum, node, index) => (
+      sum + getNodeMinorSize(node, direction) + (index === group.length - 1 ? 0 : minorGap)
+    ), 0);
+    let minorCursor = -totalMinorSpan / 2;
+    group.forEach((node) => {
+      const primary = rankPrimaryStart.get(rank) ?? 0;
+      const minor = minorCursor;
+      rawPositions.set(
+        node.id,
+        isPrimaryVertical(direction)
+          ? { x: minor, y: primary }
+          : { x: primary, y: minor },
+      );
+      minorCursor += getNodeMinorSize(node, direction) + minorGap;
+    });
+  });
+
+  const rawNodes = document.nodes.map((node) => ({
+    ...node,
+    ...(rawPositions.get(node.id) ?? { x: node.x, y: node.y }),
+  }));
+  const rawBounds = buildSelectionBounds(rawNodes);
+  const currentBounds = buildSelectionBounds(document.nodes);
+  if (!rawBounds || !currentBounds) {
+    return rawNodes;
+  }
+
+  const offset = {
+    x: Math.round(currentBounds.x + currentBounds.width / 2 - (rawBounds.x + rawBounds.width / 2)),
+    y: Math.round(currentBounds.y + currentBounds.height / 2 - (rawBounds.y + rawBounds.height / 2)),
+  };
+
+  return document.nodes.map((node) => {
+    const raw = rawPositions.get(node.id);
+    if (!raw) {
+      return node;
+    }
+    return {
+      ...node,
+      x: Math.round(raw.x + offset.x),
+      y: Math.round(raw.y + offset.y),
+    };
+  });
+}
+
+function tidyDocumentNodes(document: GraphDocument) {
+  const compactedNodes = compactDocumentNodes(document);
+  const baseDocument = { ...document, nodes: compactedNodes };
+  const semanticEdges = buildSemanticLayoutEdges(baseDocument);
+  if (semanticEdges.length === 0) {
+    return compactedNodes;
+  }
+
+  const direction = document.direction;
+  const nodeMap = new Map(compactedNodes.map((node) => [node.id, node]));
+  const incoming = new Map(compactedNodes.map((node) => [node.id, [] as string[]]));
+  const outgoing = new Map(compactedNodes.map((node) => [node.id, [] as string[]]));
+  const allNeighbors = new Map(compactedNodes.map((node) => [node.id, [] as string[]]));
+  semanticEdges.forEach((edge) => {
+    incoming.get(edge.to)?.push(edge.from);
+    outgoing.get(edge.from)?.push(edge.to);
+    allNeighbors.set(edge.from, [...(allNeighbors.get(edge.from) ?? []), edge.to]);
+    allNeighbors.set(edge.to, [...(allNeighbors.get(edge.to) ?? []), edge.from]);
+  });
+
+  const primaryGap = isPrimaryVertical(direction) ? 92 : 104;
+  const primaryShiftLimit = isPrimaryVertical(direction) ? 44 : 52;
+  const minorShiftLimit = isPrimaryVertical(direction) ? 34 : 28;
+  const relaxedNodes = compactedNodes.map((node) => {
+    const currentPrimary = getNodePrimaryStart(node, direction);
+    const currentMinor = getNodeMinorStart(node, direction);
+    const primaryTargets: number[] = [];
+    const minorTargets: number[] = [];
+
+    (incoming.get(node.id) ?? []).forEach((neighborId) => {
+      const neighbor = nodeMap.get(neighborId);
+      if (!neighbor) {
+        return;
+      }
+      primaryTargets.push(getNodePrimaryStart(neighbor, direction) + getNodePrimarySize(neighbor, direction) + primaryGap);
+      minorTargets.push(getNodeMinorStart(neighbor, direction));
+    });
+    (outgoing.get(node.id) ?? []).forEach((neighborId) => {
+      const neighbor = nodeMap.get(neighborId);
+      if (!neighbor) {
+        return;
+      }
+      primaryTargets.push(getNodePrimaryStart(neighbor, direction) - getNodePrimarySize(node, direction) - primaryGap);
+      minorTargets.push(getNodeMinorStart(neighbor, direction));
+    });
+
+    const nextPrimary = primaryTargets.length > 0
+      ? currentPrimary + clamp(
+        Math.round(primaryTargets.reduce((sum, value) => sum + value, 0) / primaryTargets.length - currentPrimary),
+        -primaryShiftLimit,
+        primaryShiftLimit,
+      )
+      : currentPrimary;
+    const nextMinor = minorTargets.length > 0
+      ? currentMinor + clamp(
+        Math.round(minorTargets.reduce((sum, value) => sum + value, 0) / minorTargets.length - currentMinor),
+        -minorShiftLimit,
+        minorShiftLimit,
+      )
+      : currentMinor;
+
+    return withNodeAxisPosition(node, direction, nextPrimary, nextMinor);
+  });
+
+  const contentMarkdown = document.contentMarkdown ?? extractContentMarkdown(document.suffixMarkdown);
+  const contentLayout = getContentCardLayout(document, { width: 320, height: 180 });
+  const contentSize = measureContentCard(contentMarkdown, contentLayout.collapsed);
+  const contentRect = {
+    x: contentLayout.x,
+    y: contentLayout.y,
+    width: contentSize.width,
+    height: contentSize.height,
+  };
+  const orderedNodes = [...relaxedNodes].sort((left, right) => {
+    const primaryDelta = getNodePrimaryStart(left, direction) - getNodePrimaryStart(right, direction);
+    if (primaryDelta !== 0) {
+      return primaryDelta;
+    }
+
+    const degreeDelta = (allNeighbors.get(right.id)?.length ?? 0) - (allNeighbors.get(left.id)?.length ?? 0);
+    if (degreeDelta !== 0) {
+      return degreeDelta;
+    }
+
+    return getNodeMinorStart(left, direction) - getNodeMinorStart(right, direction);
+  });
+
+  const placed = new Map<string, GraphNode>();
+  const obstacles: Rect[] = [expandRect(contentRect, 16)];
+  orderedNodes.forEach((node) => {
+    const original = nodeMap.get(node.id) ?? node;
+    const resolvedRect = searchFreeRect(
+      { x: node.x, y: node.y, width: node.width, height: node.height },
+      obstacles,
+      {
+        x: node.x - original.x || (isPrimaryVertical(direction) ? 0 : 1),
+        y: node.y - original.y || (isPrimaryVertical(direction) ? 1 : 0),
+      },
+    );
+    const placedNode = { ...node, x: resolvedRect.x, y: resolvedRect.y };
+    placed.set(node.id, placedNode);
+    obstacles.push(expandRect(resolvedRect, 16));
+  });
+
+  return document.nodes.map((node) => placed.get(node.id) ?? node);
 }
 
 function compactDocumentNodes(document: GraphDocument) {
@@ -3230,13 +4351,20 @@ export default function App() {
   const [activeLocalDirectoryId, setActiveLocalDirectoryId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    readStoredNumber(storageKeys.sidebarWidth, DEFAULT_SIDEBAR_WIDTH),
+  );
+  const [inspectorWidth, setInspectorWidth] = useState(() =>
+    readStoredNumber(storageKeys.inspectorWidth, DEFAULT_INSPECTOR_WIDTH),
+  );
   const [mobileSourcePreviewOpen, setMobileSourcePreviewOpen] = useState(false);
   const [helpDialogOpen, setHelpDialogOpen] = useState(false);
-  const [aiPanelOpen, setAiPanelOpen] = useState(false);
   const [aiPanelTab, setAiPanelTab] = useState<AiPanelTab>('chat');
-  const [aiSettings, setAiSettings] = useState<AiSettingsDraft>(() =>
-    readStoredJson(storageKeys.aiSettings, defaultAiSettings),
-  );
+  const [inspectorView, setInspectorView] = useState<InspectorView>('properties');
+  const [aiSettings, setAiSettings] = useState<AiSettingsDraft>(() => ({
+    ...defaultAiSettings,
+    ...readStoredJson(storageKeys.aiSettings, defaultAiSettings),
+  }));
   const [aiMessages, setAiMessages] = useState<AiMessage[]>(() =>
     readStoredArray(storageKeys.aiChat, defaultAiMessages),
   );
@@ -3261,6 +4389,7 @@ export default function App() {
   const [hasLocalProjectAccess, setHasLocalProjectAccess] = useState(false);
   const [nodeInspectorDraft, setNodeInspectorDraft] = useState<NodeInspectorDraft>({
     label: '',
+    annotation: '',
     shape: 'rect',
     fill: '#fff8ef',
     stroke: '#24404f',
@@ -3285,7 +4414,7 @@ export default function App() {
   const [projectInspectorDraft, setProjectInspectorDraft] = useState<ProjectInspectorDraft>({
     projectName: initialWorkspace.document.projectName ?? 'Untitled Project',
     projectSummary: initialWorkspace.document.projectSummary ?? '',
-    contentMarkdown: extractContentMarkdown(initialWorkspace.document.suffixMarkdown),
+    contentMarkdown: initialWorkspace.document.contentMarkdown ?? extractContentMarkdown(initialWorkspace.document.suffixMarkdown),
   });
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [editingLabel, setEditingLabel] = useState('');
@@ -3296,18 +4425,21 @@ export default function App() {
   const [editingContent, setEditingContent] = useState(false);
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [dragTargetSubgraphId, setDragTargetSubgraphId] = useState<string | null>(null);
+  const [dragTargetNodeId, setDragTargetNodeId] = useState<string | null>(null);
+  const [dragTargetEdgeId, setDragTargetEdgeId] = useState<string | null>(null);
   const [dragReparentMode, setDragReparentMode] = useState(false);
   const [boxState, setBoxState] = useState<BoxState | null>(null);
   const [panState, setPanState] = useState<PanState | null>(null);
   const [miniMapDragState, setMiniMapDragState] = useState<MiniMapDragState | null>(null);
   const [connectingState, setConnectingState] = useState<ConnectingState | null>(null);
+  const [panelResizeState, setPanelResizeState] = useState<PanelResizeState | null>(null);
   const [spacePressed, setSpacePressed] = useState(false);
+  const workspaceRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const canvasBoardRef = useRef<HTMLDivElement>(null);
   const localHandleEntriesRef = useRef<Record<string, LocalHandleEntry>>({});
   const localRootDirectoryRef = useRef<LocalProjectDirectoryHandle | null>(null);
   const nodeClipboardRef = useRef<NodeClipboardState | null>(null);
-  const aiPanelRef = useRef<HTMLDivElement>(null);
   const documentRef = useRef(documentState);
   const documentRevisionRef = useRef(documentRevision);
   const aiLastMarkdownRef = useRef(aiLastMarkdown);
@@ -3339,13 +4471,17 @@ export default function App() {
     () => applyDragPreview(documentState.nodes, dragState),
     [documentState.nodes, dragState],
   );
+  const framePreviewNodes = useMemo(
+    () => (dragReparentMode ? documentState.nodes : previewNodes),
+    [documentState.nodes, dragReparentMode, previewNodes],
+  );
   const subgraphFrames = useMemo(
-    () => buildSubgraphFrames(documentState, previewNodes),
-    [documentState, previewNodes],
+    () => buildSubgraphFrames(documentState, framePreviewNodes),
+    [documentState, framePreviewNodes],
   );
   const contentMarkdown = useMemo(
-    () => extractContentMarkdown(documentState.suffixMarkdown),
-    [documentState.suffixMarkdown],
+    () => documentState.contentMarkdown ?? extractContentMarkdown(documentState.suffixMarkdown),
+    [documentState.contentMarkdown, documentState.suffixMarkdown],
   );
   const contentCardLayout = useMemo(
     () => getContentCardLayout(documentState, { width: 320, height: 180 }),
@@ -3356,19 +4492,7 @@ export default function App() {
     () => measureContentCard(editingContent ? contentInspectorDraft.markdown : contentMarkdown, contentCardCollapsed),
     [contentCardCollapsed, contentInspectorDraft.markdown, contentMarkdown, editingContent],
   );
-  const contentCardRenderLayout = useMemo(() => {
-    if (dragState?.kind !== 'content') {
-      return contentCardLayout;
-    }
-
-    const deltaX = dragState.current.x - dragState.origin.x;
-    const deltaY = dragState.current.y - dragState.origin.y;
-    return {
-      ...contentCardLayout,
-      x: (dragState.initialPositions[CONTENT_CARD_ID]?.x ?? contentCardLayout.x) + deltaX,
-      y: (dragState.initialPositions[CONTENT_CARD_ID]?.y ?? contentCardLayout.y) + deltaY,
-    };
-  }, [contentCardLayout, dragState]);
+  const contentCardRenderLayout = contentCardLayout;
   const contentCardRect = useMemo(
     () => ({
       x: contentCardRenderLayout.x,
@@ -3504,6 +4628,35 @@ export default function App() {
     () => buildEdgeEndpointOffsetMap(visibleEdges, edgeEndpoints),
     [edgeEndpoints, visibleEdges],
   );
+  const dragEntityEndpointId =
+    dragState?.kind === 'subgraph'
+      ? (dragState.entityId ?? null)
+      : dragState?.kind === 'node' && dragState.ids.length === 1
+        ? dragState.ids[0]
+        : null;
+  const dragInsertPreview = useMemo(() => {
+    if (!dragState || !dragTargetEdgeId || !dragEntityEndpointId) {
+      return null;
+    }
+
+    const previewEdge = visibleEdges.find((edge) => edge.id === dragTargetEdgeId) ?? null;
+    const insertedEndpoint = edgeEndpointMap.get(dragEntityEndpointId);
+    if (!previewEdge || !insertedEndpoint) {
+      return null;
+    }
+
+    const fromEndpoint = edgeEndpointMap.get(previewEdge.from);
+    const toEndpoint = edgeEndpointMap.get(previewEdge.to);
+    if (!fromEndpoint || !toEndpoint) {
+      return null;
+    }
+
+    return {
+      first: buildEdgeGeometry(fromEndpoint, insertedEndpoint),
+      second: buildEdgeGeometry(insertedEndpoint, toEndpoint),
+      stroke: insertedEndpoint.stroke,
+    };
+  }, [dragEntityEndpointId, dragState, dragTargetEdgeId, edgeEndpointMap, visibleEdges]);
   const canvasExportBounds = useMemo(
     () => buildCanvasExportBounds({
       nodes: visibleNodes,
@@ -3525,8 +4678,8 @@ export default function App() {
     ],
   );
   const allSubgraphFrames = useMemo(
-    () => buildSubgraphFrames(documentState, previewNodes),
-    [documentState, previewNodes],
+    () => buildSubgraphFrames(documentState, framePreviewNodes),
+    [documentState, framePreviewNodes],
   );
   const allSubgraphFrameMap = useMemo(
     () => new Map(allSubgraphFrames.map((frame) => [frame.id, frame])),
@@ -3810,6 +4963,13 @@ export default function App() {
     setSidebarOpen(false);
     setMobileSourcePreviewOpen(false);
     setInspectorOpen((current) => !current);
+  }, []);
+
+  const openInspectorView = useCallback((nextView: InspectorView) => {
+    setSidebarOpen(false);
+    setMobileSourcePreviewOpen(false);
+    setInspectorView(nextView);
+    setInspectorOpen(true);
   }, []);
 
   const updateViewport = useCallback(
@@ -4103,23 +5263,39 @@ export default function App() {
 
     const ids = new Set(selection.ids);
     commitDocument(
-      (current) => ({
-        ...current,
-        nodes: current.nodes.map((node) =>
-          ids.has(node.id)
-            ? resizeNodeToContent(
-              {
-                ...node,
-                shape: draft.shape,
-                fill: draft.fill,
-                stroke: draft.stroke,
-                textColor: draft.textColor,
-              },
-              draft.label,
-            )
-            : node,
-        ),
-      }),
+      (current) => {
+        const nextNodeAnnotations = {
+          ...(current.nodeAnnotations ?? {}),
+        };
+
+        selection.ids.forEach((nodeId) => {
+          const normalizedAnnotation = draft.annotation.trim();
+          if (normalizedAnnotation) {
+            nextNodeAnnotations[nodeId] = draft.annotation;
+            return;
+          }
+          delete nextNodeAnnotations[nodeId];
+        });
+
+        return {
+          ...current,
+          nodes: current.nodes.map((node) =>
+            ids.has(node.id)
+              ? resizeNodeToContent(
+                {
+                  ...node,
+                  shape: draft.shape,
+                  fill: draft.fill,
+                  stroke: draft.stroke,
+                  textColor: draft.textColor,
+                },
+                draft.label,
+              )
+              : node,
+          ),
+          nodeAnnotations: nextNodeAnnotations,
+        };
+      },
       '已更新节点',
       `已更新 ${selection.ids.length} 个节点属性。`,
     );
@@ -4208,7 +5384,7 @@ export default function App() {
     const current = documentRef.current;
     setEditingContent(true);
     setContentInspectorDraft({
-      markdown: normalizeContentMarkdown(extractContentMarkdown(current.suffixMarkdown)),
+      markdown: normalizeContentMarkdown(current.contentMarkdown ?? extractContentMarkdown(current.suffixMarkdown)),
     });
     setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
     if (contentCardLayout.collapsed) {
@@ -4237,7 +5413,7 @@ export default function App() {
     commitDocument(
       (current) => ({
         ...current,
-        suffixMarkdown: buildContentSuffixMarkdown(draft.markdown),
+        contentMarkdown: trimMultilineBlock(draft.markdown),
       }),
       '已更新附加信息',
       '已更新工程 Markdown 的附加信息层。',
@@ -4256,7 +5432,7 @@ export default function App() {
     const current = documentRef.current;
     const currentName = current.projectName?.trim() || 'Untitled Project';
     const currentSummary = trimMultilineBlock(current.projectSummary ?? '');
-    const currentContent = trimMultilineBlock(extractContentMarkdown(current.suffixMarkdown));
+    const currentContent = trimMultilineBlock(current.contentMarkdown ?? extractContentMarkdown(current.suffixMarkdown));
 
     if (
       normalizedName === currentName &&
@@ -4272,7 +5448,7 @@ export default function App() {
         projectName: normalizedName,
         projectSummary: normalizedSummary,
         prefixMarkdown: buildProjectPrefixMarkdown(normalizedName, normalizedSummary),
-        suffixMarkdown: buildContentSuffixMarkdown(normalizedContent),
+        contentMarkdown: normalizedContent,
       }),
       '已更新工程信息',
       '已更新 Project Name、Summary 与附加信息。',
@@ -4344,10 +5520,21 @@ export default function App() {
     commitDocument(
       (current) => ({
         ...current,
-        nodes: compactDocumentNodes(current),
+        nodes: tidyDocumentNodes(current),
       }),
       '已整理布局',
-      '已按当前编排做局部整理，不会重排整张图。',
+      '已根据当前排布做理线、压缩间距和局部避让。',
+    );
+  }, [commitDocument]);
+
+  const autoLayout = useCallback(() => {
+    commitDocument(
+      (current) => ({
+        ...current,
+        nodes: layoutDocumentNodes(current),
+      }),
+      '已重排布局',
+      '已按拓扑结构重新布局，优先减少打结、遮挡和无效留白。',
     );
   }, [commitDocument]);
 
@@ -5330,8 +6517,9 @@ export default function App() {
 
     if (!isMobileViewport && selection.kind !== 'none') {
       setInspectorOpen(true);
+      setInspectorView((current) => (current === 'ai' && inspectorOpen ? 'ai' : 'properties'));
     }
-  }, [isMobileViewport, mode, selection.kind]);
+  }, [inspectorOpen, isMobileViewport, mode, selection.kind]);
 
   useEffect(() => () => {
     clearPendingBackgroundInteraction();
@@ -5595,6 +6783,20 @@ export default function App() {
 
       if (
         event.key === 'Enter' &&
+        selection.kind === 'subgraph' &&
+        selection.ids.length === 1 &&
+        !editingSubgraphId
+      ) {
+        const targetSubgraph = documentState.subgraphs.find((subgraph) => subgraph.id === selection.ids[0]);
+        if (targetSubgraph) {
+          event.preventDefault();
+          startSubgraphTitleEdit(targetSubgraph);
+        }
+        return;
+      }
+
+      if (
+        event.key === 'Enter' &&
         selection.kind === 'content' &&
         !editingContent
       ) {
@@ -5622,6 +6824,7 @@ export default function App() {
     copySelection,
     createNodesFromShortcut,
     documentState.nodes,
+    documentState.subgraphs,
     deleteSelection,
     duplicateSelection,
     documentState.edges,
@@ -5637,18 +6840,57 @@ export default function App() {
     startEdgeInlineEdit,
     startContentInlineEdit,
     startInlineEdit,
+    startSubgraphTitleEdit,
     updateViewport,
     undoDocument,
     visibleNodes,
     wrapSelectionInSubgraph,
     zoomViewportAtPoint,
     editingContent,
+    editingSubgraphId,
   ]);
 
   useEffect(() => {
     if (!dragState && !boxState && !panState && !connectingState) {
       return;
     }
+
+    const resolveHierarchyTargets = (pointer: Point, activeDragState: DragState) => {
+      const excludedNodeIds = activeDragState.ids;
+      const excludedSubgraphIds = activeDragState.kind === 'subgraph' && activeDragState.entityId
+        ? [activeDragState.entityId]
+        : [];
+      const nextNodeTargetId = findNodeDropTarget(visibleNodes, pointer, excludedNodeIds);
+      const insertableEndpointId = activeDragState.kind === 'subgraph'
+        ? activeDragState.entityId ?? null
+        : activeDragState.ids.length === 1
+          ? activeDragState.ids[0]
+          : null;
+      const nextEdgeTargetId = nextNodeTargetId || !insertableEndpointId
+        ? null
+        : findEdgeDropTarget(
+          pointer,
+          visibleEdges,
+          edgeEndpointMap,
+          edgeLaneMap,
+          edgeEndpointOffsetMap,
+          [insertableEndpointId],
+        );
+      const nextSubgraphTargetId =
+        nextNodeTargetId || nextEdgeTargetId
+          ? null
+          : findSubgraphDropTarget(
+            allSubgraphFrames,
+            pointer,
+            excludedSubgraphIds,
+          );
+
+      return {
+        nodeId: nextNodeTargetId,
+        edgeId: nextEdgeTargetId,
+        subgraphId: nextSubgraphTargetId,
+      };
+    };
 
     function onPointerMove(event: PointerEvent) {
       const canvas = canvasRef.current;
@@ -5677,17 +6919,16 @@ export default function App() {
       const y = (event.clientY - bounds.top - viewport.y) / viewport.zoom;
 
       if (dragState) {
-        if (dragState.kind === 'node' && (event.ctrlKey || event.metaKey)) {
+        if (dragState.kind !== 'content' && (event.ctrlKey || event.metaKey)) {
           setDragReparentMode(true);
-          const pointer = { x, y };
-          setDragTargetSubgraphId(
-            findSubgraphDropTarget(
-              allSubgraphFrames,
-              pointer,
-            ),
-          );
+          const targets = resolveHierarchyTargets({ x, y }, dragState);
+          setDragTargetNodeId(targets.nodeId);
+          setDragTargetEdgeId(targets.edgeId);
+          setDragTargetSubgraphId(targets.subgraphId);
         } else {
           setDragReparentMode(false);
+          setDragTargetNodeId(null);
+          setDragTargetEdgeId(null);
           setDragTargetSubgraphId(null);
         }
 
@@ -5748,8 +6989,24 @@ export default function App() {
         const deltaX = dragState.current.x - dragState.origin.x;
         const deltaY = dragState.current.y - dragState.origin.y;
         const movedDistance = Math.hypot(deltaX, deltaY);
-        const shouldReparent = dragState.kind === 'node' && dragReparentMode;
-        const dropTargetSubgraphId = shouldReparent ? dragTargetSubgraphId : null;
+        const shouldReparent = dragState.kind !== 'content' && (dragReparentMode || event.ctrlKey || event.metaKey);
+        const liveTargets = shouldReparent
+          ? resolveHierarchyTargets(dragState.current, dragState)
+          : null;
+        const resolvedTargetNodeId = liveTargets?.nodeId ?? null;
+        const resolvedTargetEdgeId = liveTargets?.edgeId ?? null;
+        const ambientSubgraphId = shouldReparent
+          ? findSubgraphDropTarget(
+            allSubgraphFrames,
+            dragState.current,
+            dragState.kind === 'subgraph' && dragState.entityId ? [dragState.entityId] : [],
+          )
+          : null;
+        const dropTargetSubgraphId = shouldReparent
+          ? (resolvedTargetNodeId || resolvedTargetEdgeId
+            ? ambientSubgraphId
+            : (liveTargets?.subgraphId ?? dragTargetSubgraphId))
+          : null;
 
         if (dragState.kind === 'content') {
           if (movedDistance > 3) {
@@ -5765,6 +7022,8 @@ export default function App() {
             );
           }
           setDragState(null);
+          setDragTargetNodeId(null);
+          setDragTargetEdgeId(null);
           setDragTargetSubgraphId(null);
           setDragReparentMode(false);
           return;
@@ -5773,7 +7032,8 @@ export default function App() {
         if (movedDistance > 3 || shouldReparent) {
           commitDocument(
             (current) => {
-              const desiredNodes = current.nodes.map((node) => {
+              const movedSet = new Set(dragState.ids);
+              let desiredNodes = current.nodes.map((node) => {
                 const initial = dragState.initialPositions[node.id];
                 if (!initial) {
                   return node;
@@ -5783,19 +7043,198 @@ export default function App() {
                   ...node,
                   x: Math.round(initial.x + deltaX),
                   y: Math.round(initial.y + deltaY),
-                  subgraphId:
-                    shouldReparent
-                      ? dropTargetSubgraphId ?? null
-                      : node.subgraphId,
                 };
               });
+              let workingDocument: GraphDocument = {
+                ...current,
+                nodes: desiredNodes,
+              };
+              let collisionTargetSubgraphId: string | null = null;
+
+              if (shouldReparent && dragState.kind === 'node') {
+                if (resolvedTargetNodeId && !movedSet.has(resolvedTargetNodeId)) {
+                  const hostNode = current.nodes.find((node) => node.id === resolvedTargetNodeId) ?? null;
+                  if (hostNode) {
+                    desiredNodes = centerMovedNodesOnPoint(
+                      desiredNodes,
+                      dragState.ids,
+                      getNodeCenter(hostNode),
+                    );
+                    workingDocument = {
+                      ...current,
+                      nodes: desiredNodes
+                        .filter((node) => node.id !== hostNode.id)
+                        .map((node) =>
+                          movedSet.has(node.id)
+                            ? { ...node, subgraphId: hostNode.id }
+                            : node,
+                        ),
+                      subgraphs: [
+                        ...current.subgraphs.filter((subgraph) => subgraph.id !== hostNode.id),
+                        createSubgraphFromNode(hostNode),
+                      ],
+                    };
+                    collisionTargetSubgraphId = hostNode.id;
+                  }
+                } else {
+                  workingDocument = {
+                    ...current,
+                    nodes: desiredNodes.map((node) =>
+                      movedSet.has(node.id)
+                        ? { ...node, subgraphId: dropTargetSubgraphId ?? null }
+                        : node,
+                    ),
+                  };
+                  collisionTargetSubgraphId = dropTargetSubgraphId;
+                }
+
+                if (resolvedTargetEdgeId && dragState.ids.length === 1) {
+                  const previewEdge = visibleEdges.find((edge) => edge.id === resolvedTargetEdgeId) ?? null;
+                  const previewFrom = previewEdge ? edgeEndpointMap.get(previewEdge.from) ?? null : null;
+                  const previewTo = previewEdge ? edgeEndpointMap.get(previewEdge.to) ?? null : null;
+                  if (previewEdge && previewFrom && previewTo) {
+                    const previewGeometry = buildEdgeGeometry(
+                      previewFrom,
+                      previewTo,
+                      edgeLaneMap.get(previewEdge.id) ?? 0,
+                      edgeEndpointOffsetMap.get(previewEdge.id),
+                    );
+                    workingDocument = {
+                      ...workingDocument,
+                      nodes: centerMovedNodesOnPoint(
+                        workingDocument.nodes,
+                        dragState.ids,
+                        previewGeometry.mid,
+                      ).map((node) =>
+                        movedSet.has(node.id)
+                          ? { ...node, subgraphId: dropTargetSubgraphId ?? null }
+                          : node,
+                      ),
+                    };
+                    collisionTargetSubgraphId = dropTargetSubgraphId;
+                  }
+                }
+
+                const workingLookup = getVisibleSubgraphIds(workingDocument.subgraphs);
+                workingDocument = {
+                  ...workingDocument,
+                  nodes: resolveDraggedNodeCollision(
+                    workingDocument,
+                    dragState.ids,
+                    workingDocument.nodes,
+                    workingLookup,
+                    collisionTargetSubgraphId,
+                    contentCardRect,
+                  ),
+                };
+
+                if (resolvedTargetEdgeId && dragState.ids.length === 1) {
+                  workingDocument = insertDraggedEndpointIntoEdge(
+                    workingDocument,
+                    resolvedTargetEdgeId,
+                    dragState.ids[0],
+                  );
+                }
+
+                return maybeConvertSourceSubgraphsToNodes(current, workingDocument, dragState.ids);
+              }
+
+              if (shouldReparent && dragState.kind === 'subgraph' && dragState.entityId) {
+                if (resolvedTargetNodeId) {
+                  const hostNode = current.nodes.find((node) => node.id === resolvedTargetNodeId) ?? null;
+                  if (hostNode) {
+                    desiredNodes = centerMovedNodesOnPoint(
+                      desiredNodes,
+                      dragState.ids,
+                      getNodeCenter(hostNode),
+                    );
+                    workingDocument = {
+                      ...current,
+                      nodes: desiredNodes.filter((node) => node.id !== hostNode.id),
+                      subgraphs: [
+                        ...current.subgraphs
+                          .filter((subgraph) => subgraph.id !== hostNode.id)
+                          .map((subgraph) =>
+                            subgraph.id === dragState.entityId
+                              ? { ...subgraph, parentId: hostNode.id }
+                              : subgraph,
+                          ),
+                        createSubgraphFromNode(hostNode),
+                      ],
+                    };
+                    collisionTargetSubgraphId = hostNode.id;
+                  }
+                } else {
+                  workingDocument = {
+                    ...current,
+                    nodes: desiredNodes,
+                    subgraphs: current.subgraphs.map((subgraph) =>
+                      subgraph.id === dragState.entityId
+                        ? { ...subgraph, parentId: dropTargetSubgraphId ?? null }
+                        : subgraph,
+                    ),
+                  };
+                  collisionTargetSubgraphId = dropTargetSubgraphId;
+                }
+
+                if (resolvedTargetEdgeId) {
+                  const previewEdge = visibleEdges.find((edge) => edge.id === resolvedTargetEdgeId) ?? null;
+                  const previewFrom = previewEdge ? edgeEndpointMap.get(previewEdge.from) ?? null : null;
+                  const previewTo = previewEdge ? edgeEndpointMap.get(previewEdge.to) ?? null : null;
+                  if (previewEdge && previewFrom && previewTo) {
+                    const previewGeometry = buildEdgeGeometry(
+                      previewFrom,
+                      previewTo,
+                      edgeLaneMap.get(previewEdge.id) ?? 0,
+                      edgeEndpointOffsetMap.get(previewEdge.id),
+                    );
+                    workingDocument = {
+                      ...workingDocument,
+                      nodes: centerMovedNodesOnPoint(
+                        workingDocument.nodes,
+                        dragState.ids,
+                        previewGeometry.mid,
+                      ),
+                      subgraphs: workingDocument.subgraphs.map((subgraph) =>
+                        subgraph.id === dragState.entityId
+                          ? { ...subgraph, parentId: dropTargetSubgraphId ?? null }
+                          : subgraph,
+                      ),
+                    };
+                    collisionTargetSubgraphId = dropTargetSubgraphId;
+                  }
+                }
+
+                const workingLookup = getVisibleSubgraphIds(workingDocument.subgraphs);
+                workingDocument = {
+                  ...workingDocument,
+                  nodes: resolveDraggedNodeCollision(
+                    workingDocument,
+                    dragState.ids,
+                    workingDocument.nodes,
+                    workingLookup,
+                    collisionTargetSubgraphId,
+                    contentCardRect,
+                  ),
+                };
+
+                if (resolvedTargetEdgeId) {
+                  workingDocument = insertDraggedEndpointIntoEdge(
+                    workingDocument,
+                    resolvedTargetEdgeId,
+                    dragState.entityId,
+                  );
+                }
+
+                return workingDocument;
+              }
 
               const resolvedNodes = resolveDraggedNodeCollision(
                 current,
                 dragState.ids,
                 desiredNodes,
                 fullSubgraphLookup,
-                dropTargetSubgraphId,
+                null,
                 contentCardRect,
               );
 
@@ -5807,7 +7246,11 @@ export default function App() {
             dragState.kind === 'subgraph' ? '已移动分组' : '已移动节点',
             dragState.kind === 'subgraph'
               ? '已整体移动当前分组及其内部元素。'
-              : shouldReparent
+              : resolvedTargetEdgeId
+                ? `已将 ${dragState.ids[0]} 插入到连线中间，并保留原有连接方向。`
+                : resolvedTargetNodeId
+                  ? `已将 ${dragState.ids.length} 个节点放入 ${resolvedTargetNodeId}，并将其转换为分组。`
+                  : shouldReparent
                 ? dropTargetSubgraphId
                   ? `已将 ${dragState.ids.length} 个节点放入 ${dropTargetSubgraphId}。`
                   : `已将 ${dragState.ids.length} 个节点移回外层画布。`
@@ -5815,6 +7258,8 @@ export default function App() {
           );
         }
         setDragState(null);
+        setDragTargetNodeId(null);
+        setDragTargetEdgeId(null);
         setDragTargetSubgraphId(null);
         setDragReparentMode(false);
       }
@@ -5893,6 +7338,11 @@ export default function App() {
       if (connectingState) {
         const target = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-edge-endpoint-id]');
         const targetId = target?.dataset.edgeEndpointId;
+        const isSubgraphTarget = !!targetId && documentState.subgraphs.some((subgraph) => subgraph.id === targetId);
+        const targetIsExplicitGroupEndpoint = !!(event.target as HTMLElement | null)?.closest(
+          '.subgraph-frame__connector, .subgraph-frame__header, .subgraph-frame__title-input, .subgraph-frame__action',
+        );
+        const treatGroupBodyAsBlankDrop = isSubgraphTarget && !targetIsExplicitGroupEndpoint;
         const dragDistance = Math.hypot(
           connectingState.current.x - connectingState.origin.x,
           connectingState.current.y - connectingState.origin.y,
@@ -5901,7 +7351,7 @@ export default function App() {
           ? connectingState.fromIds
           : [connectingState.fromId];
 
-        if (targetId && sourceIds.some((sourceId) => sourceId !== targetId)) {
+        if (targetId && !treatGroupBodyAsBlankDrop && sourceIds.some((sourceId) => sourceId !== targetId)) {
           const nextEdges = sourceIds
             .filter((sourceId) => sourceId !== targetId)
             .map((sourceId) => ({
@@ -5945,6 +7395,8 @@ export default function App() {
     function onPointerCancel() {
       clearPendingBackgroundInteraction();
       setDragState(null);
+      setDragTargetNodeId(null);
+      setDragTargetEdgeId(null);
       setDragTargetSubgraphId(null);
       setDragReparentMode(false);
       setBoxState(null);
@@ -5973,8 +7425,11 @@ export default function App() {
     createNodeAtForSources,
     documentState.layout.viewport,
     documentState.nodes,
+    documentState.subgraphs,
     dragState,
     dragReparentMode,
+    dragTargetEdgeId,
+    dragTargetNodeId,
     dragTargetSubgraphId,
     edgeEndpointMap,
     edgeLaneMap,
@@ -6173,6 +7628,7 @@ export default function App() {
       current: point,
       ids: activeIds,
       initialPositions,
+      entityId: activeIds.length === 1 ? activeIds[0] : null,
     });
   }
 
@@ -6205,25 +7661,7 @@ export default function App() {
       setSelection((current) => toggleSelectionIds(current, 'content', [CONTENT_CARD_ID]));
       return;
     }
-
-    const point = pointFromClient(event.clientX, event.clientY);
-    if (!point) {
-      return;
-    }
-
     setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
-    setDragState({
-      kind: 'content',
-      origin: point,
-      current: point,
-      ids: [CONTENT_CARD_ID],
-      initialPositions: {
-        [CONTENT_CARD_ID]: {
-          x: contentCardRenderLayout.x,
-          y: contentCardRenderLayout.y,
-        },
-      },
-    });
   }
 
   function startSubgraphDrag(
@@ -6296,6 +7734,7 @@ export default function App() {
           .filter((node) => memberIds.includes(node.id))
           .map((node) => [node.id, { x: node.x, y: node.y }]),
       ),
+      entityId: subgraphId,
     });
   }
 
@@ -6341,6 +7780,10 @@ export default function App() {
       : null;
   const selectedContent =
     selection.kind === 'content' && selection.ids[0] === CONTENT_CARD_ID;
+  const nodeAnnotationMap = useMemo(
+    () => getNodeAnnotationMap(documentState),
+    [documentState],
+  );
   const selectedNodePresetId = selectedNode
     ? nodeStylePresets.find((preset) =>
       preset.fill === selectedNode.fill &&
@@ -6361,9 +7804,49 @@ export default function App() {
     typeof (window as Window & { showOpenFilePicker?: unknown }).showOpenFilePicker === 'function';
   const showSidebar = mode === 'canvas' ? sidebarOpen : isMobileViewport ? sidebarOpen : true;
   const showInspector = mode === 'canvas' ? inspectorOpen : isMobileViewport ? inspectorOpen : true;
-  const workspaceClassName = `workspace workspace--${mode}${isMobileViewport ? ' workspace--mobile' : ''}${showSidebar ? ' workspace--sidebar-open' : ''}${showInspector ? ' workspace--inspector-open' : ''}`;
+  const clampPanelWidth = useCallback((
+    side: 'left' | 'right',
+    requestedWidth: number,
+    overrides?: { sidebar?: number; inspector?: number },
+  ) => {
+    const fallback = side === 'left' ? DEFAULT_SIDEBAR_WIDTH : DEFAULT_INSPECTOR_WIDTH;
+    if (isMobileViewport) {
+      return fallback;
+    }
+
+    const min = side === 'left' ? MIN_SIDEBAR_WIDTH : MIN_INSPECTOR_WIDTH;
+    const max = side === 'left' ? MAX_SIDEBAR_WIDTH : MAX_INSPECTOR_WIDTH;
+    const workspaceWidth = workspaceRef.current?.getBoundingClientRect().width ?? window.innerWidth;
+    const resolvedSidebarWidth = overrides?.sidebar ?? sidebarWidth;
+    const resolvedInspectorWidth = overrides?.inspector ?? inspectorWidth;
+    const oppositeWidth = side === 'left'
+      ? (showInspector ? resolvedInspectorWidth : 0)
+      : (showSidebar ? resolvedSidebarWidth : 0);
+    const available = workspaceWidth - NAV_RAIL_WIDTH - oppositeWidth - MIN_WORKSPACE_CENTER_WIDTH;
+
+    return clamp(requestedWidth, min, Math.max(min, Math.min(max, available)));
+  }, [inspectorWidth, isMobileViewport, showInspector, showSidebar, sidebarWidth]);
+  const workspaceClassName = `workspace workspace--${mode}${isMobileViewport ? ' workspace--mobile' : ''}${showSidebar ? ' workspace--sidebar-open' : ''}${showInspector ? ' workspace--inspector-open' : ''}${panelResizeState ? ' workspace--resizing' : ''}`;
   const appShellClassName = `app-shell${isMobileViewport ? ' app-shell--mobile' : ''}${isConstrainedDevice ? ' app-shell--constrained' : ''}`;
   const mobileOverlayOpen = isMobileViewport && (showSidebar || mobileSourcePreviewOpen);
+  const workspaceStyle = useMemo(() => ({
+    '--nav-width': `${NAV_RAIL_WIDTH}px`,
+    '--sidebar-width': showSidebar ? `${clampPanelWidth('left', sidebarWidth)}px` : '0px',
+    '--inspector-width': showInspector ? `${clampPanelWidth('right', inspectorWidth)}px` : '0px',
+  }) as CSSProperties, [clampPanelWidth, inspectorWidth, showInspector, showSidebar, sidebarWidth]);
+  const startPanelResize = useCallback((side: 'left' | 'right', event: ReactPointerEvent<HTMLDivElement>) => {
+    if (isMobileViewport) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setPanelResizeState({
+      side,
+      startX: event.clientX,
+      startWidth: side === 'left' ? sidebarWidth : inspectorWidth,
+    });
+  }, [inspectorWidth, isMobileViewport, sidebarWidth]);
 
   useEffect(() => {
     if (!selectedNode) {
@@ -6372,12 +7855,13 @@ export default function App() {
 
     setNodeInspectorDraft({
       label: selectedNode.label,
+      annotation: nodeAnnotationMap[selectedNode.id] ?? '',
       shape: selectedNode.shape,
       fill: selectedNode.fill,
       stroke: selectedNode.stroke,
       textColor: selectedNode.textColor,
     });
-  }, [selectedNode]);
+  }, [nodeAnnotationMap, selectedNode]);
 
   useEffect(() => {
     if (!selectedEdge) {
@@ -6450,6 +7934,14 @@ export default function App() {
   }, [aiSettings]);
 
   useEffect(() => {
+    localStorage.setItem(storageKeys.sidebarWidth, String(Math.round(sidebarWidth)));
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    localStorage.setItem(storageKeys.inspectorWidth, String(Math.round(inspectorWidth)));
+  }, [inspectorWidth]);
+
+  useEffect(() => {
     localStorage.setItem(storageKeys.aiChat, JSON.stringify(aiMessages.slice(-24)));
   }, [aiMessages]);
 
@@ -6461,6 +7953,63 @@ export default function App() {
       localStorage.removeItem(storageKeys.aiLastMarkdown);
     }
   }, [aiLastMarkdown]);
+
+  useEffect(() => {
+    if (!panelResizeState || isMobileViewport) {
+      return;
+    }
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'ew-resize';
+    document.body.style.userSelect = 'none';
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const deltaX = event.clientX - panelResizeState.startX;
+      if (panelResizeState.side === 'left') {
+        setSidebarWidth(clampPanelWidth('left', panelResizeState.startWidth + deltaX));
+        return;
+      }
+
+      setInspectorWidth(clampPanelWidth('right', panelResizeState.startWidth - deltaX));
+    };
+
+    const stopResize = () => {
+      setPanelResizeState(null);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopResize);
+    window.addEventListener('pointercancel', stopResize);
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopResize);
+      window.removeEventListener('pointercancel', stopResize);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+  }, [clampPanelWidth, isMobileViewport, panelResizeState]);
+
+  useEffect(() => {
+    if (isMobileViewport) {
+      return;
+    }
+
+    const syncPanelWidths = () => {
+      setSidebarWidth((current) => clampPanelWidth('left', current));
+      setInspectorWidth((current) => clampPanelWidth('right', current));
+    };
+
+    syncPanelWidths();
+    window.addEventListener('resize', syncPanelWidths);
+
+    return () => {
+      window.removeEventListener('resize', syncPanelWidths);
+    };
+  }, [clampPanelWidth, isMobileViewport]);
 
   const getProjectMarkdown = useCallback(() => (
     documentRef.current.markdown ?? documentRef.current.source
@@ -6533,7 +8082,7 @@ export default function App() {
         case 'updateContentMarkdown': {
           next = {
             ...next,
-            suffixMarkdown: buildContentSuffixMarkdown(trimMultilineBlock(operation.markdown)),
+            contentMarkdown: trimMultilineBlock(operation.markdown),
           };
           applied += 1;
           break;
@@ -6572,6 +8121,27 @@ export default function App() {
           applied += 1;
           break;
         }
+        case 'updateNodeAnnotation': {
+          if (!next.nodes.some((node) => node.id === operation.nodeId)) {
+            warnings.push(`Missing node: ${operation.nodeId}`);
+            break;
+          }
+          const normalizedAnnotation = trimMultilineBlock(operation.annotation);
+          const nextAnnotations = {
+            ...(next.nodeAnnotations ?? {}),
+          };
+          if (normalizedAnnotation) {
+            nextAnnotations[operation.nodeId] = normalizedAnnotation;
+          } else {
+            delete nextAnnotations[operation.nodeId];
+          }
+          next = {
+            ...next,
+            nodeAnnotations: nextAnnotations,
+          };
+          applied += 1;
+          break;
+        }
         case 'deleteNode': {
           if (!next.nodes.some((node) => node.id === operation.nodeId)) {
             warnings.push(`Missing node: ${operation.nodeId}`);
@@ -6581,6 +8151,9 @@ export default function App() {
             ...next,
             nodes: next.nodes.filter((node) => node.id !== operation.nodeId),
             edges: next.edges.filter((edge) => edge.from !== operation.nodeId && edge.to !== operation.nodeId),
+            nodeAnnotations: Object.fromEntries(
+              Object.entries(next.nodeAnnotations ?? {}).filter(([nodeId]) => nodeId !== operation.nodeId),
+            ),
           };
           applied += 1;
           break;
@@ -6743,23 +8316,46 @@ export default function App() {
           throw new Error('markdown is required.');
         }
 
-        const nextMarkdown = setProjectMarkdown(markdown);
+        const currentDocument = structuredClone(documentRef.current);
+        const parsed = parseProjectMarkdown(
+          markdown,
+          currentDocument.projectName ?? 'Untitled Project',
+          currentDocument.layout,
+        );
+        const lockedCandidate = applyAiLocksToMarkdown(parsed, currentDocument, aiSettings);
+        const nextDocument = materializeDocument(lockedCandidate);
+        applyCommittedDocument(
+          nextDocument,
+          '已通过 AI 更新 Markdown',
+          'AI 已通过 Tool API 写入完整工程 Markdown。',
+          currentDocument,
+        );
         return {
           ok: true,
-          markdown: nextMarkdown,
+          markdown: nextDocument.markdown ?? nextDocument.source,
           revision: documentRevisionRef.current,
         };
       }
       case 'apply_graph_operation_batch': {
-        const operations = Array.isArray(argumentsObject.operations)
+        const incomingOperations = Array.isArray(argumentsObject.operations)
           ? argumentsObject.operations as GraphOperation[]
           : [];
-        if (operations.length === 0) {
+        if (incomingOperations.length === 0) {
           throw new Error('operations is required.');
+        }
+        const filtered = filterGraphOperationsByAiLocks(incomingOperations, aiSettings);
+        if (filtered.operations.length === 0) {
+          return {
+            ok: true,
+            applied: 0,
+            warnings: filtered.warnings,
+            revision: documentRevisionRef.current,
+            markdown: getProjectMarkdown(),
+          };
         }
 
         const result = applyGraphOperationBatch(
-          operations,
+          filtered.operations,
           {
             expectedRevision:
               typeof argumentsObject.expectedRevision === 'number'
@@ -6772,20 +8368,21 @@ export default function App() {
             detail:
               typeof argumentsObject.detail === 'string'
                 ? argumentsObject.detail
-                : `AI 已应用 ${operations.length} 个结构操作。`,
+                : `AI 已应用 ${filtered.operations.length} 个结构操作。`,
           },
         );
 
         return {
           ok: true,
           ...result,
+          warnings: [...filtered.warnings, ...result.warnings],
           markdown: getProjectMarkdown(),
         };
       }
       default:
         throw new Error(`Unsupported tool: ${name}`);
     }
-  }, [applyGraphOperationBatch, getGraphSemanticSnapshot, getProjectMarkdown, setProjectMarkdown]);
+  }, [aiSettings, applyCommittedDocument, applyGraphOperationBatch, getGraphSemanticSnapshot, getProjectMarkdown]);
 
   const sendAiMessage = useCallback(async () => {
     const prompt = aiInput.trim();
@@ -6816,7 +8413,11 @@ export default function App() {
         },
         {
           role: 'system',
-          content: `Tool rules:\n${aiToolRules}`,
+          content: `Tool rules:\n${aiToolRules}\n\nLock rules:\n${buildAiLockRules(aiSettings)}`,
+        },
+        {
+          role: 'system',
+          content: `Project format:\n${aiProjectFormatGuide}`,
         },
         {
           role: 'system',
@@ -7126,6 +8727,9 @@ export default function App() {
                 <button className="desktop-command-button" onClick={compactLayout} type="button">
                   整理
                 </button>
+                <button className="desktop-command-button" onClick={autoLayout} type="button">
+                  布局
+                </button>
                 <button className="desktop-command-button" onClick={standardizeCurrentProject} type="button">
                   标准化
                 </button>
@@ -7148,11 +8752,18 @@ export default function App() {
                   源码
                 </button>
                 <button
-                  className={showInspector ? 'desktop-command-button is-active' : 'desktop-command-button'}
-                  onClick={toggleInspector}
+                  className={showInspector && inspectorView === 'properties' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  onClick={() => openInspectorView('properties')}
                   type="button"
                 >
                   属性
+                </button>
+                <button
+                  className={showInspector && inspectorView === 'ai' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  onClick={() => openInspectorView('ai')}
+                  type="button"
+                >
+                  AI
                 </button>
                 <button
                   className={selection.kind !== 'none' ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
@@ -7282,7 +8893,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className={workspaceClassName}>
+      <main className={workspaceClassName} ref={workspaceRef} style={workspaceStyle}>
         {mobileOverlayOpen ? (
           <button
             aria-label="关闭当前面板"
@@ -7321,6 +8932,16 @@ export default function App() {
           >
             <WorkbenchIcon name={showSidebar ? 'chevron-left' : 'chevron-right'} />
           </button>
+        ) : null}
+
+        {!isMobileViewport && showSidebar ? (
+          <div
+            aria-label="拖拽调整左侧栏宽度"
+            aria-orientation="vertical"
+            className="panel-resizer panel-resizer--left"
+            onPointerDown={(event) => startPanelResize('left', event)}
+            role="separator"
+          />
         ) : null}
 
         <aside className={`sidebar${showSidebar ? ' is-open' : ''}`}>
@@ -7684,9 +9305,35 @@ export default function App() {
                         key={frame.id}
                         className={`subgraph-frame${selection.kind === 'subgraph' && selectionContains(selection, frame.id) ? ' is-selected' : ''}${dragTargetSubgraphId === frame.id ? ' is-drop-target' : ''}${subgraph.collapsed ? ' is-collapsed' : ''}`}
                         data-edge-endpoint-id={frame.id}
+                        onDoubleClick={(event) => {
+                          if (isMobileViewport) {
+                            return;
+                          }
+                          const target = event.target as HTMLElement;
+                          if (target.closest('.subgraph-frame__header, .subgraph-frame__action, .subgraph-frame__connector, .subgraph-frame__title-input, .subgraph-frame__title-button')) {
+                            return;
+                          }
+
+                          if (subgraph.collapsed) {
+                            return;
+                          }
+
+                          event.stopPropagation();
+                          const point = pointFromClient(event.clientX, event.clientY);
+                          if (!point) {
+                            return;
+                          }
+
+                          createNodeAt(point, undefined, 'solid', frame.id);
+                        }}
                         onPointerDown={(event) => {
                           const target = event.target as HTMLElement;
                           if (target.closest('.subgraph-frame__header, .subgraph-frame__action, .subgraph-frame__connector, .subgraph-frame__title-input')) {
+                            return;
+                          }
+
+                          if (event.button === 2) {
+                            startSubgraphDrag(event, frame.id);
                             return;
                           }
 
@@ -7820,6 +9467,7 @@ export default function App() {
                       event.stopPropagation();
                       startContentInlineEdit();
                     }}
+                    onWheelCapture={(event) => event.stopPropagation()}
                     onPointerDown={(event) => {
                       const target = event.target as HTMLElement;
                       if (target.closest('.content-card__action, .content-card__editor')) {
@@ -7841,8 +9489,8 @@ export default function App() {
                     style={{
                       left: contentCardRenderLayout.x,
                       top: contentCardRenderLayout.y,
-                      width: contentCardSize.width,
-                      height: contentCardSize.height,
+                      width: Math.min(contentCardSize.width, 520),
+                      height: Math.min(contentCardCollapsed ? contentCardSize.height : contentCardSize.height, contentCardCollapsed ? 120 : 420),
                     }}
                   >
                     <div
@@ -7894,6 +9542,7 @@ export default function App() {
                           }
                         }}
                         onPointerDown={(event) => event.stopPropagation()}
+                        onWheelCapture={(event) => event.stopPropagation()}
                         rows={Math.max(8, contentInspectorDraft.markdown.split(/\r?\n/).length + 2)}
                         spellCheck={false}
                         value={contentInspectorDraft.markdown}
@@ -7905,6 +9554,8 @@ export default function App() {
                     ) : (
                       <div
                         className="content-card__body"
+                        onDoubleClick={(event) => event.stopPropagation()}
+                        onWheelCapture={(event) => event.stopPropagation()}
                         dangerouslySetInnerHTML={{ __html: contentCardPreviewHtml }}
                       />
                     )}
@@ -7993,7 +9644,7 @@ export default function App() {
                         <g key={edge.id}>
                           {isEdgeSelected ? (
                             <path
-                              className={`edge-path edge-path--selection${isGroupEdge ? ' is-group-edge' : ''}`}
+                              className={`edge-path edge-path--selection${isGroupEdge ? ' is-group-edge' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
                               d={geometry.path}
                               markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-outline)'}
                               pointerEvents="none"
@@ -8002,7 +9653,7 @@ export default function App() {
                             />
                           ) : null}
                           <path
-                            className={`edge-path edge-path--outline edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
+                            className={`edge-path edge-path--outline edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
                             d={geometry.path}
                             markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-outline)'}
                             pointerEvents="none"
@@ -8011,7 +9662,7 @@ export default function App() {
                             strokeWidth={outlineWidth}
                           />
                           <path
-                            className={`edge-path edge-path--main edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}`}
+                            className={`edge-path edge-path--main edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
                             d={geometry.path}
                             markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-solid)'}
                             pointerEvents="none"
@@ -8149,6 +9800,23 @@ export default function App() {
                       );
                     })}
 
+                    {dragInsertPreview ? (
+                      <>
+                        <path
+                          className="edge-path edge-path--preview edge-path--insert-preview"
+                          d={dragInsertPreview.first.path}
+                          markerEnd="url(#arrow-solid)"
+                          stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
+                        />
+                        <path
+                          className="edge-path edge-path--preview edge-path--insert-preview"
+                          d={dragInsertPreview.second.path}
+                          markerEnd="url(#arrow-solid)"
+                          stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
+                        />
+                      </>
+                    ) : null}
+
                     {connectingState ? (
                       <path
                         className="edge-path edge-path--preview"
@@ -8178,7 +9846,7 @@ export default function App() {
                     return (
                       <div
                         key={node.id}
-                        className={`graph-node graph-node--${node.shape}${selected ? ' is-selected' : ''}${hoveredNodeId === node.id ? ' is-hovered' : ''}`}
+                        className={`graph-node graph-node--${node.shape}${selected ? ' is-selected' : ''}${hoveredNodeId === node.id ? ' is-hovered' : ''}${dragTargetNodeId === node.id ? ' is-drop-target' : ''}`}
                         data-edge-endpoint-id={node.id}
                         data-node-id={node.id}
                         onDoubleClick={(event) => {
@@ -8287,271 +9955,88 @@ export default function App() {
                   />
                 ) : null}
 
-                <div className="tool-dock-cluster">
-                  <div className="tool-dock" role="toolbar" aria-label="画布工具">
-                    <button
-                      aria-label="选择"
-                      className="tool-dock__button has-tooltip is-active"
-                      data-tooltip="选择"
-                      type="button"
-                    >
-                      <WorkbenchIcon name="cursor" />
-                    </button>
-                    <button
-                      aria-label="新建节点"
-                      className="tool-dock__button has-tooltip"
-                      data-tooltip="新建节点"
-                      onClick={() => {
-                        const viewport = documentState.layout.viewport;
-                        createNodeAt({
-                          x: (540 - viewport.x) / viewport.zoom,
-                          y: (260 - viewport.y) / viewport.zoom,
-                        });
-                      }}
-                      type="button"
-                    >
-                      <WorkbenchIcon name="node" />
-                    </button>
-                    <button
-                      aria-label="创建分组"
-                      className={canGroupSelection ? 'tool-dock__button has-tooltip' : 'tool-dock__button has-tooltip is-disabled'}
-                      data-tooltip="创建分组"
-                      disabled={!canGroupSelection}
-                      onClick={wrapSelectionInSubgraph}
-                      type="button"
-                    >
-                      <WorkbenchIcon name="group" />
-                    </button>
-                    <button
-                      aria-label="重置视口"
-                      className="tool-dock__button has-tooltip"
-                      data-tooltip="重置视口"
-                      onClick={() => {
-                        updateViewport(() => ({ x: 120, y: 90, zoom: 1 }));
-                        setHistory((current) => [
-                          createHistoryEntry('视口已重置', '已重置画布视角。'),
-                          ...current,
-                        ].slice(0, 40));
-                      }}
-                      type="button"
-                    >
-                      <WorkbenchIcon name="reset" />
-                    </button>
-
-                    <span className="tool-dock__divider" />
-
-                    <button
-                      aria-label="缩小"
-                      className="tool-dock__button has-tooltip"
-                      data-tooltip="缩小"
-                      onClick={() =>
-                        updateViewport((viewport) => ({
-                          ...viewport,
-                          zoom: clamp(viewport.zoom - 0.1, 0.35, 2.8),
-                        }))
-                      }
-                      type="button"
-                    >
-                      <WorkbenchIcon name="minus" />
-                    </button>
-                    <span className="tool-dock__zoom">{Math.round(documentState.layout.viewport.zoom * 100)}%</span>
-                    <button
-                      aria-label="放大"
-                      className="tool-dock__button has-tooltip"
-                      data-tooltip="放大"
-                      onClick={() =>
-                        updateViewport((viewport) => ({
-                          ...viewport,
-                          zoom: clamp(viewport.zoom + 0.1, 0.35, 2.8),
-                        }))
-                      }
-                      type="button"
-                    >
-                      <WorkbenchIcon name="plus" />
-                    </button>
-                  </div>
-
+                <div className="tool-dock" role="toolbar" aria-label="画布工具">
                   <button
-                    aria-label="打开 AI 助手"
-                    className={aiPanelOpen ? 'ai-trigger has-tooltip is-active' : 'ai-trigger has-tooltip'}
-                    data-tooltip="AI 助手"
+                    aria-label="选择"
+                    className="tool-dock__button has-tooltip is-active"
+                    data-tooltip="选择"
+                    type="button"
+                  >
+                    <WorkbenchIcon name="cursor" />
+                  </button>
+                  <button
+                    aria-label="新建节点"
+                    className="tool-dock__button has-tooltip"
+                    data-tooltip="新建节点"
                     onClick={() => {
-                      setAiPanelOpen((current) => !current);
-                      setAiPanelTab('chat');
+                      const viewport = documentState.layout.viewport;
+                      createNodeAt({
+                        x: (540 - viewport.x) / viewport.zoom,
+                        y: (260 - viewport.y) / viewport.zoom,
+                      });
                     }}
                     type="button"
                   >
-                    <WorkbenchIcon name="chat" />
+                    <WorkbenchIcon name="node" />
+                  </button>
+                  <button
+                    aria-label="创建分组"
+                    className={canGroupSelection ? 'tool-dock__button has-tooltip' : 'tool-dock__button has-tooltip is-disabled'}
+                    data-tooltip="创建分组"
+                    disabled={!canGroupSelection}
+                    onClick={wrapSelectionInSubgraph}
+                    type="button"
+                  >
+                    <WorkbenchIcon name="group" />
+                  </button>
+                  <button
+                    aria-label="重置视口"
+                    className="tool-dock__button has-tooltip"
+                    data-tooltip="重置视口"
+                    onClick={() => {
+                      updateViewport(() => ({ x: 120, y: 90, zoom: 1 }));
+                      setHistory((current) => [
+                        createHistoryEntry('视口已重置', '已重置画布视角。'),
+                        ...current,
+                      ].slice(0, 40));
+                    }}
+                    type="button"
+                  >
+                    <WorkbenchIcon name="reset" />
+                  </button>
+
+                  <span className="tool-dock__divider" />
+
+                  <button
+                    aria-label="缩小"
+                    className="tool-dock__button has-tooltip"
+                    data-tooltip="缩小"
+                    onClick={() =>
+                      updateViewport((viewport) => ({
+                        ...viewport,
+                        zoom: clamp(viewport.zoom - 0.1, 0.35, 2.8),
+                      }))
+                    }
+                    type="button"
+                  >
+                    <WorkbenchIcon name="minus" />
+                  </button>
+                  <span className="tool-dock__zoom">{Math.round(documentState.layout.viewport.zoom * 100)}%</span>
+                  <button
+                    aria-label="放大"
+                    className="tool-dock__button has-tooltip"
+                    data-tooltip="放大"
+                    onClick={() =>
+                      updateViewport((viewport) => ({
+                        ...viewport,
+                        zoom: clamp(viewport.zoom + 0.1, 0.35, 2.8),
+                      }))
+                    }
+                    type="button"
+                  >
+                    <WorkbenchIcon name="plus" />
                   </button>
                 </div>
-
-                {aiPanelOpen ? (
-                  <section
-                    aria-label="AI 测试面板"
-                    className="ai-panel"
-                    onPointerDownCapture={(event) => event.stopPropagation()}
-                    onTouchEndCapture={(event) => event.stopPropagation()}
-                    onTouchMoveCapture={(event) => event.stopPropagation()}
-                    onTouchStartCapture={(event) => event.stopPropagation()}
-                    onWheelCapture={(event) => event.stopPropagation()}
-                    ref={aiPanelRef}
-                  >
-                    <div className="ai-panel__header">
-                      <div>
-                        <p className="eyebrow">AI Sandbox</p>
-                        <h2>AI 助手</h2>
-                      </div>
-                      <button
-                        aria-label="关闭 AI 助手"
-                        className="panel-icon-button"
-                        onClick={() => setAiPanelOpen(false)}
-                        type="button"
-                      >
-                        <WorkbenchIcon name="chevron-right" />
-                      </button>
-                    </div>
-
-                    <div className="ai-panel__tabs" role="tablist" aria-label="AI 面板页签">
-                      <button
-                        className={aiPanelTab === 'chat' ? 'ai-panel__tab is-active' : 'ai-panel__tab'}
-                        onClick={() => setAiPanelTab('chat')}
-                        type="button"
-                      >
-                        <WorkbenchIcon name="chat" />
-                        <span>聊天</span>
-                      </button>
-                      <button
-                        className={aiPanelTab === 'settings' ? 'ai-panel__tab is-active' : 'ai-panel__tab'}
-                        onClick={() => setAiPanelTab('settings')}
-                        type="button"
-                      >
-                        <WorkbenchIcon name="settings" />
-                        <span>设置</span>
-                      </button>
-                    </div>
-
-                    {aiPanelTab === 'chat' ? (
-                      <>
-                        <div
-                          className="ai-panel__messages"
-                          onWheelCapture={(event) => event.stopPropagation()}
-                        >
-                          {aiMessages.map((message) => (
-                            <article
-                              className={
-                                message.status === 'error'
-                                  ? `ai-message ai-message--${message.role} is-error`
-                                  : `ai-message ai-message--${message.role}`
-                              }
-                              key={message.id}
-                            >
-                              <strong>{message.role === 'assistant' ? 'AI' : '你'}</strong>
-                              <p>{message.content}</p>
-                            </article>
-                          ))}
-                          {aiSending ? (
-                            <article className="ai-message ai-message--assistant">
-                              <strong>AI</strong>
-                              <p>正在思考当前工程上下文...</p>
-                            </article>
-                          ) : null}
-                        </div>
-                        <div className="ai-panel__composer">
-                          <textarea
-                            className="ai-panel__input"
-                            onChange={(event) => setAiInput(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (handleNativeSelectAllShortcut(event)) {
-                                return;
-                              }
-
-                              if (event.key === 'Enter' && !event.shiftKey) {
-                                event.preventDefault();
-                                void sendAiMessage();
-                              }
-                            }}
-                            onWheelCapture={(event) => event.stopPropagation()}
-                            placeholder="直接提问，当前图结构和完整 Markdown 会自动带入上下文。"
-                            rows={4}
-                            value={aiInput}
-                          />
-                          <div className="ai-panel__composer-bar">
-                            <span>Enter 发送，Shift + Enter 换行</span>
-                            <button
-                              className="solid-button"
-                              disabled={aiSending || !aiInput.trim()}
-                              onClick={() => {
-                                void sendAiMessage();
-                              }}
-                              type="button"
-                            >
-                              发送
-                            </button>
-                          </div>
-                        </div>
-                      </>
-                    ) : (
-                      <div
-                        className="ai-panel__settings"
-                        onWheelCapture={(event) => event.stopPropagation()}
-                      >
-                        <label className="field">
-                          <span>API URL</span>
-                          <input
-                            onChange={(event) =>
-                              setAiSettings((current) => ({ ...current, apiUrl: event.target.value }))
-                            }
-                            type="url"
-                            value={aiSettings.apiUrl}
-                          />
-                        </label>
-                        <label className="field">
-                          <span>API Key</span>
-                          <input
-                            onChange={(event) =>
-                              setAiSettings((current) => ({ ...current, apiKey: event.target.value }))
-                            }
-                            type="password"
-                            value={aiSettings.apiKey}
-                          />
-                        </label>
-                        <label className="field">
-                          <span>Model</span>
-                          <input
-                            onChange={(event) =>
-                              setAiSettings((current) => ({ ...current, model: event.target.value }))
-                            }
-                            type="text"
-                            value={aiSettings.model}
-                          />
-                        </label>
-                        <label className="field">
-                          <span>Context Window</span>
-                          <input
-                            onChange={(event) =>
-                              setAiSettings((current) => ({
-                                ...current,
-                                contextWindow: Number.parseInt(event.target.value, 10) || current.contextWindow,
-                              }))
-                            }
-                            type="number"
-                            value={aiSettings.contextWindow}
-                          />
-                        </label>
-                        <label className="field">
-                          <span>System Prompt</span>
-                          <textarea
-                            onChange={(event) =>
-                              setAiSettings((current) => ({ ...current, systemPrompt: event.target.value }))
-                            }
-                            rows={6}
-                            value={aiSettings.systemPrompt}
-                          />
-                        </label>
-                      </div>
-                    )}
-                  </section>
-                ) : null}
               </div>
             </div>
           ) : null}
@@ -8658,6 +10143,25 @@ export default function App() {
             <div className="mobile-sheet-handle" aria-hidden="true" />
           ) : null}
 
+          <div className="inspector-tabs" role="tablist" aria-label="右侧面板视图">
+            <button
+              className={inspectorView === 'properties' ? 'inspector-tab is-active' : 'inspector-tab'}
+              onClick={() => setInspectorView('properties')}
+              type="button"
+            >
+              属性
+            </button>
+            <button
+              className={inspectorView === 'ai' ? 'inspector-tab is-active' : 'inspector-tab'}
+              onClick={() => setInspectorView('ai')}
+              type="button"
+            >
+              AI
+            </button>
+          </div>
+
+          {inspectorView === 'properties' ? (
+            <>
           {selectedNode ? (
             <section className="sidebar-card">
               <div className="sidebar-card__header">
@@ -8684,6 +10188,29 @@ export default function App() {
                   }}
                   rows={4}
                   value={nodeInspectorDraft.label}
+                />
+              </label>
+              <label className="field">
+                <span>注释</span>
+                <textarea
+                  onBlur={() => applyNodeInspectorDraft()}
+                  onChange={(event) =>
+                    setNodeInspectorDraft((current) => ({ ...current, annotation: event.target.value }))
+                  }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault();
+                      applyNodeInspectorDraft();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  placeholder="节点注释会写入 ## Node Annotations，并随节点生命周期自动清理。"
+                  rows={3}
+                  value={nodeInspectorDraft.annotation}
                 />
               </label>
               <label className="field">
@@ -9008,7 +10535,7 @@ export default function App() {
                       event.currentTarget.blur();
                     }
                   }}
-                  rows={Math.max(12, contentInspectorDraft.markdown.split(/\r?\n/).length + 3)}
+                  rows={Math.min(10, Math.max(7, contentInspectorDraft.markdown.split(/\r?\n/).length + 2))}
                   value={contentInspectorDraft.markdown}
                 />
               </label>
@@ -9067,7 +10594,7 @@ export default function App() {
                       event.currentTarget.blur();
                     }
                   }}
-                  rows={4}
+                  rows={3}
                   value={projectInspectorDraft.projectSummary}
                 />
               </label>
@@ -9092,12 +10619,184 @@ export default function App() {
                       event.currentTarget.blur();
                     }
                   }}
-                  rows={Math.max(12, projectInspectorDraft.contentMarkdown.split(/\r?\n/).length + 3)}
+                  rows={Math.min(10, Math.max(7, projectInspectorDraft.contentMarkdown.split(/\r?\n/).length + 2))}
                   value={projectInspectorDraft.contentMarkdown}
                 />
               </label>
             </section>
           ) : null}
+            </>
+          ) : (
+            <section className="sidebar-card sidebar-card--ai">
+              <div className="sidebar-card__header">
+                <h2>AI 助手</h2>
+                <span>Local only</span>
+              </div>
+
+              <div className="ai-panel__tabs" role="tablist" aria-label="AI 面板页签">
+                <button
+                  className={aiPanelTab === 'chat' ? 'ai-panel__tab is-active' : 'ai-panel__tab'}
+                  onClick={() => setAiPanelTab('chat')}
+                  type="button"
+                >
+                  <WorkbenchIcon name="chat" />
+                  <span>聊天</span>
+                </button>
+                <button
+                  className={aiPanelTab === 'settings' ? 'ai-panel__tab is-active' : 'ai-panel__tab'}
+                  onClick={() => setAiPanelTab('settings')}
+                  type="button"
+                >
+                  <WorkbenchIcon name="settings" />
+                  <span>设置</span>
+                </button>
+              </div>
+
+              {aiPanelTab === 'chat' ? (
+                <>
+                  <div className="ai-panel__messages" onWheelCapture={(event) => event.stopPropagation()}>
+                    {aiMessages.map((message) => (
+                      <article
+                        className={
+                          message.status === 'error'
+                            ? `ai-message ai-message--${message.role} is-error`
+                            : `ai-message ai-message--${message.role}`
+                        }
+                        key={message.id}
+                      >
+                        <strong>{message.role === 'assistant' ? 'AI' : '你'}</strong>
+                        <p>{message.content}</p>
+                      </article>
+                    ))}
+                    {aiSending ? (
+                      <article className="ai-message ai-message--assistant">
+                        <strong>AI</strong>
+                        <p>正在思考当前工程上下文...</p>
+                      </article>
+                    ) : null}
+                  </div>
+                  <section className="ai-agent-controls" aria-label="Agent 模式控制">
+                    <div className="ai-agent-controls__header">
+                      <strong>Agent 模式</strong>
+                      <span>锁定的部分会直接禁止 AI 改写</span>
+                    </div>
+                    <div className="ai-agent-controls__list">
+                      {aiLockControls.map((control) => {
+                        const checked = aiSettings[control.key];
+                        return (
+                          <button
+                            aria-pressed={!checked}
+                            className={checked ? 'ai-agent-toggle is-locked' : 'ai-agent-toggle is-unlocked'}
+                            key={control.key}
+                            onClick={() =>
+                              setAiSettings((current) => ({
+                                ...current,
+                                [control.key]: !current[control.key],
+                              }))
+                            }
+                            type="button"
+                          >
+                            <span className="ai-agent-toggle__state">{checked ? '锁定' : '开锁'}</span>
+                            <span className="ai-agent-toggle__label">{control.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                  <div className="ai-panel__composer">
+                    <textarea
+                      className="ai-panel__input"
+                      onChange={(event) => setAiInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (handleNativeSelectAllShortcut(event)) {
+                          return;
+                        }
+
+                        if (event.key === 'Enter' && !event.shiftKey) {
+                          event.preventDefault();
+                          void sendAiMessage();
+                        }
+                      }}
+                      onWheelCapture={(event) => event.stopPropagation()}
+                      placeholder="当前会自动附带完整 Markdown、上一轮改动、当前选中内容和工具规则。"
+                      rows={3}
+                      value={aiInput}
+                    />
+                    <div className="ai-panel__composer-bar">
+                      <span>Enter 发送，Shift + Enter 换行</span>
+                      <button
+                        className="solid-button"
+                        disabled={aiSending || !aiInput.trim()}
+                        onClick={() => {
+                          void sendAiMessage();
+                        }}
+                        type="button"
+                      >
+                        发送
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="ai-panel__settings" onWheelCapture={(event) => event.stopPropagation()}>
+                  <label className="field">
+                    <span>API URL</span>
+                    <input
+                      onChange={(event) =>
+                        setAiSettings((current) => ({ ...current, apiUrl: event.target.value }))
+                      }
+                      type="url"
+                      value={aiSettings.apiUrl}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>API Key</span>
+                    <input
+                      onChange={(event) =>
+                        setAiSettings((current) => ({ ...current, apiKey: event.target.value }))
+                      }
+                      type="password"
+                      value={aiSettings.apiKey}
+                    />
+                    <small>仅保存在当前浏览器，不写入工程 Markdown。</small>
+                  </label>
+                  <label className="field">
+                    <span>Model</span>
+                    <input
+                      onChange={(event) =>
+                        setAiSettings((current) => ({ ...current, model: event.target.value }))
+                      }
+                      type="text"
+                      value={aiSettings.model}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Context Window</span>
+                    <input
+                      onChange={(event) =>
+                        setAiSettings((current) => ({
+                          ...current,
+                          contextWindow: Number.parseInt(event.target.value, 10) || current.contextWindow,
+                        }))
+                      }
+                      type="number"
+                      value={aiSettings.contextWindow}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>System Prompt</span>
+                    <textarea
+                      onChange={(event) =>
+                        setAiSettings((current) => ({ ...current, systemPrompt: event.target.value }))
+                      }
+                      rows={6}
+                      value={aiSettings.systemPrompt}
+                    />
+                  </label>
+                </div>
+              )}
+            </section>
+          )}
         </aside>
 
         {!isMobileViewport ? (
@@ -9109,6 +10808,16 @@ export default function App() {
           >
             <WorkbenchIcon name={showInspector ? 'chevron-right' : 'chevron-left'} />
           </button>
+        ) : null}
+
+        {!isMobileViewport && showInspector ? (
+          <div
+            aria-label="拖拽调整右侧栏宽度"
+            aria-orientation="vertical"
+            className="panel-resizer panel-resizer--right"
+            onPointerDown={(event) => startPanelResize('right', event)}
+            role="separator"
+          />
         ) : null}
 
         {isMobileViewport && mode === 'source' ? (
@@ -9220,8 +10929,12 @@ export default function App() {
               </article>
               <article className="help-card">
                 <strong>📦 分组层级</strong>
-                <p>按住 `Ctrl/Cmd` 拖拽节点可以放入组或拖出组；中途再按下 `Ctrl/Cmd` 也会切到改层级模式。</p>
+                <p>按住 `Ctrl/Cmd` 拖拽节点或组可以改层级：拖进组里会纳入该组，拖到外层会脱出；拖到另一个节点上会把那个节点直接转换成分组；如果把组里唯一的节点拖出来，空组会自动收缩回一个普通节点。</p>
               </article>
+	              <article className="help-card">
+	                <strong>🧩 插入连线</strong>
+	                <p>按住 `Ctrl/Cmd` 拖拽单个节点或组到一条连线中间，会把它插入这条线：原来的 `A -&gt; C` 会变成 `A -&gt; B -&gt; C`，并保留原来前半段的线条文字。</p>
+	              </article>
             </div>
           </section>
         </div>

@@ -47,6 +47,12 @@ ${sampleMermaidSource}
 - This area is regular Markdown content.
 - The canvas editor will not rewrite this content.
 
+## Node Annotations
+
+### \`Review\`
+
+This decision node should stay explicit for reviewers.
+
 \`\`\`lths-compat
 v1
 \`\`\`

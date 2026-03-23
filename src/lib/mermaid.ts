@@ -17,9 +17,9 @@ const defaultNodeStyle = {
 };
 
 export const defaultSubgraphStyle = {
-  fill: '#d7efff',
-  stroke: '#38bdf8',
-  textColor: '#083344',
+  fill: '#fff8ef',
+  stroke: '#24404f',
+  textColor: '#12212c',
 };
 
 export const defaultEdgeStyle = {
@@ -509,13 +509,17 @@ export function parseMermaidDocument(
 
     const parsedEdge = parseEdgeLine(line);
     if (parsedEdge) {
-      const from = ensureNode(parsedEdge.from);
-      const to = ensureNode(parsedEdge.to);
-      if (from && to) {
+      const fromSubgraph = subgraphs.find((subgraph) => subgraph.id === parsedEdge.from.id) ?? null;
+      const toSubgraph = subgraphs.find((subgraph) => subgraph.id === parsedEdge.to.id) ?? null;
+      const from = fromSubgraph ? null : ensureNode(parsedEdge.from);
+      const to = toSubgraph ? null : ensureNode(parsedEdge.to);
+      const fromId = fromSubgraph?.id ?? from?.id ?? null;
+      const toId = toSubgraph?.id ?? to?.id ?? null;
+      if (fromId && toId) {
         edges.push({
           id: crypto.randomUUID(),
-          from: from.id,
-          to: to.id,
+          from: fromId,
+          to: toId,
           label: parsedEdge.label,
           type: parsedEdge.type,
           strokeColor: defaultEdgeStyle.strokeColor,
