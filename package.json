@@ -1,11 +1,51 @@
 {
   "name": "lths_md",
+  "displayName": "LMD_EDITER",
   "private": true,
   "version": "0.1.0",
   "description": "Mermaid spatial editor MVP",
+  "categories": [
+    "Other"
+  ],
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "activationEvents": [
+    "onCustomEditor:lmdEditer.canvas",
+    "onCommand:lmdEditer.openWithCanvas",
+    "onCommand:lmdEditer.openTextSource"
+  ],
+  "main": "./out/extension.cjs",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "lmdEditer.canvas",
+        "displayName": "LMD_EDITER",
+        "selector": [
+          {
+            "filenamePattern": "*.lmd"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "lmdEditer.openWithCanvas",
+        "title": "LMD_EDITER: Open Canvas View"
+      },
+      {
+        "command": "lmdEditer.openTextSource",
+        "title": "LMD_EDITER: Open Text Source"
+      }
+    ]
+  },
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build:webview": "tsc -b && vite build",
+    "build:extension": "tsc -p tsconfig.extension.json",
+    "build:vscode": "pnpm run build:webview && pnpm run build:extension",
+    "build": "pnpm run build:webview",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -17,8 +57,10 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/node": "^24.7.2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@types/vscode": "^1.96.0",
     "@vitejs/plugin-react": "^6.0.1",
     "eslint": "^10.0.3",
     "eslint-plugin-react-hooks": "^7.0.1",

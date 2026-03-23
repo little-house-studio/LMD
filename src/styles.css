@@ -278,6 +278,60 @@ select:focus-visible {
   white-space: nowrap;
 }
 
+.vscode-commandbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  width: 100%;
+}
+
+.vscode-commandbar__file {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 240px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.vscode-commandbar__file strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.76rem;
+  color: var(--ink);
+}
+
+.vscode-commandbar__badge {
+  flex: 0 0 auto;
+  color: var(--ink-faint);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.vscode-commandbar__tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  padding-bottom: 1px;
+  scrollbar-width: none;
+}
+
+.vscode-commandbar__tools::-webkit-scrollbar {
+  display: none;
+}
+
 .desktop-commandbar::-webkit-scrollbar {
   display: none;
 }
@@ -675,6 +729,12 @@ select:focus-visible {
   border-color: rgba(35, 131, 226, 0.26);
   background: rgba(35, 131, 226, 0.12);
   color: var(--ink);
+}
+
+.icon-button.is-disabled,
+.panel-icon-button.is-disabled {
+  opacity: 0.42;
+  pointer-events: none;
 }
 
 .icon-button--primary {

@@ -264,6 +264,18 @@ interface AiMessage {
   status?: 'error';
 }
 
+interface AppHostConfig {
+  platform?: 'web' | 'vscode';
+  initialMarkdown?: string;
+  fileName?: string;
+}
+
+interface VsCodeWebviewApi {
+  postMessage(message: unknown): void;
+  setState?(state: unknown): void;
+  getState?(): unknown;
+}
+
 type AiPanelTab = 'chat' | 'settings';
 type InspectorView = 'properties' | 'ai';
 
@@ -290,7 +302,10 @@ type IconName =
   | 'link-end'
   | 'trash'
   | 'chat'
-  | 'settings';
+  | 'settings'
+  | 'layout'
+  | 'tidy'
+  | 'standardize';
 
 const shapeOptions: Array<{ label: string; value: NodeShape }> = [
   { label: '矩形', value: 'rect' },
@@ -574,6 +589,27 @@ const aiProjectFormatGuide = [
   'Edit the smallest valid layer possible. Prefer section-preserving changes over full rewrites.',
 ].join('\n');
 
+function readAppHostConfig(): AppHostConfig {
+  const config = (window as Window & { __LMD_EDITOR_CONFIG__?: AppHostConfig }).__LMD_EDITOR_CONFIG__;
+  if (!config || typeof config !== 'object') {
+    return { platform: 'web' };
+  }
+
+  return {
+    platform: config.platform === 'vscode' ? 'vscode' : 'web',
+    initialMarkdown: typeof config.initialMarkdown === 'string' ? config.initialMarkdown : undefined,
+    fileName: typeof config.fileName === 'string' ? config.fileName : undefined,
+  };
+}
+
+function getProjectFallbackName(fileName?: string) {
+  if (!fileName) {
+    return 'Untitled LMD';
+  }
+
+  return fileName.replace(/\.(lmd|md)$/i, '') || 'Untitled LMD';
+}
+
 function readStoredJson<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -797,6 +833,30 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
           <path d="M19 12a7.2 7.2 0 0 0-.1-1l2-1.6-2-3.4-2.3.8a7.4 7.4 0 0 0-1.7-1L14.5 3h-5L9 5.8a7.4 7.4 0 0 0-1.7 1L5 6l-2 3.4L5 11a7 7 0 0 0 0 2l-2 1.6L5 18l2.3-.8a7.4 7.4 0 0 0 1.7 1l.5 2.8h5l.5-2.8a7.4 7.4 0 0 0 1.7-1L19 18l2-3.4-2-1.6c.1-.3.1-.7.1-1z" />
         </svg>
       );
+    case 'layout':
+      return (
+        <svg {...props}>
+          <rect x="4.5" y="5" width="5" height="5" rx="1.2" />
+          <rect x="14.5" y="5" width="5" height="5" rx="1.2" />
+          <rect x="9.5" y="14" width="5" height="5" rx="1.2" />
+          <path d="M9.5 7.5h5M7 10v4M17 10v4" />
+        </svg>
+      );
+    case 'tidy':
+      return (
+        <svg {...props}>
+          <path d="M5 7h14M5 12h10M5 17h14" />
+          <path d="M17 10l2 2-2 2" />
+        </svg>
+      );
+    case 'standardize':
+      return (
+        <svg {...props}>
+          <path d="M7 4.5h8l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 6 19V6A1.5 1.5 0 0 1 7.5 4.5z" />
+          <path d="M15 4.5V9h4" />
+          <path d="M9 13l2 2 4-4" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -987,9 +1047,9 @@ function materializeDocument(candidate: GraphDocument): GraphDocument {
   };
 }
 
-function loadWorkspace() {
-  const savedProject = localStorage.getItem(storageKeys.project);
-  const savedHistory = localStorage.getItem(storageKeys.history);
+function loadWorkspace(initialMarkdown?: string, fallbackName = 'Untitled Project', skipStoredState = false) {
+  const savedProject = skipStoredState ? null : localStorage.getItem(storageKeys.project);
+  const savedHistory = skipStoredState ? null : localStorage.getItem(storageKeys.history);
 
   let history: HistoryEntry[] = [createHistoryEntry('工作区已启动', '已打开原型编辑器。')];
 
@@ -999,14 +1059,16 @@ function loadWorkspace() {
     } catch {
       history = [createHistoryEntry('工作区已启动', '已重置本地历史缓存。')];
     }
+  } else if (skipStoredState) {
+    history = [createHistoryEntry('工作区已启动', '已打开 LMD_EDITER。')];
   }
 
-  const projectMarkdown = savedProject ?? sampleProjectMarkdown;
+  const projectMarkdown = initialMarkdown ?? savedProject ?? sampleProjectMarkdown;
   let parsed: GraphDocument;
   try {
-    parsed = parseProjectMarkdown(projectMarkdown, 'Untitled Project', createDefaultLayout());
+    parsed = parseProjectMarkdown(projectMarkdown, fallbackName, createDefaultLayout());
   } catch {
-    parsed = standardizeProjectMarkdown(projectMarkdown, 'Untitled Project', createDefaultLayout());
+    parsed = standardizeProjectMarkdown(projectMarkdown, fallbackName, createDefaultLayout());
   }
 
   return {
@@ -4338,19 +4400,37 @@ function MermaidPreview({ source }: { source: string }) {
 }
 
 export default function App() {
-  const [initialWorkspace] = useState(() => loadWorkspace());
+  const hostConfigRef = useRef(readAppHostConfig());
+  const hostConfig = hostConfigRef.current;
+  const isVsCodeHost = hostConfig.platform === 'vscode';
+  const vscodeApiRef = useRef<VsCodeWebviewApi | null>(null);
+  const lastVsCodeSyncedMarkdownRef = useRef(hostConfig.initialMarkdown ?? '');
+  if (
+    isVsCodeHost &&
+    !vscodeApiRef.current &&
+    'acquireVsCodeApi' in window &&
+    typeof (window as Window & { acquireVsCodeApi?: () => VsCodeWebviewApi }).acquireVsCodeApi === 'function'
+  ) {
+    vscodeApiRef.current = (window as Window & { acquireVsCodeApi: () => VsCodeWebviewApi }).acquireVsCodeApi();
+  }
+
+  const [initialWorkspace] = useState(() =>
+    loadWorkspace(hostConfig.initialMarkdown, getProjectFallbackName(hostConfig.fileName), isVsCodeHost),
+  );
   const [documentState, setDocumentState] = useState<GraphDocument>(initialWorkspace.document);
   const [isMobileViewport, setIsMobileViewport] = useState(() => window.innerWidth <= 820);
   const [isConstrainedDevice, setIsConstrainedDevice] = useState(false);
   const [mode, setMode] = useState<EditorMode>('canvas');
-  const [leftPanel, setLeftPanel] = useState<LeftPanel>('files');
+  const [leftPanel, setLeftPanel] = useState<LeftPanel>(isVsCodeHost ? 'graph' : 'files');
   const [activeFileTab, setActiveFileTab] = useState<WorkspaceTabId>('diagram');
-  const [activeWorkspaceSource, setActiveWorkspaceSource] = useState<'cloud' | 'local'>('cloud');
+  const [activeWorkspaceSource, setActiveWorkspaceSource] = useState<'cloud' | 'local'>(
+    isVsCodeHost ? 'local' : 'cloud',
+  );
   const [localExplorerItems, setLocalExplorerItems] = useState<ExplorerItem[]>(defaultLocalProjectItems);
   const [activeLocalFileId, setActiveLocalFileId] = useState<string | null>(null);
   const [activeLocalDirectoryId, setActiveLocalDirectoryId] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(isVsCodeHost);
+  const [inspectorOpen, setInspectorOpen] = useState(isVsCodeHost);
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     readStoredNumber(storageKeys.sidebarWidth, DEFAULT_SIDEBAR_WIDTH),
   );
@@ -6009,12 +6089,23 @@ export default function App() {
   }, [documentState.markdown]);
 
   const goToMode = useCallback((nextMode: EditorMode) => {
+    if (isVsCodeHost) {
+      if (nextMode === 'source') {
+        vscodeApiRef.current?.postMessage({ type: 'lmd/openSource' });
+        return;
+      }
+
+      if (nextMode === 'history') {
+        return;
+      }
+    }
+
     if (mode === 'source' && nextMode !== 'source' && sourceParseError) {
       return;
     }
 
     setMode(nextMode);
-  }, [mode, sourceParseError]);
+  }, [isVsCodeHost, mode, sourceParseError]);
 
   const openLocalProjectFile = useCallback(async (item: ExplorerItem) => {
     const localEntry = localHandleEntriesRef.current[item.id];
@@ -6453,11 +6544,96 @@ export default function App() {
   }, [mode]);
 
   useEffect(() => {
+    if (!isVsCodeHost) {
+      return;
+    }
+
+    if (leftPanel !== 'graph') {
+      setLeftPanel('graph');
+    }
+
+    if (inspectorView !== 'properties') {
+      setInspectorView('properties');
+    }
+
+    if (mode !== 'canvas') {
+      setMode('canvas');
+    }
+  }, [inspectorView, isVsCodeHost, leftPanel, mode]);
+
+  useEffect(() => {
     if (previousModeRef.current === 'source' && mode !== 'source') {
       commitSourceDraft();
     }
     previousModeRef.current = mode;
   }, [commitSourceDraft, mode]);
+
+  useEffect(() => {
+    if (!isVsCodeHost) {
+      return;
+    }
+
+    const applyIncomingMarkdown = (markdown: string, nextFileName?: string) => {
+      const currentMarkdown = documentRef.current.markdown ?? documentRef.current.source;
+      if (markdown === currentMarkdown) {
+        lastVsCodeSyncedMarkdownRef.current = markdown;
+        return;
+      }
+
+      const fallbackName = getProjectFallbackName(nextFileName ?? hostConfig.fileName);
+
+      try {
+        const parsed = materializeDocument(
+          parseProjectMarkdown(markdown, fallbackName, documentRef.current.layout),
+        );
+        lastVsCodeSyncedMarkdownRef.current = markdown;
+        setDocumentState(parsed);
+        setSourceDraft(parsed.markdown ?? parsed.source);
+        setSaveStatus('saved');
+        return;
+      } catch {
+        try {
+          const standardized = materializeDocument(
+            standardizeProjectMarkdown(markdown, fallbackName, documentRef.current.layout),
+          );
+          lastVsCodeSyncedMarkdownRef.current = standardized.markdown ?? markdown;
+          setDocumentState(standardized);
+          setSourceDraft(standardized.markdown ?? standardized.source);
+          setSaveStatus('saved');
+          return;
+        } catch {
+          setSaveStatus('error');
+        }
+      }
+    };
+
+    const handleHostMessage = (event: MessageEvent) => {
+      const payload = event.data;
+      if (!payload || typeof payload !== 'object') {
+        return;
+      }
+
+      if (
+        'type' in payload &&
+        payload.type === 'lmd/document' &&
+        'markdown' in payload &&
+        typeof payload.markdown === 'string'
+      ) {
+        applyIncomingMarkdown(
+          payload.markdown,
+          'fileName' in payload && typeof payload.fileName === 'string'
+            ? payload.fileName
+            : undefined,
+        );
+      }
+    };
+
+    window.addEventListener('message', handleHostMessage);
+    vscodeApiRef.current?.postMessage({ type: 'lmd/ready' });
+    return () => {
+      window.removeEventListener('message', handleHostMessage);
+    };
+  }, [hostConfig.fileName, isVsCodeHost]);
 
   useEffect(() => {
     if (
@@ -6471,6 +6647,22 @@ export default function App() {
     const timeout = window.setTimeout(() => {
       void (async () => {
         try {
+          if (isVsCodeHost) {
+            const markdown = documentState.markdown ?? '';
+            if (markdown !== lastVsCodeSyncedMarkdownRef.current) {
+              vscodeApiRef.current?.postMessage({
+                type: 'lmd/updateDocument',
+                markdown,
+              });
+              lastVsCodeSyncedMarkdownRef.current = markdown;
+            }
+
+            if (!cancelled) {
+              setSaveStatus('saved');
+            }
+            return;
+          }
+
           localStorage.setItem(storageKeys.project, documentState.markdown ?? '');
           localStorage.setItem(storageKeys.history, JSON.stringify(history));
 
@@ -6504,8 +6696,10 @@ export default function App() {
     documentState.markdown,
     documentState.source,
     history,
+    isVsCodeHost,
     sourceDraft,
     sourceParseError,
+    vscodeApiRef,
   ]);
 
   useEffect(() => {
@@ -7798,6 +7992,13 @@ export default function App() {
   const activeModeLabel =
     mode === 'canvas' ? '画布模式' : mode === 'source' ? '源码模式' : '历史模式';
   const canGroupSelection = selection.kind === 'node' && selection.ids.length >= 2;
+  const visibleLeftPanels = isVsCodeHost
+    ? leftPanelMeta.filter((item) => item.id === 'graph')
+    : leftPanelMeta;
+  const visibleModeMeta = isVsCodeHost
+    ? modeMeta.filter((entry) => entry.id === 'canvas')
+    : modeMeta;
+  const vscodeFileLabel = hostConfig.fileName ?? 'untitled.lmd';
   const supportsLocalProjectPicker =
     typeof (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function';
   const supportsLocalMarkdownPicker =
@@ -7827,7 +8028,7 @@ export default function App() {
     return clamp(requestedWidth, min, Math.max(min, Math.min(max, available)));
   }, [inspectorWidth, isMobileViewport, showInspector, showSidebar, sidebarWidth]);
   const workspaceClassName = `workspace workspace--${mode}${isMobileViewport ? ' workspace--mobile' : ''}${showSidebar ? ' workspace--sidebar-open' : ''}${showInspector ? ' workspace--inspector-open' : ''}${panelResizeState ? ' workspace--resizing' : ''}`;
-  const appShellClassName = `app-shell${isMobileViewport ? ' app-shell--mobile' : ''}${isConstrainedDevice ? ' app-shell--constrained' : ''}`;
+  const appShellClassName = `app-shell${isMobileViewport ? ' app-shell--mobile' : ''}${isConstrainedDevice ? ' app-shell--constrained' : ''}${isVsCodeHost ? ' app-shell--vscode' : ''}`;
   const mobileOverlayOpen = isMobileViewport && (showSidebar || mobileSourcePreviewOpen);
   const workspaceStyle = useMemo(() => ({
     '--nav-width': `${NAV_RAIL_WIDTH}px`,
@@ -8625,9 +8826,9 @@ export default function App() {
         <div className="workbench-brand">
           {isMobileViewport ? (
             <button
-              aria-label="打开资源面板"
+              aria-label={isVsCodeHost ? '打开图谱面板' : '打开资源面板'}
               className="icon-button workbench-mobile-trigger"
-              onClick={() => toggleLeftPanel('files')}
+              onClick={() => toggleLeftPanel(isVsCodeHost ? 'graph' : 'files')}
               type="button"
             >
               <WorkbenchIcon name="menu" />
@@ -8644,7 +8845,118 @@ export default function App() {
         </div>
 
         <div className="workbench-tabs" aria-label="已打开文件">
-          {isMobileViewport ? (
+          {isVsCodeHost && !isMobileViewport ? (
+            <div className="vscode-commandbar" role="toolbar" aria-label="LMD_EDITER 工具栏">
+              <div className="vscode-commandbar__file" title={vscodeFileLabel}>
+                <span className="vscode-commandbar__badge">LMD_EDITER</span>
+                <strong>{vscodeFileLabel}</strong>
+              </div>
+              <div className="vscode-commandbar__tools">
+                <button
+                  aria-label="图谱"
+                  className={showSidebar && leftPanel === 'graph' ? 'icon-button has-tooltip is-active' : 'icon-button has-tooltip'}
+                  data-tooltip="图谱"
+                  onClick={() => toggleLeftPanel('graph')}
+                  type="button"
+                >
+                  <WorkbenchIcon name="graph" />
+                </button>
+                <button
+                  aria-label="新建节点"
+                  className="icon-button has-tooltip"
+                  data-tooltip="新建节点"
+                  onClick={createNodeInViewportCenter}
+                  type="button"
+                >
+                  <WorkbenchIcon name="node" />
+                </button>
+                <button
+                  aria-label="分组"
+                  className={canGroupSelection ? 'icon-button has-tooltip' : 'icon-button has-tooltip is-disabled'}
+                  data-tooltip="分组"
+                  disabled={!canGroupSelection}
+                  onClick={wrapSelectionInSubgraph}
+                  type="button"
+                >
+                  <WorkbenchIcon name="group" />
+                </button>
+                <button
+                  aria-label="复制"
+                  className={selection.kind === 'node' && selection.ids.length > 0 ? 'icon-button has-tooltip' : 'icon-button has-tooltip is-disabled'}
+                  data-tooltip="复制"
+                  disabled={!(selection.kind === 'node' && selection.ids.length > 0)}
+                  onClick={duplicateSelection}
+                  type="button"
+                >
+                  <WorkbenchIcon name="copy" />
+                </button>
+                <button
+                  aria-label="删除"
+                  className={selection.kind !== 'none' ? 'icon-button has-tooltip' : 'icon-button has-tooltip is-disabled'}
+                  data-tooltip="删除"
+                  disabled={selection.kind === 'none'}
+                  onClick={deleteSelection}
+                  type="button"
+                >
+                  <WorkbenchIcon name="trash" />
+                </button>
+                <button
+                  aria-label="整理"
+                  className="icon-button has-tooltip"
+                  data-tooltip="整理"
+                  onClick={compactLayout}
+                  type="button"
+                >
+                  <WorkbenchIcon name="tidy" />
+                </button>
+                <button
+                  aria-label="布局"
+                  className="icon-button has-tooltip"
+                  data-tooltip="布局"
+                  onClick={autoLayout}
+                  type="button"
+                >
+                  <WorkbenchIcon name="layout" />
+                </button>
+                <button
+                  aria-label="标准化"
+                  className="icon-button has-tooltip"
+                  data-tooltip="标准化"
+                  onClick={standardizeCurrentProject}
+                  type="button"
+                >
+                  <WorkbenchIcon name="standardize" />
+                </button>
+                <button
+                  aria-label="源码"
+                  className="icon-button has-tooltip"
+                  data-tooltip="源码"
+                  onClick={() => goToMode('source')}
+                  type="button"
+                >
+                  <WorkbenchIcon name="source" />
+                </button>
+                <button
+                  aria-label="属性"
+                  className={showInspector ? 'icon-button has-tooltip is-active' : 'icon-button has-tooltip'}
+                  data-tooltip="属性"
+                  onClick={() => openInspectorView('properties')}
+                  type="button"
+                >
+                  <WorkbenchIcon name="inspect" />
+                </button>
+                <button
+                  aria-label="导出画布图片"
+                  className="icon-button has-tooltip"
+                  data-tooltip="导出图片"
+                  onClick={exportCanvasImage}
+                  type="button"
+                >
+                  <WorkbenchIcon name="preview" />
+                </button>
+              </div>
+            </div>
+          ) : isMobileViewport ? (
             workspaceTabs.map((tab) => (
               <button
                 key={tab.id}
@@ -8783,69 +9095,96 @@ export default function App() {
         </div>
 
         <div className="workbench-bar__actions">
-          <div className="presence-strip" aria-label="在线协作者">
-            {collaboratorPresets.map((collaborator) => (
-              <button
-                aria-label={`${collaborator.name}，当前${collaborator.role}`}
-                className="presence-avatar has-tooltip"
-                data-tooltip={`${collaborator.name} · ${collaborator.role}`}
-                key={collaborator.id}
-                onClick={() => {
-                  setSidebarOpen(false);
-                  setInspectorOpen(true);
-                }}
-                type="button"
+          {isVsCodeHost && !isMobileViewport ? (
+            <div
+              aria-label={
+                saveStatus === 'saving'
+                  ? '正在写入 LMD'
+                  : saveStatus === 'error'
+                    ? '同步异常'
+                    : 'LMD 已连接'
+              }
+              className={`status-pill status-pill--${saveStatus}`}
+              data-tooltip={
+                saveStatus === 'saving'
+                  ? '正在写入 LMD'
+                  : saveStatus === 'error'
+                    ? '同步异常'
+                    : 'LMD 已连接'
+              }
+            >
+              <span className="status-pill__dot" />
+              {saveStatus === 'saving'
+                ? '正在写入 LMD'
+                : saveStatus === 'error'
+                  ? '同步异常'
+                  : 'LMD 已连接'}
+            </div>
+          ) : (
+            <>
+              <div className="presence-strip" aria-label="在线协作者">
+                {collaboratorPresets.map((collaborator) => (
+                  <button
+                    aria-label={`${collaborator.name}，当前${collaborator.role}`}
+                    className="presence-avatar has-tooltip"
+                    data-tooltip={`${collaborator.name} · ${collaborator.role}`}
+                    key={collaborator.id}
+                    onClick={() => {
+                      setSidebarOpen(false);
+                      setInspectorOpen(true);
+                    }}
+                    type="button"
+                  >
+                    <span
+                      className="presence-avatar__dot"
+                      style={{ background: collaborator.color }}
+                    />
+                    <span className="presence-avatar__label">{collaborator.name.slice(0, 1)}</span>
+                  </button>
+                ))}
+              </div>
+
+              <div
+                aria-label={
+                  saveStatus === 'saving'
+                    ? activeWorkspaceSource === 'cloud'
+                      ? '正在同步云端'
+                      : '正在写入本地'
+                    : saveStatus === 'error'
+                      ? '保存异常'
+                      : activeWorkspaceSource === 'cloud'
+                        ? '云端同步就绪'
+                        : '本地项目已连接'
+                }
+                className={`status-pill status-pill--${saveStatus}`}
+                data-tooltip={
+                  saveStatus === 'saving'
+                    ? activeWorkspaceSource === 'cloud'
+                      ? '正在同步云端'
+                      : '正在写入本地'
+                    : saveStatus === 'error'
+                      ? '保存异常'
+                      : activeWorkspaceSource === 'cloud'
+                        ? '云端同步就绪'
+                        : '本地项目已连接'
+                }
               >
-                <span
-                  className="presence-avatar__dot"
-                  style={{ background: collaborator.color }}
-                />
-                <span className="presence-avatar__label">{collaborator.name.slice(0, 1)}</span>
-              </button>
-            ))}
-          </div>
+                <span className="status-pill__dot" />
+                {saveStatus === 'saving'
+                  ? activeWorkspaceSource === 'cloud'
+                    ? '正在同步云端'
+                    : '正在写入本地'
+                  : saveStatus === 'error'
+                    ? '保存异常'
+                    : activeWorkspaceSource === 'cloud'
+                      ? '云端同步就绪'
+                      : '本地项目已连接'}
+              </div>
 
-          <div
-            aria-label={
-              saveStatus === 'saving'
-                ? activeWorkspaceSource === 'cloud'
-                  ? '正在同步云端'
-                  : '正在写入本地'
-                : saveStatus === 'error'
-                  ? '保存异常'
-                  : activeWorkspaceSource === 'cloud'
-                    ? '云端同步就绪'
-                    : '本地项目已连接'
-            }
-            className={`status-pill status-pill--${saveStatus}`}
-            data-tooltip={
-              saveStatus === 'saving'
-                ? activeWorkspaceSource === 'cloud'
-                  ? '正在同步云端'
-                  : '正在写入本地'
-                : saveStatus === 'error'
-                  ? '保存异常'
-                  : activeWorkspaceSource === 'cloud'
-                    ? '云端同步就绪'
-                    : '本地项目已连接'
-            }
-          >
-            <span className="status-pill__dot" />
-            {saveStatus === 'saving'
-              ? activeWorkspaceSource === 'cloud'
-                ? '正在同步云端'
-                : '正在写入本地'
-              : saveStatus === 'error'
-                ? '保存异常'
-                : activeWorkspaceSource === 'cloud'
-                  ? '云端同步就绪'
-                  : '本地项目已连接'}
-          </div>
-
-          <div className="workbench-icon-row" role="toolbar" aria-label="工作台控制">
-            {isMobileViewport ? (
+              <div className="workbench-icon-row" role="toolbar" aria-label="工作台控制">
+                {isMobileViewport ? (
               <div className="mode-switch" role="tablist" aria-label="工作区模式">
-                {modeMeta.map((entry) => (
+                {visibleModeMeta.map((entry) => (
                   <button
                     aria-label={entry.label}
                     className={entry.id === mode ? 'mode-pill has-tooltip is-active' : 'mode-pill has-tooltip'}
@@ -8858,38 +9197,40 @@ export default function App() {
                   </button>
                 ))}
               </div>
-            ) : (
-              <>
-                <button
-                  aria-label="复制 Mermaid 源码"
-                  className="icon-button has-tooltip"
-                  data-tooltip="复制 Mermaid"
-                  onClick={copySource}
-                  type="button"
-                >
-                  <WorkbenchIcon name="copy" />
-                </button>
-                <button
-                  aria-label="导出当前画布图片"
-                  className="icon-button has-tooltip"
-                  data-tooltip="导出图片"
-                  onClick={exportCanvasImage}
-                  type="button"
-                >
-                  <WorkbenchIcon name="preview" />
-                </button>
-                <button
-                  aria-label="导出标准 Markdown"
-                  className="icon-button icon-button--primary has-tooltip"
-                  data-tooltip="导出 Markdown"
-                  onClick={exportMarkdown}
-                  type="button"
-                >
-                  <WorkbenchIcon name="share" />
-                </button>
-              </>
-            )}
-          </div>
+                ) : (
+                  <>
+                    <button
+                      aria-label="复制 Mermaid 源码"
+                      className="icon-button has-tooltip"
+                      data-tooltip="复制 Mermaid"
+                      onClick={copySource}
+                      type="button"
+                    >
+                      <WorkbenchIcon name="copy" />
+                    </button>
+                    <button
+                      aria-label="导出当前画布图片"
+                      className="icon-button has-tooltip"
+                      data-tooltip="导出图片"
+                      onClick={exportCanvasImage}
+                      type="button"
+                    >
+                      <WorkbenchIcon name="preview" />
+                    </button>
+                    <button
+                      aria-label="导出标准 Markdown"
+                      className="icon-button icon-button--primary has-tooltip"
+                      data-tooltip="导出 Markdown"
+                      onClick={exportMarkdown}
+                      type="button"
+                    >
+                      <WorkbenchIcon name="share" />
+                    </button>
+                  </>
+                )}
+              </div>
+            </>
+          )}
         </div>
       </header>
 
@@ -8908,7 +9249,7 @@ export default function App() {
         ) : null}
 
         <nav className="nav-rail" aria-label="工作台导航">
-          {leftPanelMeta.map((item) => (
+          {visibleLeftPanels.map((item) => (
             <button
               aria-label={item.label}
               className={leftPanel === item.id ? 'nav-rail__button has-tooltip is-active' : 'nav-rail__button has-tooltip'}
@@ -8950,7 +9291,7 @@ export default function App() {
           ) : null}
           {isMobileViewport ? (
             <div className="mobile-panel-tabs" role="tablist" aria-label="移动资源面板">
-              {leftPanelMeta.map((item) => (
+              {visibleLeftPanels.map((item) => (
                 <button
                   aria-label={item.label}
                   className={leftPanel === item.id ? 'mobile-panel-tab is-active' : 'mobile-panel-tab'}
@@ -8976,7 +9317,7 @@ export default function App() {
             </section>
           ) : null}
 
-          {leftPanel === 'files' ? (
+          {!isVsCodeHost && leftPanel === 'files' ? (
             <>
               <section className="sidebar-card">
                 <div className="sidebar-card__header">
@@ -10151,13 +10492,15 @@ export default function App() {
             >
               属性
             </button>
-            <button
-              className={inspectorView === 'ai' ? 'inspector-tab is-active' : 'inspector-tab'}
-              onClick={() => setInspectorView('ai')}
-              type="button"
-            >
-              AI
-            </button>
+            {!isVsCodeHost ? (
+              <button
+                className={inspectorView === 'ai' ? 'inspector-tab is-active' : 'inspector-tab'}
+                onClick={() => setInspectorView('ai')}
+                type="button"
+              >
+                AI
+              </button>
+            ) : null}
           </div>
 
           {inspectorView === 'properties' ? (
@@ -10626,7 +10969,7 @@ export default function App() {
             </section>
           ) : null}
             </>
-          ) : (
+          ) : !isVsCodeHost ? (
             <section className="sidebar-card sidebar-card--ai">
               <div className="sidebar-card__header">
                 <h2>AI 助手</h2>
@@ -10796,7 +11139,7 @@ export default function App() {
                 </div>
               )}
             </section>
-          )}
+          ) : null}
         </aside>
 
         {!isMobileViewport ? (
@@ -10844,16 +11187,16 @@ export default function App() {
         {isMobileViewport ? (
           <div className="mobile-bottom-bar" role="toolbar" aria-label="安卓竖屏工作台控制">
             <button
-              aria-label="打开资源面板"
-              className={showSidebar && leftPanel === 'files' ? 'mobile-bottom-bar__button is-active' : 'mobile-bottom-bar__button'}
-              onClick={() => toggleLeftPanel('files')}
+              aria-label={isVsCodeHost ? '打开图谱面板' : '打开资源面板'}
+              className={showSidebar && leftPanel === (isVsCodeHost ? 'graph' : 'files') ? 'mobile-bottom-bar__button is-active' : 'mobile-bottom-bar__button'}
+              onClick={() => toggleLeftPanel(isVsCodeHost ? 'graph' : 'files')}
               type="button"
             >
-              <WorkbenchIcon name="files" />
+              <WorkbenchIcon name={isVsCodeHost ? 'graph' : 'files'} />
             </button>
 
             <div className="mobile-bottom-bar__modes" role="tablist" aria-label="模式切换">
-              {modeMeta.map((entry) => (
+              {visibleModeMeta.map((entry) => (
                 <button
                   aria-label={entry.label}
                   className={entry.id === mode ? 'mobile-mode-pill is-active' : 'mobile-mode-pill'}
@@ -10867,12 +11210,12 @@ export default function App() {
             </div>
 
             <button
-              aria-label={mode === 'source' ? '打开预览' : '打开属性'}
+              aria-label={isVsCodeHost ? '打开属性' : mode === 'source' ? '打开预览' : '打开属性'}
               className={showInspector || mobileSourcePreviewOpen ? 'mobile-bottom-bar__button is-active' : 'mobile-bottom-bar__button'}
               onClick={handleMobileInspectorToggle}
               type="button"
             >
-              <WorkbenchIcon name={mode === 'source' ? 'preview' : 'inspect'} />
+              <WorkbenchIcon name={isVsCodeHost ? 'inspect' : mode === 'source' ? 'preview' : 'inspect'} />
             </button>
           </div>
         ) : null}

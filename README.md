@@ -2,6 +2,45 @@
 
 Mermaid 空间编辑协作平台前端原型。
 
+## LMD_EDITER VSCode 插件版
+
+当前仓库已经内置一个 VSCode 插件壳 `LMD_EDITER`。
+
+- 面向 `*.lmd` 文件
+- 默认用画布视图打开
+- 顶部 `源码` 按键会回到 VSCode 自带文本编辑器
+- 插件版会裁掉 AI、云端、协作、文件管理、历史和内置源码编辑界面
+
+### 构建插件版
+
+```bash
+pnpm install
+pnpm run build:vscode
+```
+
+构建完成后会得到：
+
+- Webview 资源：[dist](/Users/mac/Documents/vscodeProject/LTHS_MD/dist)
+- VSCode 扩展入口：[out/extension.cjs](/Users/mac/Documents/vscodeProject/LTHS_MD/out/extension.cjs)
+
+### 插件调试
+
+推荐在 VSCode 里以“扩展开发宿主”方式启动当前仓库：
+
+- 打开本仓库
+- 运行 `pnpm run build:vscode`
+- 在 VSCode 中按 `F5`
+- 新建或打开 `*.lmd` 文件
+
+### 当前插件版保留的核心能力
+
+- 画布编辑
+- 节点 / 连线 / 分组 / 附加信息
+- 整理 / 布局 / 标准化
+- 图谱树与导航图
+- 属性栏编辑
+- 导出当前画布图片
+
 ## 本地开发
 
 ```bash
