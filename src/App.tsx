@@ -179,16 +179,16 @@ const PINCH_RESPONSE = 1.3;
 const WHEEL_PINCH_DIVISOR = 360;
 const NAV_RAIL_WIDTH = 38;
 const DEFAULT_SIDEBAR_WIDTH = 188;
-const DEFAULT_INSPECTOR_WIDTH = 176;
+const DEFAULT_INSPECTOR_WIDTH = 320;
 const CONTENT_CARD_MIN_WIDTH = 116;
 const CONTENT_CARD_MAX_WIDTH = 360;
 const CONTENT_CARD_COLLAPSED_HEIGHT = 38;
 const CONTENT_CARD_MIN_HEIGHT = 80;
 const CONTENT_CARD_MAX_HEIGHT = 320;
 const MIN_SIDEBAR_WIDTH = 164;
-const MIN_INSPECTOR_WIDTH = 156;
+const MIN_INSPECTOR_WIDTH = 272;
 const MAX_SIDEBAR_WIDTH = 280;
-const MAX_INSPECTOR_WIDTH = 248;
+const MAX_INSPECTOR_WIDTH = 420;
 const MIN_WORKSPACE_CENTER_WIDTH = 360;
 const SUBGRAPH_HEADER_HEIGHT = 42;
 const SUBGRAPH_MIN_WIDTH = 284;
@@ -283,7 +283,42 @@ interface AiMessage {
   id: string;
   role: 'assistant' | 'user';
   content: string;
+  createdAt: string;
   status?: 'error';
+}
+
+interface AiConversationRecord {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messages: AiMessage[];
+}
+
+type AiChangeTargetKind = 'project' | 'content' | 'node' | 'edge' | 'subgraph';
+
+interface AiChangeBubble {
+  id: string;
+  kind: AiChangeTargetKind;
+  label: string;
+  detail: string;
+  targetId?: string;
+}
+
+interface AiToolChangeTarget {
+  kind: AiChangeTargetKind;
+  label: string;
+  detail: string;
+  targetId?: string;
+}
+
+interface AiToolExecutionResult {
+  ok: boolean;
+  revision?: number;
+  markdown?: string;
+  warnings?: string[];
+  changes?: AiToolChangeTarget[];
+  [key: string]: unknown;
 }
 
 interface AppHostConfig {
@@ -500,28 +535,61 @@ const defaultAiSettings: AiSettingsDraft = {
     'LMD is a single-file Markdown format stored as a .lmd file.',
     'Use the current graph semantic snapshot and the latest full LMD document as the primary context.',
     'Be concise, practical, and grounded in the provided workspace state.',
+    'When tools are available, you must use them to read or write instead of claiming that structured updates are impossible.',
+    'If a request is local, prefer local tools. Do not demand an operations array unless you truly need structural graph operations.',
     'Unless the request requires it, avoid changing already-written text.',
     'Prefer targeted edits over refactors.',
     'Prefer creating groups, and nested groups when they improve clarity.',
+    'Prefer arranging related nodes into clear functional blocks or progressive workflow blocks when it improves readability.',
     'The current structured canvas and semantic tools support Mermaid flowchart/graph diagrams only.',
     'Do not introduce classDiagram, sequenceDiagram, ER, UML-like structures, or any other Mermaid diagram type unless the user explicitly asks for source-only Mermaid that will not be edited on the canvas.',
     'Current LMD file structure is: `# Project Name`, `## Summary`, `## Diagram` with one standard ```mermaid``` block, `## Content`, and one final ```lths-compat``` block.',
     'The Mermaid block must remain standard Mermaid syntax.',
     'Canvas nodes conceptually have a title and a description. In Mermaid source, the node ID should be derived from the title with a short unique suffix, and the Mermaid label should contain the description only.',
     'There is no separate `Node Annotations` section in the current format.',
+    'When editing only part of the document, preserve unrelated text, node positions, and unaffected groups.',
   ].join(' '),
   lockProjectMeta: true,
   lockAdditionalInfo: true,
   lockDiagram: false,
 };
 
+function createAiMessage(
+  role: AiMessage['role'],
+  content: string,
+  status?: AiMessage['status'],
+): AiMessage {
+  return {
+    id: crypto.randomUUID(),
+    role,
+    content,
+    createdAt: new Date().toISOString(),
+    ...(status ? { status } : {}),
+  };
+}
+
 const defaultAiMessages: AiMessage[] = [
   {
     id: 'ai-welcome',
     role: 'assistant',
     content: 'AI 验证入口已打开。现在会附带完整 LMD 文档、相对上一轮的改动、当前选中内容，并允许 AI 调用本地工具修改文档。',
+    createdAt: new Date().toISOString(),
   },
 ];
+
+function createAiConversationRecord(
+  title = '新对话',
+  messages: AiMessage[] = defaultAiMessages,
+): AiConversationRecord {
+  const now = new Date().toISOString();
+  return {
+    id: crypto.randomUUID(),
+    title,
+    createdAt: now,
+    updatedAt: now,
+    messages,
+  };
+}
 
 const aiLockControls = [
   { key: 'lockProjectMeta', label: '标题 / 简介', unlocked: '允许修改标题与简介' },
@@ -529,12 +597,50 @@ const aiLockControls = [
   { key: 'lockDiagram', label: '流程图', unlocked: '允许修改流程图' },
 ] as const;
 
+function deriveAiConversationTitle(messages: AiMessage[]) {
+  const userMessage = messages.find((message) => message.role === 'user');
+  if (!userMessage) {
+    return '新对话';
+  }
+
+  const normalized = userMessage.content.replace(/\s+/g, ' ').trim();
+  return normalized.slice(0, 20) || '新对话';
+}
+
+function normalizeStoredAiMessages(messages: AiMessage[]) {
+  return messages.map((message) => ({
+    ...message,
+    createdAt: message.createdAt ?? new Date().toISOString(),
+  }));
+}
+
+function readInitialAiConversationRecords() {
+  const storedRecords = readStoredArray<AiConversationRecord>(storageKeys.aiSessions, []);
+  if (storedRecords.length > 0) {
+    return storedRecords.map((record) => ({
+      ...record,
+      messages: normalizeStoredAiMessages(record.messages ?? defaultAiMessages),
+      title: record.title || deriveAiConversationTitle(record.messages ?? defaultAiMessages),
+      createdAt: record.createdAt ?? new Date().toISOString(),
+      updatedAt: record.updatedAt ?? new Date().toISOString(),
+    }));
+  }
+
+  const legacyMessages = readStoredArray<AiMessage>(storageKeys.aiChat, defaultAiMessages);
+  return [
+    createAiConversationRecord(
+      deriveAiConversationTitle(legacyMessages),
+      normalizeStoredAiMessages(legacyMessages),
+    ),
+  ];
+}
+
 const aiToolDefinitions = [
   {
     type: 'function',
     function: {
       name: 'get_graph_semantic_snapshot',
-      description: 'Read the current semantic LMD project snapshot for a flowchart-based LMD document, including Project Name, Summary, Additional Information, nodes with title/description semantics, edges, subgraphs, and current selection, without layout or style details.',
+      description: 'Read the current semantic LMD project snapshot for a flowchart-based LMD document, including Project Name, Summary, Additional Information, nodes with title/description semantics, unique node IDs, node coordinates and sizes, edges, subgraphs, and current selection.',
       parameters: {
         type: 'object',
         properties: {},
@@ -545,8 +651,86 @@ const aiToolDefinitions = [
   {
     type: 'function',
     function: {
+      name: 'update_lmd_sections',
+      description: 'Update top-level LMD sections without rewriting the whole file. Use this for Project Name, Summary, or Additional Information changes. This is the preferred tool for partial Markdown edits outside the flowchart structure.',
+      parameters: {
+        type: 'object',
+        properties: {
+          projectName: {
+            type: 'string',
+          },
+          projectSummary: {
+            type: 'string',
+          },
+          contentMarkdown: {
+            type: 'string',
+          },
+          detail: {
+            type: 'string',
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_lmd_entities',
+      description: 'Update existing nodes, edges, or subgraphs by ID without describing generic operations. Use this for local text/label/title/description edits. Always prefer IDs from the current selection or graph semantic snapshot.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nodes: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                title: { type: 'string' },
+                description: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          },
+          edges: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                label: { type: 'string' },
+                type: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          },
+          subgraphs: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                title: { type: 'string' },
+                description: { type: 'string' },
+                collapsed: { type: 'boolean' },
+              },
+              additionalProperties: false,
+            },
+          },
+          detail: {
+            type: 'string',
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'apply_graph_operation_batch',
-      description: 'Apply structured semantic operations to the current LMD document when the Diagram section is a flowchart/graph Mermaid diagram. Supported operations include project meta updates, Additional Information updates, node title/description label updates, edge label updates, subgraph updates, and node/subgraph structural edits.',
+      description: 'Apply structured graph operations to the current LMD document when the Diagram section is a flowchart/graph Mermaid diagram. Use this only for structural changes such as creating, deleting, connecting, regrouping, or moving entities. It requires an explicit operations array.',
       parameters: {
         type: 'object',
         properties: {
@@ -604,7 +788,11 @@ const aiToolDefinitions = [
 
 const aiToolRules = [
   'Prefer tools over guesswork whenever the user asks to change the document.',
+  'Prefer update_lmd_sections for Project Name, Summary, or Additional Information edits.',
+  'Prefer update_lmd_entities for local node, edge, or subgraph text edits.',
   'Prefer apply_graph_operation_batch for structural diagram edits.',
+  'Never answer that you need an operations array if the request can be satisfied by update_lmd_sections, update_lmd_entities, get_project_markdown, or set_project_markdown.',
+  'For partial document edits, use update_lmd_sections or update_lmd_entities before attempting a full rewrite.',
   'Treat the project as an LMD document: a single Markdown file with the sections Project Name, Summary, Diagram, Content, and a final lths-compat block.',
   'Use the full LMD file syntax exactly. Do not invent old sections such as Node Annotations.',
   'The current structured canvas model supports Mermaid flowchart/graph only.',
@@ -613,6 +801,9 @@ const aiToolRules = [
   'Prefer the smallest valid layer: graph operations first, section-preserving Markdown edits second, full rewrites last.',
   'Do not invent new top-level sections unless the user explicitly asks for them.',
   'Prefer preserving the existing section structure instead of rewriting the whole file.',
+  'Node IDs are unique and stable within the document. Node coordinates in the semantic snapshot correspond to those IDs and should be used to keep local edits local.',
+  'When there is an active selection, treat it as the primary scope. Mention the selected IDs in tool arguments whenever possible.',
+  'When structure changes are not required, avoid apply_graph_operation_batch and do not complain that operations are missing; use update_lmd_sections, update_lmd_entities, or set_project_markdown instead.',
   'Use set_project_markdown only for broader Markdown rewrites or when the batch tool cannot express the change cleanly.',
   'Treat the current selection as the primary scope unless the user clearly asks for a wider change.',
   'After editing, briefly summarize what changed.',
@@ -654,6 +845,7 @@ const aiProjectFormatGuide = [
   'The Mermaid block should stay standard Mermaid syntax.',
   'The current format does not use a separate `Node Annotations` section.',
   'Canvas nodes conceptually have a title and a description. In source, the node ID is title-derived with a short unique suffix, and the Mermaid label stores the description only.',
+  'Node IDs must remain unique. They are the stable reference for local graph edits and correspond to node coordinates in the graph semantic snapshot.',
   'The current canvas editor and structured AI tools support flowchart/graph diagrams only.',
   'Other Mermaid diagram types may exist in source form and preview correctly, but they should be preserved as source instead of being rewritten through flowchart graph operations.',
   'Edit the smallest valid layer possible. Prefer section-preserving changes over full rewrites.',
@@ -710,6 +902,14 @@ function readStoredArray<T>(key: string, fallback: T[]) {
 
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed as T[] : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function readStoredString(key: string, fallback: string) {
+  try {
+    return localStorage.getItem(key) ?? fallback;
   } catch {
     return fallback;
   }
@@ -1178,6 +1378,10 @@ function normalizeInlineEntityText(value: string) {
   return value.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n');
 }
 
+function isEdgeType(value: unknown): value is GraphEdge['type'] {
+  return value === 'solid' || value === 'dotted' || value === 'thick' || value === 'line';
+}
+
 function splitEntityText(value: string) {
   const normalized = normalizeInlineEntityText(value).trimEnd();
   const [titleLine = '', ...restLines] = normalized.split('\n');
@@ -1188,11 +1392,12 @@ function splitEntityText(value: string) {
 }
 
 function splitEntityDraft(value: string) {
-  const normalized = normalizeInlineEntityText(value).trimEnd();
+  // Preserve in-progress trailing newlines while editing the draft.
+  const normalized = normalizeInlineEntityText(value);
   const [titleLine = '', ...restLines] = normalized.split('\n');
   return {
     title: titleLine,
-    description: restLines.join('\n').trim(),
+    description: restLines.join('\n'),
   };
 }
 
@@ -1266,7 +1471,8 @@ function composeEntityText(title: string, description = '') {
 
 function composeEntityDraft(title: string, description = '') {
   const normalizedTitle = title.replace(/\r\n/g, '\n');
-  const normalizedDescription = description.replace(/\r\n/g, '\n').trimEnd();
+  // Keep in-progress line breaks while editing; final trimming happens on commit.
+  const normalizedDescription = description.replace(/\r\n/g, '\n');
   return normalizedDescription
     ? `${normalizedTitle}\n${normalizedDescription}`
     : normalizedTitle;
@@ -1997,6 +2203,10 @@ function buildGraphSemanticSnapshotFromDocument(
         title: splitEntityText(node.label).title,
         description: splitEntityText(node.label).description,
         subgraphId: node.subgraphId,
+        x: Math.round(node.x),
+        y: Math.round(node.y),
+        width: Math.round(node.width),
+        height: Math.round(node.height),
       })),
       edges: document.edges.map((edge) => ({
         id: edge.id,
@@ -2218,58 +2428,283 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
   }
 
   if (selection.kind === 'node') {
-    return JSON.stringify({
-      kind: 'node',
-      items: document.nodes
-        .filter((node) => selection.ids.includes(node.id))
-        .map((node) => ({
-          id: node.id,
-          label: node.label,
-          title: splitEntityText(node.label).title,
-          description: splitEntityText(node.label).description,
-          subgraphId: node.subgraphId,
-        })),
-    }, null, 2);
+    return document.nodes
+      .filter((node) => selection.ids.includes(node.id))
+      .map((node) => {
+        const parts = splitEntityText(node.label);
+        return [
+          `Node ${node.id}`,
+          `title: ${parts.title || '（空）'}`,
+          `description: ${parts.description || '（空）'}`,
+          `subgraph: ${node.subgraphId ?? 'none'}`,
+          `position: (${Math.round(node.x)}, ${Math.round(node.y)})`,
+          `size: ${Math.round(node.width)} x ${Math.round(node.height)}`,
+        ].join('\n');
+      })
+      .join('\n\n');
   }
 
   if (selection.kind === 'edge') {
-    return JSON.stringify({
-      kind: 'edge',
-      items: document.edges
-        .filter((edge) => selection.ids.includes(edge.id))
-        .map((edge) => ({
-          id: edge.id,
-          from: edge.from,
-          to: edge.to,
-          label: edge.label,
-          type: edge.type,
-        })),
-    }, null, 2);
+    return document.edges
+      .filter((edge) => selection.ids.includes(edge.id))
+      .map((edge) => [
+        `Edge ${edge.id}`,
+        `from: ${edge.from}`,
+        `to: ${edge.to}`,
+        `label: ${edge.label || '（空）'}`,
+        `type: ${edge.type}`,
+      ].join('\n'))
+      .join('\n\n');
   }
 
   if (selection.kind === 'subgraph') {
-    return JSON.stringify({
-      kind: 'subgraph',
-      items: document.subgraphs
-        .filter((subgraph) => selection.ids.includes(subgraph.id))
-        .map((subgraph) => ({
-          id: subgraph.id,
-          title: subgraph.title,
-          parentId: subgraph.parentId,
-          collapsed: subgraph.collapsed,
-          nodeIds: document.nodes
-            .filter((node) => node.subgraphId === subgraph.id)
-            .map((node) => node.id),
-        })),
-    }, null, 2);
+    return document.subgraphs
+      .filter((subgraph) => selection.ids.includes(subgraph.id))
+      .map((subgraph) => [
+        `Subgraph ${subgraph.id}`,
+        `title: ${subgraph.title || '（空）'}`,
+        `parent: ${subgraph.parentId ?? 'none'}`,
+        `collapsed: ${subgraph.collapsed ? 'true' : 'false'}`,
+        `children: ${document.nodes.filter((node) => node.subgraphId === subgraph.id).map((node) => node.id).join(', ') || 'none'}`,
+      ].join('\n'))
+      .join('\n\n');
   }
 
-  return JSON.stringify({
-    kind: 'content',
-    title: 'Additional Information',
-    markdown: normalizeContentMarkdown(document.contentMarkdown ?? extractContentMarkdown(document.suffixMarkdown)),
-    id: CONTENT_CARD_ID,
-  }, null, 2);
+  return [
+    `Additional Information ${CONTENT_CARD_ID}`,
+    normalizeContentMarkdown(document.contentMarkdown ?? extractContentMarkdown(document.suffixMarkdown)) || '（空）',
+  ].join('\n');
+}
+
+function buildSelectionContextSummary(document: GraphDocument, selection: SelectionState) {
+  if (selection.kind === 'none' || selection.ids.length === 0) {
+    return '';
+  }
+
+  if (selection.kind === 'node') {
+    return document.nodes
+      .filter((node) => selection.ids.includes(node.id))
+      .map((node) => {
+        const parts = splitEntityText(node.label);
+        return `${parts.title || node.id} [${node.id}]`;
+      })
+      .join('；');
+  }
+
+  if (selection.kind === 'edge') {
+    return document.edges
+      .filter((edge) => selection.ids.includes(edge.id))
+      .map((edge) => `${edge.from} -> ${edge.to}`)
+      .join('；');
+  }
+
+  if (selection.kind === 'subgraph') {
+    return document.subgraphs
+      .filter((subgraph) => selection.ids.includes(subgraph.id))
+      .map((subgraph) => `${subgraph.title || subgraph.id} [${subgraph.id}]`)
+      .join('；');
+  }
+
+  return '附加信息';
+}
+
+function describeDocumentChangeTargets(
+  previous: GraphDocument,
+  next: GraphDocument,
+): AiToolChangeTarget[] {
+  const changes: AiToolChangeTarget[] = [];
+  if ((previous.projectName ?? '') !== (next.projectName ?? '')) {
+    changes.push({
+      kind: 'project',
+      label: 'Project Name',
+      detail: `已更新标题为 ${next.projectName ?? '（空）'}`,
+    });
+  }
+  if ((previous.projectSummary ?? '') !== (next.projectSummary ?? '')) {
+    changes.push({
+      kind: 'project',
+      label: 'Summary',
+      detail: '已更新简介内容。',
+    });
+  }
+  if ((previous.contentMarkdown ?? '') !== (next.contentMarkdown ?? '')) {
+    changes.push({
+      kind: 'content',
+      label: '附加信息',
+      detail: '已更新附加信息内容。',
+      targetId: CONTENT_CARD_ID,
+    });
+  }
+
+  next.nodes.forEach((node) => {
+    const previousNode = previous.nodes.find((item) => item.id === node.id);
+    if (!previousNode) {
+      changes.push({
+        kind: 'node',
+        label: splitEntityText(node.label).title || node.id,
+        detail: '已创建节点。',
+        targetId: node.id,
+      });
+      return;
+    }
+    if (previousNode.label !== node.label) {
+      changes.push({
+        kind: 'node',
+        label: splitEntityText(node.label).title || node.id,
+        detail: '已更新节点文本。',
+        targetId: node.id,
+      });
+    }
+  });
+
+  next.subgraphs.forEach((subgraph) => {
+    const previousSubgraph = previous.subgraphs.find((item) => item.id === subgraph.id);
+    if (!previousSubgraph) {
+      changes.push({
+        kind: 'subgraph',
+        label: splitEntityText(subgraph.title).title || subgraph.id,
+        detail: '已创建分组。',
+        targetId: subgraph.id,
+      });
+      return;
+    }
+    if (previousSubgraph.title !== subgraph.title || previousSubgraph.collapsed !== subgraph.collapsed) {
+      changes.push({
+        kind: 'subgraph',
+        label: splitEntityText(subgraph.title).title || subgraph.id,
+        detail: '已更新分组内容。',
+        targetId: subgraph.id,
+      });
+    }
+  });
+
+  next.edges.forEach((edge) => {
+    const previousEdge = previous.edges.find((item) => item.id === edge.id);
+    if (!previousEdge) {
+      changes.push({
+        kind: 'edge',
+        label: `${edge.from} -> ${edge.to}`,
+        detail: '已创建连线。',
+        targetId: edge.id,
+      });
+      return;
+    }
+    if (previousEdge.label !== edge.label || previousEdge.type !== edge.type) {
+      changes.push({
+        kind: 'edge',
+        label: `${edge.from} -> ${edge.to}`,
+        detail: '已更新连线。',
+        targetId: edge.id,
+      });
+    }
+  });
+
+  return changes;
+}
+
+function describeOperationChangeTargets(
+  operations: GraphOperation[],
+  document: GraphDocument,
+): AiToolChangeTarget[] {
+  const changes: AiToolChangeTarget[] = [];
+
+  operations.forEach((operation) => {
+    if (operation.type === 'updateProjectMeta') {
+      if (operation.projectName !== undefined) {
+        changes.push({ kind: 'project', label: 'Project Name', detail: '已更新标题。' });
+      }
+      if (operation.projectSummary !== undefined) {
+        changes.push({ kind: 'project', label: 'Summary', detail: '已更新简介。' });
+      }
+      return;
+    }
+
+    if (operation.type === 'updateContentMarkdown') {
+      changes.push({
+        kind: 'content',
+        label: '附加信息',
+        detail: '已更新附加信息内容。',
+        targetId: CONTENT_CARD_ID,
+      });
+      return;
+    }
+
+    if (operation.type === 'updateNodeLabel' || operation.type === 'createNode' || operation.type === 'deleteNode') {
+      const targetNodeId = 'nodeId' in operation ? operation.nodeId : operation.nodeId;
+      const node = targetNodeId
+        ? document.nodes.find((item) => item.id === targetNodeId)
+        : undefined;
+      const label =
+        operation.type === 'createNode'
+          ? splitEntityText(operation.label ?? '新建节点').title || '新建节点'
+          : node
+            ? splitEntityText(node.label).title || node.id
+            : targetNodeId || '节点';
+      changes.push({
+        kind: 'node',
+        label,
+        detail:
+          operation.type === 'createNode'
+            ? '已创建节点。'
+            : operation.type === 'deleteNode'
+              ? '已删除节点。'
+              : '已更新节点文本。',
+        targetId: targetNodeId,
+      });
+      return;
+    }
+
+    if (operation.type === 'updateEdgeLabel' || operation.type === 'createEdge' || operation.type === 'deleteEdge') {
+      const label =
+        operation.type === 'createEdge'
+          ? `${operation.from} -> ${operation.to}`
+          : operation.type === 'updateEdgeLabel' || operation.type === 'deleteEdge'
+            ? operation.edgeId
+            : '连线';
+      changes.push({
+        kind: 'edge',
+        label,
+        detail:
+          operation.type === 'createEdge'
+            ? '已创建连线。'
+            : operation.type === 'deleteEdge'
+              ? '已删除连线。'
+              : '已更新连线文本。',
+        targetId: 'edgeId' in operation ? operation.edgeId : undefined,
+      });
+      return;
+    }
+
+    if (operation.type === 'createSubgraph' || operation.type === 'updateSubgraphTitle') {
+      changes.push({
+        kind: 'subgraph',
+        label: operation.type === 'createSubgraph' ? (operation.title?.trim() || '新分组') : operation.subgraphId,
+        detail: operation.type === 'createSubgraph' ? '已创建分组。' : '已更新分组标题。',
+        targetId: operation.type === 'updateSubgraphTitle' ? operation.subgraphId : operation.subgraphId,
+      });
+      return;
+    }
+
+    if (operation.type === 'moveNodeToSubgraph') {
+      changes.push({
+        kind: 'node',
+        label: operation.nodeId,
+        detail: `已移动到 ${operation.subgraphId ?? '画布根层'}。`,
+        targetId: operation.nodeId,
+      });
+    }
+  });
+
+  return changes;
+}
+
+function buildAiUserPrompt(prompt: string, selectionSummary: string) {
+  const normalizedPrompt = prompt.trim();
+  if (!selectionSummary.trim()) {
+    return normalizedPrompt;
+  }
+
+  return `当前选中内容：${selectionSummary}\n用户要求：${normalizedPrompt}`;
 }
 
 function buildHostSourceSelectionPayload(document: GraphDocument, selection: SelectionState) {
@@ -5176,20 +5611,39 @@ export default function App() {
   const [helpDialogOpen, setHelpDialogOpen] = useState(false);
   const [aiPanelTab, setAiPanelTab] = useState<AiPanelTab>('chat');
   const [inspectorView, setInspectorView] = useState<InspectorView>('properties');
+  const [aiRecordsExpanded, setAiRecordsExpanded] = useState(false);
   const [aiSettings, setAiSettings] = useState<AiSettingsDraft>(() => ({
     ...defaultAiSettings,
     ...readStoredJson(storageKeys.aiSettings, defaultAiSettings),
   }));
+  const [aiRecords, setAiRecords] = useState<AiConversationRecord[]>(() =>
+    readInitialAiConversationRecords(),
+  );
+  const [activeAiRecordId, setActiveAiRecordId] = useState(() =>
+    readStoredString(storageKeys.aiActiveSession, ''),
+  );
+  const activeAiRecord = useMemo(() => {
+    if (aiRecords.length === 0) {
+      return createAiConversationRecord();
+    }
+
+    return aiRecords.find((record) => record.id === activeAiRecordId) ?? aiRecords[0];
+  }, [activeAiRecordId, aiRecords]);
   const [aiMessages, setAiMessages] = useState<AiMessage[]>(() =>
-    readStoredArray(storageKeys.aiChat, defaultAiMessages),
+    normalizeStoredAiMessages(readInitialAiConversationRecords()[0]?.messages ?? defaultAiMessages),
   );
   const [aiInput, setAiInput] = useState('');
   const [aiSending, setAiSending] = useState(false);
   const [aiLastMarkdown, setAiLastMarkdown] = useState(() =>
     localStorage.getItem(storageKeys.aiLastMarkdown) ?? '',
   );
-  const [canvasHovered, setCanvasHovered] = useState(false);
+  const [aiChangeBubbles, setAiChangeBubbles] = useState<AiChangeBubble[]>([]);
   const [selection, setSelection] = useState<SelectionState>({ kind: 'none', ids: [] });
+  const selectionContextSummary = useMemo(
+    () => buildSelectionContextSummary(documentState, selection),
+    [documentState, selection],
+  );
+  const [canvasHovered, setCanvasHovered] = useState(false);
   const [history, setHistory] = useState<HistoryEntry[]>(initialWorkspace.history);
   const [documentRevision, setDocumentRevision] = useState(1);
   const [, setUndoStack] = useState<GraphDocument[]>([]);
@@ -5227,6 +5681,74 @@ export default function App() {
     stroke: defaultSubgraphStyle.stroke,
     textColor: defaultSubgraphStyle.textColor,
   });
+
+  const activateAiConversation = useCallback((recordId: string) => {
+    setActiveAiRecordId(recordId);
+    setAiRecordsExpanded(false);
+  }, []);
+
+  const createAiConversation = useCallback(() => {
+    const nextRecord = createAiConversationRecord();
+    setAiRecords((current) => [nextRecord, ...current].slice(0, 24));
+    setActiveAiRecordId(nextRecord.id);
+    setAiMessages(nextRecord.messages);
+    setAiPanelTab('chat');
+    setAiRecordsExpanded(false);
+  }, []);
+
+  const clearActiveAiConversation = useCallback(() => {
+    if (!activeAiRecord) {
+      return;
+    }
+
+    const clearedMessages = [createAiMessage('assistant', defaultAiMessages[0].content)];
+    setAiMessages(clearedMessages);
+    setAiLastMarkdown(documentRef.current.markdown ?? documentRef.current.source);
+    setAiChangeBubbles([]);
+    setAiRecords((current) => current.map((record) => (
+      record.id === activeAiRecord.id
+        ? {
+            ...record,
+            title: '新对话',
+            updatedAt: new Date().toISOString(),
+            messages: clearedMessages,
+          }
+        : record
+    )));
+    setAiRecordsExpanded(false);
+  }, [activeAiRecord]);
+
+  const pushAiChangeBubbles = useCallback((changes: AiToolChangeTarget[]) => {
+    if (changes.length === 0) {
+      return;
+    }
+
+    const createdAt = Date.now();
+    const nextBubbles = changes.slice(0, 6).map((change, index) => ({
+      id: `${createdAt}-${index}-${change.kind}-${change.targetId ?? change.label}`,
+      ...change,
+    }));
+    setAiChangeBubbles((current) => [...nextBubbles, ...current].slice(0, 8));
+  }, []);
+
+  const dismissAiChangeBubble = useCallback((bubbleId: string) => {
+    setAiChangeBubbles((current) => current.filter((bubble) => bubble.id !== bubbleId));
+  }, []);
+  useEffect(() => {
+    if (aiChangeBubbles.length === 0) {
+      return undefined;
+    }
+
+    const timers = aiChangeBubbles.map((bubble) =>
+      window.setTimeout(() => {
+        dismissAiChangeBubble(bubble.id);
+      }, 12000),
+    );
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [aiChangeBubbles, dismissAiChangeBubble]);
   const [contentInspectorDraft, setContentInspectorDraft] = useState<ContentInspectorDraft>({
     markdown: '',
   });
@@ -5267,6 +5789,7 @@ export default function App() {
   const nodeTitleEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const nodeDescriptionEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const nodeEditorShellRef = useRef<HTMLDivElement | null>(null);
+  const pendingPlaceholderTitleSelectAllRef = useRef(false);
   const editingLabelRef = useRef(editingLabel);
   const subgraphEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const searchRestoreViewportRef = useRef<ViewportState | null>(null);
@@ -6317,6 +6840,57 @@ export default function App() {
     isMobileViewport,
     mode,
     selection,
+  ]);
+
+  const focusAiChangeTarget = useCallback((bubble: AiChangeBubble) => {
+    setMode('canvas');
+    setInspectorView('properties');
+    if (!inspectorOpen) {
+      setInspectorOpen(true);
+    }
+
+    if (bubble.kind === 'project') {
+      setSelection({ kind: 'none', ids: [] });
+      dismissAiChangeBubble(bubble.id);
+      return;
+    }
+
+    if (bubble.kind === 'content') {
+      setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
+      dismissAiChangeBubble(bubble.id);
+      return;
+    }
+
+    if (bubble.kind === 'node' && bubble.targetId) {
+      const target = documentRef.current.nodes.find((node) => node.id === bubble.targetId);
+      if (target) {
+        setSelection({ kind: 'node', ids: [target.id] });
+        focusViewportOnRect(target, isMobileViewport ? 0.3 : 0.48);
+      }
+      dismissAiChangeBubble(bubble.id);
+      return;
+    }
+
+    if (bubble.kind === 'subgraph' && bubble.targetId) {
+      setSelection({ kind: 'subgraph', ids: [bubble.targetId] });
+      focusViewportOnRect(allSubgraphFrameMap.get(bubble.targetId) ?? null, isMobileViewport ? 0.3 : 0.48);
+      dismissAiChangeBubble(bubble.id);
+      return;
+    }
+
+    if (bubble.kind === 'edge' && bubble.targetId) {
+      setSelection({ kind: 'edge', ids: [bubble.targetId] });
+      dismissAiChangeBubble(bubble.id);
+      return;
+    }
+
+    dismissAiChangeBubble(bubble.id);
+  }, [
+    allSubgraphFrameMap,
+    dismissAiChangeBubble,
+    focusViewportOnRect,
+    inspectorOpen,
+    isMobileViewport,
   ]);
 
   const moveViewportFromMiniMapRect = useCallback((miniX: number, miniY: number) => {
@@ -7523,7 +8097,10 @@ export default function App() {
   const goToMode = useCallback((nextMode: EditorMode) => {
     if (isVsCodeHost) {
       if (nextMode === 'source') {
-        vscodeApiRef.current?.postMessage({ type: 'lmd/openSource' });
+        vscodeApiRef.current?.postMessage({
+          type: 'lmd/openSource',
+          selection: buildHostSourceSelectionPayload(documentRef.current, selection),
+        });
         return;
       }
 
@@ -7537,7 +8114,7 @@ export default function App() {
     }
 
     setMode(nextMode);
-  }, [isVsCodeHost, mode, sourceParseError]);
+  }, [isVsCodeHost, mode, selection, sourceParseError]);
 
   const openLocalProjectFile = useCallback(async (item: ExplorerItem) => {
     const localEntry = localHandleEntriesRef.current[item.id];
@@ -9621,7 +10198,11 @@ export default function App() {
     window.requestAnimationFrame(() => {
       focusControlWithoutScroll(editor);
       const caretPosition = value.length;
-      if (editingNodeSelectAll) {
+      const shouldAutoSelectPlaceholderTitle =
+        editingNodeField === 'title' && shouldSelectAllInlineNodeField(value, 'title');
+      pendingPlaceholderTitleSelectAllRef.current =
+        editingNodeField === 'title' && (editingNodeSelectAll || shouldAutoSelectPlaceholderTitle);
+      if (editingNodeSelectAll || shouldAutoSelectPlaceholderTitle) {
         editor.select();
         editor.selectionStart = 0;
         editor.selectionEnd = value.length;
@@ -9741,6 +10322,28 @@ export default function App() {
   }, [aiSettings]);
 
   useEffect(() => {
+    if (aiRecords.length === 0) {
+      const initialRecord = createAiConversationRecord();
+      setAiRecords([initialRecord]);
+      setActiveAiRecordId(initialRecord.id);
+      setAiMessages(initialRecord.messages);
+      return;
+    }
+
+    if (!aiRecords.some((record) => record.id === activeAiRecordId)) {
+      setActiveAiRecordId(aiRecords[0].id);
+    }
+  }, [activeAiRecordId, aiRecords]);
+
+  useEffect(() => {
+    if (!activeAiRecord) {
+      return;
+    }
+
+    setAiMessages(normalizeStoredAiMessages(activeAiRecord.messages));
+  }, [activeAiRecord]);
+
+  useEffect(() => {
     localStorage.setItem(storageKeys.sidebarWidth, String(Math.round(sidebarWidth)));
   }, [sidebarWidth]);
 
@@ -9749,8 +10352,27 @@ export default function App() {
   }, [inspectorWidth]);
 
   useEffect(() => {
+    if (!activeAiRecord) {
+      return;
+    }
+
+    setAiRecords((current) => current.map((record) => (
+      record.id === activeAiRecord.id
+        ? {
+            ...record,
+            title: deriveAiConversationTitle(aiMessages),
+            updatedAt: new Date().toISOString(),
+            messages: aiMessages.slice(-32),
+          }
+        : record
+    )));
     localStorage.setItem(storageKeys.aiChat, JSON.stringify(aiMessages.slice(-24)));
-  }, [aiMessages]);
+    localStorage.setItem(storageKeys.aiActiveSession, activeAiRecord.id);
+  }, [activeAiRecord, aiMessages]);
+
+  useEffect(() => {
+    localStorage.setItem(storageKeys.aiSessions, JSON.stringify(aiRecords));
+  }, [aiRecords]);
 
   useEffect(() => {
     aiLastMarkdownRef.current = aiLastMarkdown;
@@ -10200,6 +10822,208 @@ export default function App() {
           ok: true,
           snapshot: getGraphSemanticSnapshot(),
         };
+      case 'update_lmd_sections': {
+        const currentDocument = structuredClone(documentRef.current);
+        const nextName =
+          typeof argumentsObject.projectName === 'string'
+            ? argumentsObject.projectName.trim()
+            : undefined;
+        const nextSummary =
+          typeof argumentsObject.projectSummary === 'string'
+            ? trimMultilineBlock(argumentsObject.projectSummary)
+            : undefined;
+        const nextContent =
+          typeof argumentsObject.contentMarkdown === 'string'
+            ? trimMultilineBlock(argumentsObject.contentMarkdown)
+            : undefined;
+        const warnings: string[] = [];
+
+        const canEditMeta = !aiSettings.lockProjectMeta;
+        const canEditContent = !aiSettings.lockAdditionalInfo;
+
+        if ((nextName !== undefined || nextSummary !== undefined) && !canEditMeta) {
+          warnings.push('Blocked Project Name / Summary update because the Project Meta lock is enabled.');
+        }
+        if (nextContent !== undefined && !canEditContent) {
+          warnings.push('Blocked Additional Information update because the Additional Information lock is enabled.');
+        }
+
+        const currentName = (currentDocument.projectName ?? 'Untitled Project').trim() || 'Untitled Project';
+        const currentSummary = trimMultilineBlock(currentDocument.projectSummary ?? '');
+        const currentContent = trimMultilineBlock(
+          currentDocument.contentMarkdown ?? extractContentMarkdown(currentDocument.suffixMarkdown),
+        );
+
+        const resolvedName = canEditMeta && nextName !== undefined ? (nextName || 'Untitled Project') : currentName;
+        const resolvedSummary = canEditMeta && nextSummary !== undefined ? nextSummary : currentSummary;
+        const resolvedContent = canEditContent && nextContent !== undefined ? nextContent : currentContent;
+
+        if (
+          resolvedName === currentName &&
+          resolvedSummary === currentSummary &&
+          resolvedContent === currentContent
+        ) {
+          return {
+            ok: true,
+            revision: documentRevisionRef.current,
+            markdown: getProjectMarkdown(),
+            warnings,
+            changes: [],
+          } satisfies AiToolExecutionResult;
+        }
+
+        const nextDocument = materializeDocument({
+          ...currentDocument,
+          projectName: resolvedName,
+          projectSummary: resolvedSummary,
+          prefixMarkdown: buildProjectPrefixMarkdown(resolvedName, resolvedSummary),
+          contentMarkdown: resolvedContent,
+        });
+        applyCommittedDocument(
+          nextDocument,
+          typeof argumentsObject.detail === 'string' ? argumentsObject.detail : '已通过 AI 更新工程信息',
+          'AI 已通过局部 LMD 区块工具更新标题、简介或附加信息。',
+          currentDocument,
+        );
+        return {
+          ok: true,
+          revision: documentRevisionRef.current,
+          markdown: nextDocument.markdown ?? nextDocument.source,
+          warnings,
+          changes: describeDocumentChangeTargets(currentDocument, nextDocument),
+        } satisfies AiToolExecutionResult;
+      }
+      case 'update_lmd_entities': {
+        const currentDocument = structuredClone(documentRef.current);
+        if (aiSettings.lockDiagram) {
+          return {
+            ok: true,
+            revision: documentRevisionRef.current,
+            markdown: getProjectMarkdown(),
+            warnings: ['Blocked entity update because the Flowchart lock is enabled.'],
+            changes: [],
+          } satisfies AiToolExecutionResult;
+        }
+
+        const nodeUpdates = Array.isArray(argumentsObject.nodes)
+          ? argumentsObject.nodes.filter((item): item is { id: string; title?: string; description?: string } => (
+            !!item && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string'
+          ))
+          : [];
+        const edgeUpdates = Array.isArray(argumentsObject.edges)
+          ? argumentsObject.edges.filter((item): item is { id: string; label?: string; type?: string } => (
+            !!item && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string'
+          ))
+          : [];
+        const subgraphUpdates = Array.isArray(argumentsObject.subgraphs)
+          ? argumentsObject.subgraphs.filter((item): item is { id: string; title?: string; description?: string; collapsed?: boolean } => (
+            !!item && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string'
+          ))
+          : [];
+
+        const warnings: string[] = [];
+        let next = structuredClone(currentDocument);
+
+        nodeUpdates.forEach((update) => {
+          const existing = next.nodes.find((node) => node.id === update.id);
+          if (!existing) {
+            warnings.push(`Missing node: ${update.id}`);
+            return;
+          }
+          const parts = splitEntityText(existing.label);
+          const title = typeof update.title === 'string' ? update.title : parts.title;
+          const description = typeof update.description === 'string' ? update.description : parts.description;
+          const nextLabel = composeEntityText(title, description);
+          next = {
+            ...next,
+            nodes: next.nodes.map((node) => (
+              node.id === update.id ? resizeNodeToContent(node, nextLabel) : node
+            )),
+          };
+        });
+
+        edgeUpdates.forEach((update) => {
+          const existing = next.edges.find((edge) => edge.id === update.id);
+          if (!existing) {
+            warnings.push(`Missing edge: ${update.id}`);
+            return;
+          }
+          next = {
+            ...next,
+            edges: next.edges.map((edge) => (
+              edge.id === update.id
+                ? {
+                    ...edge,
+                    label: typeof update.label === 'string' ? update.label : edge.label,
+                    type: isEdgeType(update.type) ? update.type : edge.type,
+                  }
+                : edge
+            )),
+          };
+        });
+
+        subgraphUpdates.forEach((update) => {
+          const existing = next.subgraphs.find((subgraph) => subgraph.id === update.id);
+          if (!existing) {
+            warnings.push(`Missing subgraph: ${update.id}`);
+            return;
+          }
+          const parts = splitEntityText(existing.title);
+          const title = typeof update.title === 'string' ? update.title : parts.title;
+          const description = typeof update.description === 'string' ? update.description : parts.description;
+          next = {
+            ...next,
+            subgraphs: next.subgraphs.map((subgraph) => (
+              subgraph.id === update.id
+                ? {
+                    ...subgraph,
+                    title: composeEntityText(title, description),
+                    collapsed: typeof update.collapsed === 'boolean' ? update.collapsed : subgraph.collapsed,
+                  }
+                : subgraph
+            )),
+          };
+        });
+
+        if (
+          nodeUpdates.length === 0 &&
+          edgeUpdates.length === 0 &&
+          subgraphUpdates.length === 0
+        ) {
+          return {
+            ok: true,
+            revision: documentRevisionRef.current,
+            markdown: getProjectMarkdown(),
+            warnings: [...warnings, 'No valid entity updates were provided.'],
+            changes: [],
+          } satisfies AiToolExecutionResult;
+        }
+
+        const nextDocument = materializeDocument(next);
+        if ((nextDocument.markdown ?? nextDocument.source) === (currentDocument.markdown ?? currentDocument.source)) {
+          return {
+            ok: true,
+            revision: documentRevisionRef.current,
+            markdown: getProjectMarkdown(),
+            warnings,
+            changes: [],
+          } satisfies AiToolExecutionResult;
+        }
+
+        applyCommittedDocument(
+          nextDocument,
+          typeof argumentsObject.detail === 'string' ? argumentsObject.detail : '已通过 AI 更新局部实体',
+          'AI 已通过局部实体工具更新节点、连线或分组内容。',
+          currentDocument,
+        );
+        return {
+          ok: true,
+          revision: documentRevisionRef.current,
+          markdown: nextDocument.markdown ?? nextDocument.source,
+          warnings,
+          changes: describeDocumentChangeTargets(currentDocument, nextDocument),
+        } satisfies AiToolExecutionResult;
+      }
       case 'get_project_markdown':
         return {
           ok: true,
@@ -10229,7 +11053,8 @@ export default function App() {
           ok: true,
           markdown: nextDocument.markdown ?? nextDocument.source,
           revision: documentRevisionRef.current,
-        };
+          changes: describeDocumentChangeTargets(currentDocument, nextDocument),
+        } satisfies AiToolExecutionResult;
       }
       case 'apply_graph_operation_batch': {
         const incomingOperations = Array.isArray(argumentsObject.operations)
@@ -10246,7 +11071,8 @@ export default function App() {
             warnings: filtered.warnings,
             revision: documentRevisionRef.current,
             markdown: getProjectMarkdown(),
-          };
+            changes: [],
+          } satisfies AiToolExecutionResult;
         }
 
         const result = applyGraphOperationBatch(
@@ -10272,7 +11098,8 @@ export default function App() {
           ...result,
           warnings: [...filtered.warnings, ...result.warnings],
           markdown: getProjectMarkdown(),
-        };
+          changes: describeOperationChangeTargets(filtered.operations, documentRef.current),
+        } satisfies AiToolExecutionResult;
       }
       default:
         throw new Error(`Unsupported tool: ${name}`);
@@ -10285,15 +11112,13 @@ export default function App() {
       return;
     }
 
-    const userMessage: AiMessage = {
-      id: crypto.randomUUID(),
-      role: 'user',
-      content: prompt,
-    };
+    const selectionContext = buildSelectionContext(documentRef.current, selection);
+    const selectionSummary = buildSelectionContextSummary(documentRef.current, selection);
+    const userPrompt = buildAiUserPrompt(prompt, selectionSummary);
+    const userMessage = createAiMessage('user', prompt);
     const conversation = [...aiMessages, userMessage];
     const markdown = getProjectMarkdown();
     const markdownDelta = buildMarkdownDeltaContext(aiLastMarkdownRef.current, markdown);
-    const selectionContext = buildSelectionContext(documentRef.current, selection);
     const historyContext = buildAiHistoryContext(aiMessages);
 
     setAiMessages(conversation);
@@ -10304,15 +11129,11 @@ export default function App() {
       const messages: Array<Record<string, unknown>> = [
         {
           role: 'system',
-          content: `AI rules:\n${aiSettings.systemPrompt}`,
+          content: `AI rules:\n${aiSettings.systemPrompt}\n\n${aiProjectFormatGuide}`,
         },
         {
           role: 'system',
           content: `Tool rules:\n${aiToolRules}\n\nLock rules:\n${buildAiLockRules(aiSettings)}`,
-        },
-        {
-          role: 'system',
-          content: `Project format:\n${aiProjectFormatGuide}`,
         },
         {
           role: 'system',
@@ -10331,18 +11152,21 @@ export default function App() {
         });
       }
 
-      messages.push(
-        {
+      if (selectionContext !== 'No active selection.') {
+        messages.push({
           role: 'system',
           content: `Current selection:\n${selectionContext}`,
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      );
+        });
+      }
+
+      messages.push({
+        role: 'user',
+        content: userPrompt,
+      });
 
       let finalAssistantContent = '';
+      const aggregatedChanges: AiToolChangeTarget[] = [];
+      const aggregatedWarnings: string[] = [];
 
       for (let step = 0; step < 6; step += 1) {
         const response = await fetch(aiSettings.apiUrl, {
@@ -10418,6 +11242,14 @@ export default function App() {
             };
           }
 
+          const typedToolResult = toolResult as AiToolExecutionResult;
+          if (Array.isArray(typedToolResult.changes)) {
+            aggregatedChanges.push(...typedToolResult.changes);
+          }
+          if (Array.isArray(typedToolResult.warnings)) {
+            aggregatedWarnings.push(...typedToolResult.warnings);
+          }
+
           messages.push({
             role: 'tool',
             tool_call_id: toolCallId,
@@ -10426,29 +11258,35 @@ export default function App() {
         }
       }
 
+      const assistantBody = finalAssistantContent || '已完成当前请求。';
+      const warningSuffix = aggregatedWarnings.length > 0
+        ? `\n\n限制说明：\n- ${Array.from(new Set(aggregatedWarnings)).join('\n- ')}`
+        : '';
+
       setAiMessages((current) => [
         ...current,
-        {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          content: finalAssistantContent || '已完成当前请求。',
-        },
+        createAiMessage('assistant', `${assistantBody}${warningSuffix}`),
       ]);
+      pushAiChangeBubbles(aggregatedChanges);
       setAiLastMarkdown(getProjectMarkdown());
     } catch (error) {
       setAiMessages((current) => [
         ...current,
-        {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          content: error instanceof Error ? error.message : 'AI 请求失败。',
-          status: 'error',
-        },
+        createAiMessage('assistant', error instanceof Error ? error.message : 'AI 请求失败。', 'error'),
       ]);
     } finally {
       setAiSending(false);
     }
-  }, [aiInput, aiMessages, aiSending, aiSettings, executeAiToolCall, getProjectMarkdown, selection]);
+  }, [
+    aiInput,
+    aiMessages,
+    aiSending,
+    aiSettings,
+    executeAiToolCall,
+    getProjectMarkdown,
+    pushAiChangeBubbles,
+    selection,
+  ]);
 
   // External Control API - allows external tools to control the editor
   useEffect(() => {
@@ -11385,6 +12223,31 @@ export default function App() {
                 ) : null}
               </div>
 
+              {aiChangeBubbles.length > 0 ? (
+                <aside className="ai-change-bubbles" aria-label="AI 修改提示">
+                  {aiChangeBubbles.map((bubble) => (
+                    <article className="ai-change-bubble" key={bubble.id}>
+                      <button
+                        className="ai-change-bubble__body"
+                        onClick={() => focusAiChangeTarget(bubble)}
+                        type="button"
+                      >
+                        <strong>{bubble.label}</strong>
+                        <span>{bubble.detail}</span>
+                      </button>
+                      <button
+                        aria-label="关闭提示"
+                        className="ai-change-bubble__dismiss"
+                        onClick={() => dismissAiChangeBubble(bubble.id)}
+                        type="button"
+                      >
+                        ×
+                      </button>
+                    </article>
+                  ))}
+                </aside>
+              ) : null}
+
               <div
                 className={`canvas-surface${spacePressed ? ' is-panning' : ''}`}
                 onContextMenu={(event) => event.preventDefault()}
@@ -11964,7 +12827,38 @@ export default function App() {
                             <textarea
                               className={`graph-node__editor graph-node__editor--title${editingNodeField === 'title' ? ' is-active' : ''}`}
                               ref={nodeTitleEditorRef}
+                              onFocus={(event) => {
+                                const target = event.currentTarget;
+                                if (
+                                  !pendingPlaceholderTitleSelectAllRef.current &&
+                                  !shouldSelectAllInlineNodeField(target.value, 'title')
+                                ) {
+                                  return;
+                                }
+
+                                window.requestAnimationFrame(() => {
+                                  target.selectionStart = 0;
+                                  target.selectionEnd = target.value.length;
+                                });
+                              }}
+                              onMouseUp={(event) => {
+                                const target = event.currentTarget;
+                                if (
+                                  !pendingPlaceholderTitleSelectAllRef.current &&
+                                  !shouldSelectAllInlineNodeField(target.value, 'title')
+                                ) {
+                                  return;
+                                }
+
+                                event.preventDefault();
+                                window.requestAnimationFrame(() => {
+                                  target.selectionStart = 0;
+                                  target.selectionEnd = target.value.length;
+                                  pendingPlaceholderTitleSelectAllRef.current = false;
+                                });
+                              }}
                               onBlur={() => {
+                                pendingPlaceholderTitleSelectAllRef.current = false;
                                 window.requestAnimationFrame(() => {
                                   if (nodeEditorShellRef.current?.contains(document.activeElement)) {
                                     persistInlineNodeDraft(node.id, {
@@ -12928,66 +13822,70 @@ export default function App() {
           ) : null}
             </>
           ) : !isVsCodeHost ? (
-            <section className="sidebar-card sidebar-card--ai">
-              <div className="sidebar-card__header">
-                <h2>AI 助手</h2>
-                <span>Local only</span>
+            <section className="ai-sidebar" aria-label="AI 助手">
+              <div className="ai-sidebar__header">
+                <div className="ai-sidebar__title">
+                  <strong>AI 助手</strong>
+                  <span>{activeAiRecord?.title ?? '新对话'}</span>
+                </div>
+                <div className="ai-sidebar__header-actions">
+                  <button
+                    aria-label="新建对话"
+                    className="panel-icon-button has-tooltip"
+                    data-tooltip="新对话"
+                    onClick={createAiConversation}
+                    type="button"
+                  >
+                    <WorkbenchIcon name="plus" />
+                  </button>
+                  <button
+                    aria-label="清空当前记录"
+                    className="panel-icon-button has-tooltip"
+                    data-tooltip="清空当前记录"
+                    onClick={clearActiveAiConversation}
+                    type="button"
+                  >
+                    <WorkbenchIcon name="trash" />
+                  </button>
+                </div>
               </div>
 
-              <div className="ai-panel__tabs" role="tablist" aria-label="AI 面板页签">
+              <div className="ai-sidebar__tabs" role="tablist" aria-label="AI 面板页签">
                 <button
-                  className={aiPanelTab === 'chat' ? 'ai-panel__tab is-active' : 'ai-panel__tab'}
+                  className={aiPanelTab === 'chat' ? 'ai-sidebar__tab is-active' : 'ai-sidebar__tab'}
                   onClick={() => setAiPanelTab('chat')}
                   type="button"
                 >
-                  <WorkbenchIcon name="chat" />
-                  <span>聊天</span>
+                  聊天
                 </button>
                 <button
-                  className={aiPanelTab === 'settings' ? 'ai-panel__tab is-active' : 'ai-panel__tab'}
+                  className={aiPanelTab === 'settings' ? 'ai-sidebar__tab is-active' : 'ai-sidebar__tab'}
                   onClick={() => setAiPanelTab('settings')}
                   type="button"
                 >
-                  <WorkbenchIcon name="settings" />
-                  <span>设置</span>
+                  设置
                 </button>
               </div>
 
               {aiPanelTab === 'chat' ? (
-                <>
-                  <div className="ai-panel__messages" onWheelCapture={(event) => event.stopPropagation()}>
-                    {aiMessages.map((message) => (
-                      <article
-                        className={
-                          message.status === 'error'
-                            ? `ai-message ai-message--${message.role} is-error`
-                            : `ai-message ai-message--${message.role}`
-                        }
-                        key={message.id}
-                      >
-                        <strong>{message.role === 'assistant' ? 'AI' : '你'}</strong>
-                        <p>{message.content}</p>
-                      </article>
-                    ))}
-                    {aiSending ? (
-                      <article className="ai-message ai-message--assistant">
-                        <strong>AI</strong>
-                        <p>正在思考当前工程上下文...</p>
-                      </article>
-                    ) : null}
-                  </div>
-                  <section className="ai-agent-controls" aria-label="Agent 模式控制">
-                    <div className="ai-agent-controls__header">
-                      <strong>Agent 模式</strong>
-                      <span>锁定的部分会直接禁止 AI 改写</span>
-                    </div>
-                    <div className="ai-agent-controls__list">
+                <div className="ai-sidebar__chat">
+                  <div className="ai-sidebar__topbar">
+                    <button
+                      aria-expanded={aiRecordsExpanded}
+                      className={aiRecordsExpanded ? 'ai-sidebar__toggle is-active' : 'ai-sidebar__toggle'}
+                      onClick={() => setAiRecordsExpanded((current) => !current)}
+                      type="button"
+                    >
+                      <WorkbenchIcon name="history" />
+                      <span>记录 {aiRecords.length}</span>
+                    </button>
+                    <div className="ai-lock-row" aria-label="Agent 模式控制">
                       {aiLockControls.map((control) => {
                         const checked = aiSettings[control.key];
                         return (
                           <button
                             aria-pressed={!checked}
-                            className={checked ? 'ai-agent-toggle is-locked' : 'ai-agent-toggle is-unlocked'}
+                            className={checked ? 'ai-lock-chip is-locked' : 'ai-lock-chip is-unlocked'}
                             key={control.key}
                             onClick={() =>
                               setAiSettings((current) => ({
@@ -12997,16 +13895,85 @@ export default function App() {
                             }
                             type="button"
                           >
-                            <span className="ai-agent-toggle__state">{checked ? '锁定' : '开锁'}</span>
-                            <span className="ai-agent-toggle__label">{control.label}</span>
+                            <span>{control.label}</span>
+                            <strong>{checked ? '锁定' : '开锁'}</strong>
                           </button>
                         );
                       })}
                     </div>
+                  </div>
+
+                  {aiRecordsExpanded ? (
+                    <section className="ai-sidebar__records-drawer" aria-label="AI 对话记录">
+                      <div className="ai-sidebar__section-header">
+                        <strong>记录列表</strong>
+                        <span>{aiRecords.length} 条</span>
+                      </div>
+                      <div className="ai-sidebar__record-list">
+                        {aiRecords.map((record) => {
+                          const previewMessage = [...record.messages]
+                            .reverse()
+                            .find((message) => message.role === 'assistant' || message.role === 'user');
+                          const preview = previewMessage?.content?.replace(/\s+/g, ' ').trim() || '空白对话';
+                          return (
+                            <button
+                              className={record.id === activeAiRecord?.id ? 'ai-record is-active' : 'ai-record'}
+                              key={record.id}
+                              onClick={() => activateAiConversation(record.id)}
+                              type="button"
+                            >
+                              <strong>{record.title}</strong>
+                              <span>{preview}</span>
+                              <small>{new Date(record.updatedAt).toLocaleString('zh-CN', { hour12: false })}</small>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  ) : null}
+
+                  <div className={`ai-selection-scope${selectionContextSummary ? ' is-active' : ''}`}>
+                    <strong>当前选中内容：</strong>
+                    <span>{selectionContextSummary || '默认按整份文档执行'}</span>
+                  </div>
+
+                  <section className="ai-sidebar__messages-section">
+                    <div className="ai-sidebar__section-header">
+                      <strong>对话</strong>
+                      <span>{aiSending ? '处理中' : '就绪'}</span>
+                    </div>
+                    <div className="ai-sidebar__messages" onWheelCapture={(event) => event.stopPropagation()}>
+                      {aiMessages.map((message) => (
+                        <article
+                          className={
+                            message.status === 'error'
+                              ? `ai-sidebar__message ai-sidebar__message--${message.role} is-error`
+                              : `ai-sidebar__message ai-sidebar__message--${message.role}`
+                          }
+                          key={message.id}
+                        >
+                          <div className="ai-sidebar__message-meta">
+                            <strong>{message.role === 'assistant' ? 'AI' : '你'}</strong>
+                            <span>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</span>
+                          </div>
+                          <p>{message.content}</p>
+                        </article>
+                      ))}
+                      {aiSending ? (
+                        <article className="ai-sidebar__message ai-sidebar__message--assistant">
+                          <div className="ai-sidebar__message-meta">
+                            <strong>AI</strong>
+                            <span>处理中</span>
+                          </div>
+                          <p>正在读取完整 LMD、最近改动与当前选中内容...</p>
+                        </article>
+                      ) : null}
+                    </div>
                   </section>
-                  <div className="ai-panel__composer">
+
+                  <div className="ai-sidebar__composer">
                     <textarea
-                      className="ai-panel__input"
+                      className="ai-sidebar__input"
                       onChange={(event) => setAiInput(event.target.value)}
                       onKeyDown={(event) => {
                         if (handleNativeSelectAllShortcut(event)) {
@@ -13019,11 +13986,15 @@ export default function App() {
                         }
                       }}
                       onWheelCapture={(event) => event.stopPropagation()}
-                      placeholder="当前会自动附带完整 Markdown、上一轮改动、当前选中内容和工具规则。"
+                      placeholder={
+                        selectionContextSummary
+                          ? `当前选中内容：${selectionContextSummary}\n请输入你要对这部分执行的操作`
+                          : '请输入你希望 AI 修改、整理或解释的内容'
+                      }
                       rows={3}
                       value={aiInput}
                     />
-                    <div className="ai-panel__composer-bar">
+                    <div className="ai-sidebar__composer-bar">
                       <span>Enter 发送，Shift + Enter 换行</span>
                       <button
                         className="solid-button"
@@ -13037,9 +14008,9 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-                </>
+                </div>
               ) : (
-                <div className="ai-panel__settings" onWheelCapture={(event) => event.stopPropagation()}>
+                <div className="ai-sidebar__settings" onWheelCapture={(event) => event.stopPropagation()}>
                   <label className="field">
                     <span>API URL</span>
                     <input
@@ -13059,7 +14030,7 @@ export default function App() {
                       type="password"
                       value={aiSettings.apiKey}
                     />
-                    <small>仅保存在当前浏览器，不写入工程 Markdown。</small>
+                    <small>仅保存在当前浏览器，不写入工程 LMD。</small>
                   </label>
                   <label className="field">
                     <span>Model</span>
@@ -13090,7 +14061,7 @@ export default function App() {
                       onChange={(event) =>
                         setAiSettings((current) => ({ ...current, systemPrompt: event.target.value }))
                       }
-                      rows={6}
+                      rows={8}
                       value={aiSettings.systemPrompt}
                     />
                   </label>

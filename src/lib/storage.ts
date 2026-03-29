@@ -5,5 +5,7 @@ export const storageKeys = {
   inspectorWidth: 'lths-md/inspector-width',
   aiSettings: 'lths-md/ai-settings',
   aiChat: 'lths-md/ai-chat',
+  aiSessions: 'lths-md/ai-sessions',
+  aiActiveSession: 'lths-md/ai-active-session',
   aiLastMarkdown: 'lths-md/ai-last-markdown',
 };

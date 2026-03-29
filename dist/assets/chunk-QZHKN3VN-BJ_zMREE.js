@@ -1,1 +1,0 @@
-import{h as e}from"./src-Dh3JgfPY.js";var t,n=(t=class{constructor(e){this.init=e,this.records=this.init()}reset(){this.records=this.init()}},e(t,`ImperativeState`),t);export{n as t};

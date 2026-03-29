@@ -107,6 +107,10 @@ export interface GraphSemanticSnapshot {
       title: string;
       description: string;
       subgraphId: string | null;
+      x: number;
+      y: number;
+      width: number;
+      height: number;
     }>;
     edges: Array<{
       id: string;

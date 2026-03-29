@@ -278,6 +278,9 @@ class LmdEditorProvider implements vscode.CustomTextEditorProvider {
       }
 
       if (message.type === 'lmd/openSource') {
+        if ('selection' in message) {
+          lastSelectionRange = resolveSelectionRange(document, message.selection);
+        }
         await vscode.window.showTextDocument(document, {
           preview: false,
           selection: lastSelectionRange ?? undefined,

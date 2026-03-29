@@ -1,0 +1,8 @@
+interface:
+  display_name: "LMD Protocol"
+  short_description: "LMD 文件结构与 Mermaid 标准约束"
+  brand_color: "#1D4ED8"
+  default_prompt: "Use $lmd-protocol to read or write this project's `.lmd` files using the correct LMD structure and Mermaid flowchart rules."
+
+policy:
+  allow_implicit_invocation: true

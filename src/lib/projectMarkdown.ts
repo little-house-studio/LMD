@@ -91,7 +91,24 @@ function inferProjectName(prefixMarkdown: string, fallbackName: string) {
 
 function inferProjectSummary(prefixMarkdown: string) {
   const summaryMatch = prefixMarkdown.match(/^##\s+Summary\s*\n([\s\S]*?)(?=\n##\s+|\n#\s+|$)/im);
-  return trimBlock(summaryMatch?.[1] ?? '');
+  return normalizeProjectSummary(summaryMatch?.[1] ?? '');
+}
+
+function normalizeProjectSummary(value: string) {
+  const normalized = trimBlock(value);
+  if (!normalized) {
+    return '';
+  }
+
+  const accidentalSectionStart = normalized.search(
+    /(?:^|\n)(?:##\s+(?:Diagram|Content)\b|```(?:mermaid|lths-compat)\b)/i,
+  );
+
+  if (accidentalSectionStart <= 0) {
+    return accidentalSectionStart === 0 ? '' : normalized;
+  }
+
+  return trimBlock(normalized.slice(0, accidentalSectionStart));
 }
 
 function inferFallbackSummary(source: string) {
@@ -893,7 +910,9 @@ export function standardizeProjectMarkdown(
   });
 
   let contentMarkdown = trimBlock(contentFragments.filter(Boolean).join('\n\n'));
-  const projectSummary = summarySections[0]?.body || inferFallbackSummary(contentMarkdown);
+  const projectSummary = normalizeProjectSummary(
+    summarySections[0]?.body || inferFallbackSummary(contentMarkdown),
+  );
   if (!summarySections[0]?.body) {
     contentMarkdown = stripLeadingSummaryParagraph(contentMarkdown, projectSummary);
   }
