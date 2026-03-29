@@ -20,8 +20,8 @@ pnpm run build:vscode
 
 构建完成后会得到：
 
-- Webview 资源：[dist](/Users/mac/Documents/vscodeProject/LTHS_MD/dist)
-- VSCode 扩展入口：[out/extension.cjs](/Users/mac/Documents/vscodeProject/LTHS_MD/out/extension.cjs)
+- Webview 资源：`dist/`
+- VSCode 扩展入口：`out/extension.cjs`
 
 ### 插件调试
 
@@ -31,6 +31,28 @@ pnpm run build:vscode
 - 运行 `pnpm run build:vscode`
 - 在 VSCode 中按 `F5`
 - 新建或打开 `*.lmd` 文件
+
+### 插件热更新开发
+
+如果你想要更接近浏览器的热更新体验，不要先跑 `build:vscode`，而是直接用开发模式：
+
+```bash
+pnpm install
+pnpm run dev:vscode
+```
+
+然后在 VSCode 里直接启动仓库自带的调试配置 `Run LMD_EDITER`。
+
+这套模式下：
+
+- React / CSS / 画布 UI 走 Vite dev server，支持接近浏览器的热更新
+- Webview 前端改动基本会即时刷新
+- 扩展宿主代码会自动 watch 编译
+
+需要注意：
+
+- Webview UI 可以做到接近浏览器 HMR
+- `extension.cts` 这类 VSCode 扩展宿主代码改动后，通常仍需要重新启动扩展宿主，不能像纯浏览器页面那样完全无感热替换
 
 ### 当前插件版保留的核心能力
 
@@ -58,7 +80,7 @@ pnpm dev
 pnpm build
 ```
 
-构建产物位于 [dist](/Users/mac/Documents/vscodeProject/LTHS_MD/dist)。
+构建产物位于 `dist/`。
 
 ## RK3366 ARM 开发板部署建议
 

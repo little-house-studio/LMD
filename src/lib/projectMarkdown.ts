@@ -1,13 +1,20 @@
 import {
   createDefaultLayout,
+  looksLikeStandaloneMermaidSource,
   measureNodeContentSize,
   parseMermaidDocument,
+  serializeMermaidDocument,
 } from './mermaid';
+import {
+  buildEntityIdFromTitle,
+  deriveEntityTitleFromId,
+} from './entityId';
 import type {
   GraphDocument,
   GraphNode,
   GraphSubgraph,
   LayoutSidecar,
+  ParsedDocument,
   ProjectCompatExtras,
   ProjectCompatLayer,
 } from './types';
@@ -18,7 +25,6 @@ const DEFAULT_VIEWPORT = createDefaultLayout().viewport;
 const EMPTY_PROJECT_MERMAID = `flowchart LR
   Start[Start]`;
 const CONTENT_SECTION_TITLE = 'Content';
-const NODE_ANNOTATIONS_SECTION_TITLE = 'Node Annotations';
 
 function normalizeLineEndings(value: string) {
   return value.replace(/\r\n/g, '\n');
@@ -157,18 +163,8 @@ function rebuildSection(title: string, body: string) {
   return trimmedBody ? `## ${trimmedTitle}\n\n${trimmedBody}` : `## ${trimmedTitle}`;
 }
 
-function findFirstParseableMermaidBlock(source: string, fallbackLayout?: LayoutSidecar) {
-  const blocks = findFenceBlocks(source, 'mermaid');
-  for (const block of blocks) {
-    try {
-      parseMermaidDocument(block.body, fallbackLayout);
-      return block;
-    } catch {
-      continue;
-    }
-  }
-
-  return null;
+function findFirstMermaidBlock(source: string) {
+  return findFenceBlocks(source, 'mermaid')[0] ?? null;
 }
 
 function stripLeadingSummaryParagraph(source: string, summary: string) {
@@ -194,7 +190,99 @@ function buildContentSection(content: string) {
   return trimmed ? `## ${CONTENT_SECTION_TITLE}\n\n${trimmed}` : `## ${CONTENT_SECTION_TITLE}`;
 }
 
-function parseNodeAnnotationsSection(markdown: string) {
+function asStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const entries = Object.entries(value).filter((entry): entry is [string, string] =>
+    typeof entry[0] === 'string' &&
+    typeof entry[1] === 'string' &&
+    entry[1].trim().length > 0,
+  );
+
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function splitEntityText(label: string) {
+  const normalized = normalizeLineEndings(label).trimEnd();
+  if (!normalized) {
+    return {
+      title: '',
+      description: '',
+    };
+  }
+
+  const [titleLine, ...restLines] = normalized.split('\n');
+  return {
+    title: titleLine.trim(),
+    description: restLines.join('\n').trim(),
+  };
+}
+
+function composeEntityText(title: string, description = '') {
+  const normalizedTitle = normalizeLineEndings(title).trimEnd() || '未命名内容';
+  const normalizedDescription = normalizeLineEndings(description).trimEnd();
+  return normalizedDescription ? `${normalizedTitle}\n${normalizedDescription}` : normalizedTitle;
+}
+
+function normalizeFlowchartNodeIds(parsed: ParsedDocument) {
+  if (parsed.diagramType !== 'flowchart') {
+    return parsed;
+  }
+
+  const usedIds = new Set<string>();
+  const idRemap = new Map<string, string>();
+
+  const nodes = parsed.nodes.map((node) => {
+    const readableTitle = deriveEntityTitleFromId(node.id);
+    const legacyParts = splitEntityText(node.label);
+    const title = readableTitle ?? (legacyParts.title || '未命名内容');
+    const description = readableTitle
+      ? legacyParts.title === readableTitle && legacyParts.description
+        ? legacyParts.description
+        : node.label.trim()
+      : legacyParts.description;
+    const nextId = buildEntityIdFromTitle(title, usedIds, node.id);
+    usedIds.add(nextId);
+    idRemap.set(node.id, nextId);
+    const size = measureNodeContentSize(title, description);
+
+    return {
+      ...node,
+      id: nextId,
+      label: composeEntityText(title, description),
+      width: size.width,
+      height: size.height,
+    };
+  });
+
+  const edges = parsed.edges.map((edge) => ({
+    ...edge,
+    from: idRemap.get(edge.from) ?? edge.from,
+    to: idRemap.get(edge.to) ?? edge.to,
+  }));
+
+  const layout: LayoutSidecar = {
+    version: parsed.layout.version,
+    viewport: { ...parsed.layout.viewport },
+    nodes: Object.fromEntries(
+      Object.entries(parsed.layout.nodes).map(([id, value]) => [idRemap.get(id) ?? id, { ...value }]),
+    ),
+    subgraphs: Object.fromEntries(
+      Object.entries(parsed.layout.subgraphs).map(([id, value]) => [id, { ...value }]),
+    ),
+  };
+
+  return {
+    ...parsed,
+    nodes,
+    edges,
+    layout,
+  };
+}
+
+function parseLegacyNodeAnnotationsSection(markdown: string) {
   const normalized = trimBlock(markdown);
   if (!normalized) {
     return {} as Record<string, string>;
@@ -235,28 +323,6 @@ function parseNodeAnnotationsSection(markdown: string) {
   );
 }
 
-function buildNodeAnnotationsSection(nodeAnnotations: Record<string, string>) {
-  const entries = Object.entries(nodeAnnotations)
-    .filter((entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].trim().length > 0)
-    .sort((left, right) => left[0].localeCompare(right[0]));
-
-  if (entries.length === 0) {
-    return '';
-  }
-
-  const lines = [`## ${NODE_ANNOTATIONS_SECTION_TITLE}`, ''];
-  entries.forEach(([nodeId, note], index) => {
-    if (index > 0) {
-      lines.push('');
-    }
-    lines.push(`### \`${nodeId}\``);
-    lines.push('');
-    lines.push(trimBlock(note));
-  });
-
-  return lines.join('\n');
-}
-
 function extractSuffixSections(
   suffixMarkdown: string,
   legacyNodeNotes?: Record<string, string>,
@@ -264,7 +330,7 @@ function extractSuffixSections(
   const normalized = trimBlock(suffixMarkdown);
   const { preamble, sections } = splitTopLevelSections(normalized);
   const contentFragments: string[] = [];
-  const nodeAnnotations = {
+  const legacyAnnotations = {
     ...(legacyNodeNotes ?? {}),
   } as Record<string, string>;
 
@@ -281,8 +347,8 @@ function extractSuffixSections(
       return;
     }
 
-    if (key === NODE_ANNOTATIONS_SECTION_TITLE.toLowerCase()) {
-      Object.assign(nodeAnnotations, parseNodeAnnotationsSection(section.body));
+    if (key === 'node annotations') {
+      Object.assign(legacyAnnotations, parseLegacyNodeAnnotationsSection(section.body));
       return;
     }
 
@@ -291,8 +357,8 @@ function extractSuffixSections(
 
   return {
     contentMarkdown: trimBlock(contentFragments.filter(Boolean).join('\n\n')),
-    nodeAnnotations: Object.fromEntries(
-      Object.entries(nodeAnnotations).filter((entry): entry is [string, string] =>
+    legacyAnnotations: Object.fromEntries(
+      Object.entries(legacyAnnotations).filter((entry): entry is [string, string] =>
         typeof entry[0] === 'string' &&
         typeof entry[1] === 'string' &&
         entry[1].trim().length > 0,
@@ -301,13 +367,39 @@ function extractSuffixSections(
   };
 }
 
-export function buildProjectSuffixMarkdown(content: string, nodeAnnotations: Record<string, string> = {}) {
-  const blocks = [buildContentSection(content)];
-  const annotationsSection = buildNodeAnnotationsSection(nodeAnnotations);
-  if (annotationsSection) {
-    blocks.push(annotationsSection);
+export function buildProjectSuffixMarkdown(content: string) {
+  return buildContentSection(content);
+}
+
+function mergeLegacyAnnotationsIntoNodes(nodes: GraphNode[], annotations: Record<string, string>) {
+  if (Object.keys(annotations).length === 0) {
+    return nodes;
   }
-  return blocks.filter(Boolean).join('\n\n');
+
+  return nodes.map((node) => {
+    const note = trimBlock(annotations[node.id] ?? '');
+    if (!note) {
+      return node;
+    }
+
+    const normalizedLabel = normalizeLineEndings(node.label).trimEnd();
+    if (normalizedLabel.includes(note)) {
+      return node;
+    }
+
+    const nextLabel = normalizedLabel.includes('\n')
+      ? `${normalizedLabel}\n\n${note}`
+      : `${normalizedLabel}\n${note}`;
+    const nextParts = splitEntityText(nextLabel);
+    const size = measureNodeContentSize(nextParts.title, nextParts.description);
+
+    return {
+      ...node,
+      label: nextLabel,
+      width: size.width,
+      height: size.height,
+    };
+  });
 }
 
 function createEmptyCompatLayer(fallbackLayout?: LayoutSidecar): ProjectCompatLayer {
@@ -547,7 +639,8 @@ function serializeCompactCompatLayer(input: {
         return null;
       }
 
-      const measured = measureNodeContentSize(node.label);
+      const parts = splitEntityText(node.label);
+      const measured = measureNodeContentSize(parts.title, parts.description);
       const values = [
         node.id,
         formatCompatNumber(stored.x),
@@ -636,13 +729,24 @@ export function parseProjectMarkdown(
   }
 
   const prefixMarkdown = trimBlock(markdownWithoutCompat.slice(0, mermaidBlock.start));
-  const legacyNodeNotes = compat.extras?.nodeNotes && typeof compat.extras.nodeNotes === 'object'
-    ? compat.extras.nodeNotes
-    : undefined;
+  const legacyNodeNotes = asStringRecord(compat.extras?.nodeNotes);
   const suffixSections = extractSuffixSections(trimBlock(markdownWithoutCompat.slice(mermaidBlock.end)), legacyNodeNotes);
-  const suffixMarkdown = buildProjectSuffixMarkdown(suffixSections.contentMarkdown, suffixSections.nodeAnnotations);
+  const suffixMarkdown = buildProjectSuffixMarkdown(suffixSections.contentMarkdown);
   const mermaidSource = mermaidBlock.body;
   const parsed = parseMermaidDocument(mermaidSource, compat.layout);
+  const parsedWithLegacyNotes = normalizeFlowchartNodeIds({
+    ...parsed,
+    nodes: mergeLegacyAnnotationsIntoNodes(parsed.nodes, suffixSections.legacyAnnotations),
+  });
+  const normalizedMermaidSource = parsedWithLegacyNotes.diagramType === 'flowchart'
+    ? serializeMermaidDocument(
+      parsedWithLegacyNotes.direction,
+      parsedWithLegacyNotes.nodes,
+      parsedWithLegacyNotes.edges,
+      parsedWithLegacyNotes.subgraphs,
+      parsedWithLegacyNotes.unsupportedLines,
+    )
+    : mermaidSource.trim();
   const projectName = inferProjectName(prefixMarkdown, fallbackName);
   const projectSummary = inferProjectSummary(prefixMarkdown);
   const compatExtras = compat.extras
@@ -652,31 +756,30 @@ export function parseProjectMarkdown(
     : undefined;
 
   return {
-    ...parsed,
-    source: mermaidSource,
+    ...parsedWithLegacyNotes,
+    source: normalizedMermaidSource,
     markdown: serializeProjectMarkdown({
       projectName,
       projectSummary,
       prefixMarkdown,
       suffixMarkdown,
-      mermaidSource,
+      mermaidSource: normalizedMermaidSource,
       compat: {
         ...compat,
-        layout: parsed.layout,
+        layout: parsedWithLegacyNotes.layout,
         extras: compatExtras,
       },
-      nodes: parsed.nodes,
-      subgraphs: parsed.subgraphs,
+      nodes: parsedWithLegacyNotes.nodes,
+      subgraphs: parsedWithLegacyNotes.subgraphs,
     }),
     projectName,
     projectSummary,
     prefixMarkdown: prefixMarkdown || buildDefaultPrefix(projectName, projectSummary),
     suffixMarkdown,
     contentMarkdown: suffixSections.contentMarkdown,
-    nodeAnnotations: suffixSections.nodeAnnotations,
     compat: {
       ...compat,
-      layout: parsed.layout,
+      layout: parsedWithLegacyNotes.layout,
       extras: compatExtras,
     },
   };
@@ -704,7 +807,6 @@ export function standardizeProjectMarkdown(
   const summarySections = normalizedSections.filter((section) => section.key === 'summary');
   const diagramSections = normalizedSections.filter((section) => section.key === 'diagram');
   const contentSections = normalizedSections.filter((section) => section.key === 'content');
-  const annotationSections = normalizedSections.filter((section) => section.key === 'node annotations');
   const extraSections = normalizedSections.filter((section) =>
     section.key !== 'summary' &&
     section.key !== 'diagram' &&
@@ -721,7 +823,7 @@ export function standardizeProjectMarkdown(
 
   let diagramHandled = false;
   for (const section of diagramSections) {
-    const parsedBlock = findFirstParseableMermaidBlock(section.body, compat.layout);
+    const parsedBlock = findFirstMermaidBlock(section.body);
     if (!diagramHandled && parsedBlock) {
       mermaidSource = parsedBlock.body;
       const residue = trimBlock(
@@ -740,7 +842,7 @@ export function standardizeProjectMarkdown(
   }
 
   if (!mermaidSource) {
-    const parsedBlock = findFirstParseableMermaidBlock(strippedTitle.body, compat.layout);
+    const parsedBlock = findFirstMermaidBlock(strippedTitle.body);
     if (parsedBlock) {
       mermaidSource = parsedBlock.body;
       const residue = trimBlock(
@@ -763,7 +865,7 @@ export function standardizeProjectMarkdown(
             }
           });
       }
-    } else if (/^(?:flowchart|graph)\s+(TD|LR|RL|BT)\b/i.test(strippedTitle.body.trim())) {
+    } else if (looksLikeStandaloneMermaidSource(strippedTitle.body.trim())) {
       mermaidSource = strippedTitle.body.trim();
     } else {
       mermaidSource = EMPTY_PROJECT_MERMAID;
@@ -776,14 +878,14 @@ export function standardizeProjectMarkdown(
     }
   });
 
-  const legacyNodeNotes = compat.extras?.nodeNotes && typeof compat.extras.nodeNotes === 'object'
-    ? compat.extras.nodeNotes
-    : undefined;
+  const legacyNodeNotes = asStringRecord(compat.extras?.nodeNotes);
   const nodeAnnotations = {
     ...(legacyNodeNotes ?? {}),
   } as Record<string, string>;
-  annotationSections.forEach((section) => {
-    Object.assign(nodeAnnotations, parseNodeAnnotationsSection(section.body));
+  normalizedSections
+    .filter((section) => section.key === 'node annotations')
+    .forEach((section) => {
+      Object.assign(nodeAnnotations, parseLegacyNodeAnnotationsSection(section.body));
   });
 
   extraSections.forEach((section) => {
@@ -796,11 +898,25 @@ export function standardizeProjectMarkdown(
     contentMarkdown = stripLeadingSummaryParagraph(contentMarkdown, projectSummary);
   }
 
+  if (Object.keys(nodeAnnotations).length > 0) {
+    const parsedDiagram = parseMermaidDocument(mermaidSource, compat.layout);
+    if (parsedDiagram.diagramType === 'flowchart') {
+      const mergedNodes = mergeLegacyAnnotationsIntoNodes(parsedDiagram.nodes, nodeAnnotations);
+      mermaidSource = serializeMermaidDocument(
+        parsedDiagram.direction,
+        mergedNodes,
+        parsedDiagram.edges,
+        parsedDiagram.subgraphs,
+        parsedDiagram.unsupportedLines,
+      );
+    }
+  }
+
   const standardizedMarkdown = serializeProjectMarkdown({
     projectName,
     projectSummary,
     prefixMarkdown: buildDefaultPrefix(projectName, projectSummary),
-    suffixMarkdown: buildProjectSuffixMarkdown(contentMarkdown, nodeAnnotations),
+    suffixMarkdown: buildProjectSuffixMarkdown(contentMarkdown),
     mermaidSource,
     compat: {
       ...compat,
@@ -821,7 +937,6 @@ export function serializeProjectMarkdown(input: {
   prefixMarkdown?: string;
   suffixMarkdown?: string;
   contentMarkdown?: string;
-  nodeAnnotations?: Record<string, string>;
   mermaidSource: string;
   compat: ProjectCompatLayer;
   nodes?: GraphNode[];
@@ -831,15 +946,8 @@ export function serializeProjectMarkdown(input: {
     input.projectName,
     input.projectSummary,
   );
-  const normalizedNodeAnnotations = Object.fromEntries(
-    Object.entries(input.nodeAnnotations ?? {}).filter((entry): entry is [string, string] =>
-      typeof entry[0] === 'string' &&
-      typeof entry[1] === 'string' &&
-      entry[1].trim().length > 0,
-    ),
-  );
-  const suffixSource = input.contentMarkdown !== undefined || Object.keys(normalizedNodeAnnotations).length > 0
-    ? buildProjectSuffixMarkdown(input.contentMarkdown ?? '', normalizedNodeAnnotations)
+  const suffixSource = input.contentMarkdown !== undefined
+    ? buildProjectSuffixMarkdown(input.contentMarkdown ?? '')
     : trimBlock(input.suffixMarkdown ?? '');
   const suffix = trimBlock(suffixSource);
   const compat = {
@@ -888,7 +996,6 @@ export function createProjectMarkdownTemplate(projectName: string, mermaidSource
     projectSummary,
     prefixMarkdown: buildDefaultPrefix(projectName, projectSummary),
     contentMarkdown: '',
-    nodeAnnotations: {},
     mermaidSource,
     compat,
     nodes: [],

@@ -1,0 +1,16 @@
+.git/**
+.github/**
+.vscode/**
+deploy/**
+docs/**
+extension-src/**
+node_modules/**
+src/**
+safe.html
+index.html
+vite.config.ts
+tsconfig*.json
+eslint.config.js
+pnpm-lock.yaml
+_worker.ts
+需求文档.md

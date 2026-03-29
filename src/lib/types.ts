@@ -59,7 +59,6 @@ export interface LayoutSidecar {
 
 export interface ProjectCompatExtras {
   contentBox?: [number, number] | [number, number, 1];
-  nodeNotes?: Record<string, string>;
   [key: string]: unknown;
 }
 
@@ -75,6 +74,7 @@ export interface ProjectCompatLayer {
 }
 
 export interface GraphDocument {
+  diagramType: string;
   direction: Direction;
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -89,7 +89,6 @@ export interface GraphDocument {
   prefixMarkdown?: string;
   suffixMarkdown?: string;
   contentMarkdown?: string;
-  nodeAnnotations?: Record<string, string>;
   compat?: ProjectCompatLayer;
 }
 
@@ -105,8 +104,9 @@ export interface GraphSemanticSnapshot {
     nodes: Array<{
       id: string;
       label: string;
+      title: string;
+      description: string;
       subgraphId: string | null;
-      annotation?: string;
     }>;
     edges: Array<{
       id: string;
@@ -148,11 +148,6 @@ export type GraphOperation =
       type: 'updateNodeLabel';
       nodeId: string;
       label: string;
-    }
-  | {
-      type: 'updateNodeAnnotation';
-      nodeId: string;
-      annotation: string;
     }
   | {
       type: 'deleteNode';
@@ -212,6 +207,7 @@ export interface SelectionState {
 }
 
 export interface ParsedDocument {
+  diagramType: string;
   direction: Direction;
   nodes: GraphNode[];
   edges: GraphEdge[];

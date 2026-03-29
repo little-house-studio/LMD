@@ -9,6 +9,9 @@ import type {
   NodeShape,
   ParsedDocument,
 } from './types';
+import {
+  normalizeEntityIdBase,
+} from './entityId';
 
 const defaultNodeStyle = {
   fill: '#fff8ef',
@@ -27,8 +30,78 @@ export const defaultEdgeStyle = {
   strokeWidth: 1,
 };
 
+function parseColorChannels(color: string) {
+  const hex = color.trim();
+  const shortMatch = hex.match(/^#([\da-f]{3})$/i);
+  if (shortMatch) {
+    const [r, g, b] = shortMatch[1].split('').map((value) => Number.parseInt(value + value, 16));
+    return { r, g, b };
+  }
+
+  const longMatch = hex.match(/^#([\da-f]{6})$/i);
+  if (longMatch) {
+    const raw = longMatch[1];
+    return {
+      r: Number.parseInt(raw.slice(0, 2), 16),
+      g: Number.parseInt(raw.slice(2, 4), 16),
+      b: Number.parseInt(raw.slice(4, 6), 16),
+    };
+  }
+
+  const rgbMatch = hex.match(/^rgba?\(([\d.\s]+),\s*([\d.\s]+),\s*([\d.\s]+)/i);
+  if (rgbMatch) {
+    return {
+      r: Number.parseInt(rgbMatch[1].trim(), 10),
+      g: Number.parseInt(rgbMatch[2].trim(), 10),
+      b: Number.parseInt(rgbMatch[3].trim(), 10),
+    };
+  }
+
+  return null;
+}
+
+function isLegacyNeutralEdgeColor(color: string) {
+  const normalized = color.trim().toLowerCase();
+  if (normalized === defaultEdgeStyle.strokeColor.toLowerCase()) {
+    return true;
+  }
+
+  const explicitlyKnownLegacyColors = new Set([
+    '#ffffff',
+    '#f8fafc',
+    '#f1f5f9',
+    '#e2e8f0',
+    '#dbe7f0',
+    '#d9e4ee',
+    '#e6eef5',
+    'rgb(255, 255, 255)',
+    'rgb(248, 250, 252)',
+    'rgb(241, 245, 249)',
+    'rgb(226, 232, 240)',
+  ]);
+  if (explicitlyKnownLegacyColors.has(normalized)) {
+    return true;
+  }
+
+  const channels = parseColorChannels(color);
+  if (!channels) {
+    return false;
+  }
+
+  const { r, g, b } = channels;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  const saturation = max === 0 ? 0 : (max - min) / max;
+
+  return luminance >= 0.82 && saturation <= 0.18;
+}
+
 export function normalizeEdgeStyle(edge: GraphEdge): GraphEdge {
-  const strokeColor = edge.strokeColor ?? defaultEdgeStyle.strokeColor;
+  const rawStrokeColor = edge.strokeColor ?? defaultEdgeStyle.strokeColor;
+  const strokeColor = isLegacyNeutralEdgeColor(rawStrokeColor)
+    ? defaultEdgeStyle.strokeColor
+    : rawStrokeColor;
   let strokeWidth = edge.strokeWidth ?? defaultEdgeStyle.strokeWidth;
 
   if (
@@ -63,17 +136,24 @@ const edgePatterns: Array<{ token: string; type: EdgeType }> = [
   { token: '---', type: 'line' },
 ];
 
+const mermaidDiagramDeclarationPatterns = [
+  /^(?:flowchart|graph)\s+(TD|LR|RL|BT)\b/i,
+  /^(?:classDiagram|sequenceDiagram|erDiagram|journey|gantt|pie|mindmap|timeline|gitGraph|requirementDiagram|quadrantChart|stateDiagram(?:-v2)?|xychart-beta|block-beta|packet-beta|architecture-beta|kanban|sankey-beta|C4Context|C4Container|C4Component|C4Dynamic|C4Deployment)\b/i,
+];
+
+const NODE_ID_PATTERN = String.raw`[\p{L}\p{N}_:-]+`;
+
 const shapeMatchers: Array<{
   shape: NodeShape;
   regex: RegExp;
 }> = [
-  { shape: 'database', regex: /^([A-Za-z0-9_:-]+)\[\((.*)\)\]$/ },
-  { shape: 'circle', regex: /^([A-Za-z0-9_:-]+)\(\((.*)\)\)$/ },
-  { shape: 'round', regex: /^([A-Za-z0-9_:-]+)\(\[(.*)\]\)$/ },
-  { shape: 'subroutine', regex: /^([A-Za-z0-9_:-]+)\[\[(.*)\]\]$/ },
-  { shape: 'hexagon', regex: /^([A-Za-z0-9_:-]+)\{\{(.*)\}\}$/ },
-  { shape: 'diamond', regex: /^([A-Za-z0-9_:-]+)\{(.*)\}$/ },
-  { shape: 'rect', regex: /^([A-Za-z0-9_:-]+)\[(.*)\]$/ },
+  { shape: 'database', regex: new RegExp(`^(${NODE_ID_PATTERN})\\[\\((.*)\\)\\]$`, 'u') },
+  { shape: 'circle', regex: new RegExp(`^(${NODE_ID_PATTERN})\\(\\((.*)\\)\\)$`, 'u') },
+  { shape: 'round', regex: new RegExp(`^(${NODE_ID_PATTERN})\\(\\[(.*)\\]\\)$`, 'u') },
+  { shape: 'subroutine', regex: new RegExp(`^(${NODE_ID_PATTERN})\\[\\[(.*)\\]\\]$`, 'u') },
+  { shape: 'hexagon', regex: new RegExp(`^(${NODE_ID_PATTERN})\\{\\{(.*)\\}\\}$`, 'u') },
+  { shape: 'diamond', regex: new RegExp(`^(${NODE_ID_PATTERN})\\{(.*)\\}$`, 'u') },
+  { shape: 'rect', regex: new RegExp(`^(${NODE_ID_PATTERN})\\[(.*)\\]$`, 'u') },
 ];
 
 function cloneLayout(layout?: LayoutSidecar): LayoutSidecar {
@@ -90,11 +170,11 @@ function cloneLayout(layout?: LayoutSidecar): LayoutSidecar {
 }
 
 function sanitizeId(input: string) {
-  return input
-    .trim()
-    .replace(/^["']|["']$/g, '')
-    .replace(/[^A-Za-z0-9_:-]+/g, '_')
-    .replace(/^_+|_+$/g, '') || `node_${Math.random().toString(36).slice(2, 8)}`;
+  return normalizeEntityIdBase(
+    input
+      .trim()
+      .replace(/^["']|["']$/g, ''),
+  ) || `node_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function decodeMermaidLabel(input: string) {
@@ -110,19 +190,43 @@ function encodeMermaidLabel(input: string) {
     .replace(/\r?\n/g, '<br/>');
 }
 
-export function measureNodeContentSize(content: string) {
-  const lines = content.split(/\r?\n/);
-  const unitsPerLine = lines.map((line) =>
+export function measureNodeContentSize(title: string, description = '') {
+  const titleLines = title.split(/\r?\n/).filter(Boolean);
+  const descriptionLines = description.split(/\r?\n/).filter(Boolean);
+  const allLines = [...(titleLines.length > 0 ? titleLines : ['未命名内容']), ...descriptionLines];
+  const unitsPerLine = allLines.map((line) =>
     Array.from(line).reduce((total, char) => total + (char.charCodeAt(0) > 255 ? 1.8 : 1), 0),
   );
-  const maxUnits = Math.max(6, ...unitsPerLine);
-  const width = Math.max(132, Math.min(320, 52 + maxUnits * 9));
-  const wrapCapacity = Math.max(8, Math.floor((width - 40) / 9));
-  const wrappedLineCount = Math.max(
+  const maxUnits = Math.max(8, ...unitsPerLine);
+  const width = Math.max(156, Math.min(480, 62 + maxUnits * 9));
+  const wrapCapacity = Math.max(10, Math.floor((width - 38) / 9));
+  const titleWrappedLineCount = Math.max(
     1,
-    unitsPerLine.reduce((total, units) => total + Math.max(1, Math.ceil(units / wrapCapacity)), 0),
+    titleLines.length > 0
+      ? titleLines.reduce((total, line) => {
+          const units = Array.from(line).reduce(
+            (count, char) => count + (char.charCodeAt(0) > 255 ? 1.8 : 1),
+            0,
+          );
+          return total + Math.max(1, Math.ceil(units / wrapCapacity));
+        }, 0)
+      : 1,
   );
-  const height = Math.max(58, Math.min(240, 26 + wrappedLineCount * 24));
+  const descriptionWrappedLineCount = descriptionLines.reduce((total, line) => {
+    const units = Array.from(line).reduce(
+      (count, char) => count + (char.charCodeAt(0) > 255 ? 1.8 : 1),
+      0,
+    );
+    return total + Math.max(1, Math.ceil(units / wrapCapacity));
+  }, 0);
+  const titleHeight = 18 + titleWrappedLineCount * 28 + (descriptionWrappedLineCount === 0 ? 10 : 0);
+  const descriptionHeight = descriptionWrappedLineCount > 0
+    ? 20 + descriptionWrappedLineCount * 22
+    : 30;
+  const height = Math.max(
+    98,
+    Math.min(760, titleHeight + descriptionHeight + 18),
+  );
 
   return { width, height };
 }
@@ -141,7 +245,7 @@ function inferNode(raw: string) {
     }
   }
 
-  const bareMatch = trimmed.match(/^([A-Za-z0-9_:-]+)$/);
+  const bareMatch = trimmed.match(new RegExp(`^(${NODE_ID_PATTERN})$`, 'u'));
   if (bareMatch) {
     return {
       id: bareMatch[1],
@@ -160,6 +264,40 @@ function inferDirection(line: string): Direction | null {
   }
 
   return match[1].toUpperCase() as Direction;
+}
+
+function getFirstMeaningfulLine(source: string) {
+  return source
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.length > 0 && !line.startsWith('%%')) ?? '';
+}
+
+export function isFlowchartSource(source: string) {
+  return inferDirection(getFirstMeaningfulLine(source)) !== null;
+}
+
+export function detectMermaidDiagramType(source: string) {
+  const firstLine = getFirstMeaningfulLine(source);
+  if (!firstLine) {
+    return 'flowchart';
+  }
+
+  if (inferDirection(firstLine)) {
+    return 'flowchart';
+  }
+
+  const tokenMatch = firstLine.match(/^([A-Za-z][A-Za-z0-9_-]*)\b/);
+  return tokenMatch?.[1] ?? 'flowchart';
+}
+
+export function looksLikeStandaloneMermaidSource(source: string) {
+  const firstLine = getFirstMeaningfulLine(source);
+  if (!firstLine) {
+    return false;
+  }
+
+  return mermaidDiagramDeclarationPatterns.some((pattern) => pattern.test(firstLine));
 }
 
 function inferSubgraph(raw: string) {
@@ -187,7 +325,7 @@ function inferSubgraph(raw: string) {
 }
 
 function parseStyleLine(raw: string) {
-  const match = raw.match(/^style\s+([A-Za-z0-9_:-]+)\s+(.+)$/i);
+  const match = raw.match(new RegExp(`^style\\s+(${NODE_ID_PATTERN})\\s+(.+)$`, 'iu'));
   if (!match) {
     return null;
   }
@@ -395,6 +533,7 @@ export function parseMermaidDocument(
   source: string,
   previousLayout?: LayoutSidecar,
 ): ParsedDocument {
+  const diagramType = detectMermaidDiagramType(source);
   const lines = source.split('\n');
   const layout = cloneLayout(previousLayout);
   const warnings: string[] = [];
@@ -405,6 +544,23 @@ export function parseMermaidDocument(
   const pendingEdgeStyles: Array<ReturnType<typeof parseLinkStyleLine>> = [];
   const subgraphStack: string[] = [];
   let direction: Direction = 'LR';
+
+  if (diagramType !== 'flowchart') {
+    warnings.push(
+      `\`${diagramType}\` is preserved as standard Mermaid source. The canvas currently edits flowchart only; use source mode or preview for this diagram.`,
+    );
+
+    return {
+      diagramType,
+      direction,
+      nodes: [],
+      edges: [],
+      subgraphs: [],
+      warnings,
+      unsupportedLines: [],
+      layout,
+    };
+  }
 
   function ensureNode(inferred: ReturnType<typeof inferNode>) {
     if (!inferred) {
@@ -564,6 +720,7 @@ export function parseMermaidDocument(
   buildAutoLayout(direction, nodes, edges, layout);
 
   return {
+    diagramType,
     direction,
     nodes,
     edges,
@@ -588,22 +745,24 @@ function edgeToken(type: EdgeType) {
 }
 
 function encodeNode(node: GraphNode) {
-  const label = encodeMermaidLabel(node.label);
+  const lines = node.label.replace(/\r\n/g, '\n').split('\n');
+  const label = encodeMermaidLabel(lines.slice(1).join('\n'));
+  const safeLabel = `"${label}"`;
   switch (node.shape) {
     case 'round':
-      return `${node.id}([${label}])`;
+      return `${node.id}([${safeLabel}])`;
     case 'diamond':
-      return `${node.id}{${label}}`;
+      return `${node.id}{${safeLabel}}`;
     case 'circle':
-      return `${node.id}((${label}))`;
+      return `${node.id}((${safeLabel}))`;
     case 'hexagon':
-      return `${node.id}{{${label}}}`;
+      return `${node.id}{{${safeLabel}}}`;
     case 'database':
-      return `${node.id}[(${label})]`;
+      return `${node.id}[(${safeLabel})]`;
     case 'subroutine':
-      return `${node.id}[[${label}]]`;
+      return `${node.id}[[${safeLabel}]]`;
     default:
-      return `${node.id}[${label}]`;
+      return `${node.id}[${safeLabel}]`;
   }
 }
 
@@ -618,7 +777,8 @@ function renderSubgraphs(
   const children = subgraphs.filter((subgraph) => subgraph.parentId === parentId);
 
   for (const subgraph of children) {
-    lines.push(`${indent}subgraph ${subgraph.id}["${subgraph.title.replace(/"/g, '\\"')}"]`);
+    const encodedTitle = encodeMermaidLabel(subgraph.title).replace(/"/g, '\\"');
+    lines.push(`${indent}subgraph ${subgraph.id}["${encodedTitle}"]`);
 
     for (const node of nodes.filter((entry) => entry.subgraphId === subgraph.id)) {
       lines.push(`${indent}  ${encodeNode(node)}`);

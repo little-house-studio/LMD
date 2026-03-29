@@ -3,6 +3,7 @@ import {
   useDeferredValue,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -28,6 +29,10 @@ import {
   serializeProjectMarkdown,
   standardizeProjectMarkdown,
 } from './lib/projectMarkdown';
+import {
+  buildEntityIdFromTitle,
+  normalizeEntityIdBase,
+} from './lib/entityId';
 import { sampleProjectMarkdown } from './lib/sample';
 import { storageKeys } from './lib/storage';
 import type {
@@ -139,6 +144,8 @@ interface ContentCardLayout {
   x: number;
   y: number;
   collapsed: boolean;
+  width?: number;
+  height?: number;
 }
 
 interface MiniMapDragState {
@@ -153,6 +160,16 @@ interface PanelResizeState {
   startWidth: number;
 }
 
+interface ContentCardResizeState {
+  edge: 'right' | 'bottom' | 'corner';
+  startX: number;
+  startY: number;
+  startWidth: number;
+  startHeight: number;
+  width: number;
+  height: number;
+}
+
 interface NodeClipboardState {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -163,6 +180,11 @@ const WHEEL_PINCH_DIVISOR = 360;
 const NAV_RAIL_WIDTH = 38;
 const DEFAULT_SIDEBAR_WIDTH = 188;
 const DEFAULT_INSPECTOR_WIDTH = 176;
+const CONTENT_CARD_MIN_WIDTH = 116;
+const CONTENT_CARD_MAX_WIDTH = 360;
+const CONTENT_CARD_COLLAPSED_HEIGHT = 38;
+const CONTENT_CARD_MIN_HEIGHT = 80;
+const CONTENT_CARD_MAX_HEIGHT = 320;
 const MIN_SIDEBAR_WIDTH = 164;
 const MIN_INSPECTOR_WIDTH = 156;
 const MAX_SIDEBAR_WIDTH = 280;
@@ -223,7 +245,7 @@ interface LocalHandleEntry {
 
 interface NodeInspectorDraft {
   label: string;
-  annotation: string;
+  description: string;
   shape: NodeShape;
   fill: string;
   stroke: string;
@@ -239,6 +261,7 @@ interface EdgeInspectorDraft {
 
 interface SubgraphInspectorDraft {
   title: string;
+  description: string;
   collapsed: boolean;
   fill: string;
   stroke: string;
@@ -253,7 +276,6 @@ interface AiSettingsDraft {
   systemPrompt: string;
   lockProjectMeta: boolean;
   lockAdditionalInfo: boolean;
-  lockAnnotations: boolean;
   lockDiagram: boolean;
 }
 
@@ -277,6 +299,17 @@ interface VsCodeWebviewApi {
 }
 
 type AiPanelTab = 'chat' | 'settings';
+type InlineNodeField = 'title' | 'description';
+type SearchResultKind = 'subgraph' | 'node';
+
+interface CanvasSearchResult {
+  id: string;
+  kind: SearchResultKind;
+  label: string;
+  meta: string;
+  rect: Rect;
+  score: number;
+}
 type InspectorView = 'properties' | 'ai';
 
 type IconName =
@@ -289,6 +322,7 @@ type IconName =
   | 'history'
   | 'copy'
   | 'share'
+  | 'download'
   | 'cursor'
   | 'node'
   | 'group'
@@ -305,7 +339,8 @@ type IconName =
   | 'settings'
   | 'layout'
   | 'tidy'
-  | 'standardize';
+  | 'standardize'
+  | 'search';
 
 const shapeOptions: Array<{ label: string; value: NodeShape }> = [
   { label: '矩形', value: 'rect' },
@@ -345,7 +380,7 @@ function getSubgraphStyle(subgraph: Pick<GraphSubgraph, 'fill' | 'stroke' | 'tex
 }
 
 const workspaceTabs: Array<{ id: WorkspaceTabId; label: string; detail: string }> = [
-  { id: 'diagram', label: 'diagram.md', detail: '主图' },
+  { id: 'diagram', label: 'diagram.lmd', detail: '主图' },
 ];
 
 const defaultLocalProjectItems: ExplorerItem[] = [];
@@ -412,7 +447,7 @@ async function scanLocalProjectDirectory(root: LocalProjectDirectoryHandle) {
         continue;
       }
 
-      if (!/\.md$/i.test(name)) {
+      if (!/\.lmd$/i.test(name)) {
         continue;
       }
 
@@ -420,7 +455,7 @@ async function scanLocalProjectDirectory(root: LocalProjectDirectoryHandle) {
       nextItems.push({
         id,
         label: name,
-        meta: 'Markdown 工程',
+        meta: 'LMD 工程',
         depth,
         kind: 'file',
         path: nextPath,
@@ -455,22 +490,28 @@ const modeMeta: Array<{ id: EditorMode; label: string; icon: IconName }> = [
   { id: 'history', label: '历史', icon: 'history' },
 ];
 
-const desktopCommandGroups = [
-  { id: 'resource', label: '资源' },
-  { id: 'edit', label: '编辑' },
-  { id: 'view', label: '视图' },
-] as const;
-
 const defaultAiSettings: AiSettingsDraft = {
   apiKey: '',
   apiUrl: 'https://api.gpt.ge/v1/chat/completions',
   model: 'gpt-5.4-mini',
   contextWindow: 200000,
-  systemPrompt:
-    'You are the internal assistant for an LMD workspace. LMD is a single-file Markdown format for Mermaid-based projects. Use the current graph semantic snapshot and the latest full LMD document as the primary context. Be concise, practical, and grounded in the provided workspace state. Unless the request requires it, avoid changing already-written text. Prefer targeted edits over refactors. Prefer creating groups, and nested groups when they improve clarity. If node annotations exist, preserve them unless the request clearly requires updating them.',
+  systemPrompt: [
+    'You are the internal assistant for an LMD workspace.',
+    'LMD is a single-file Markdown format stored as a .lmd file.',
+    'Use the current graph semantic snapshot and the latest full LMD document as the primary context.',
+    'Be concise, practical, and grounded in the provided workspace state.',
+    'Unless the request requires it, avoid changing already-written text.',
+    'Prefer targeted edits over refactors.',
+    'Prefer creating groups, and nested groups when they improve clarity.',
+    'The current structured canvas and semantic tools support Mermaid flowchart/graph diagrams only.',
+    'Do not introduce classDiagram, sequenceDiagram, ER, UML-like structures, or any other Mermaid diagram type unless the user explicitly asks for source-only Mermaid that will not be edited on the canvas.',
+    'Current LMD file structure is: `# Project Name`, `## Summary`, `## Diagram` with one standard ```mermaid``` block, `## Content`, and one final ```lths-compat``` block.',
+    'The Mermaid block must remain standard Mermaid syntax.',
+    'Canvas nodes conceptually have a title and a description. In Mermaid source, the node ID should be derived from the title with a short unique suffix, and the Mermaid label should contain the description only.',
+    'There is no separate `Node Annotations` section in the current format.',
+  ].join(' '),
   lockProjectMeta: true,
   lockAdditionalInfo: true,
-  lockAnnotations: true,
   lockDiagram: false,
 };
 
@@ -478,14 +519,13 @@ const defaultAiMessages: AiMessage[] = [
   {
     id: 'ai-welcome',
     role: 'assistant',
-    content: 'AI 验证入口已打开。现在会附带完整 LMD 文档、Node Annotations、相对上一轮的改动、当前选中内容，并允许 AI 调用本地工具修改文档。',
+    content: 'AI 验证入口已打开。现在会附带完整 LMD 文档、相对上一轮的改动、当前选中内容，并允许 AI 调用本地工具修改文档。',
   },
 ];
 
 const aiLockControls = [
   { key: 'lockProjectMeta', label: '标题 / 简介', unlocked: '允许修改标题与简介' },
   { key: 'lockAdditionalInfo', label: '附加信息', unlocked: '允许修改附加信息' },
-  { key: 'lockAnnotations', label: '节点注释', unlocked: '允许修改节点注释' },
   { key: 'lockDiagram', label: '流程图', unlocked: '允许修改流程图' },
 ] as const;
 
@@ -494,7 +534,7 @@ const aiToolDefinitions = [
     type: 'function',
     function: {
       name: 'get_graph_semantic_snapshot',
-      description: 'Read the current semantic LMD project snapshot, including Project Name, Summary, Additional Information, nodes, edges, subgraphs, current selection, and node annotations, without layout or style details.',
+      description: 'Read the current semantic LMD project snapshot for a flowchart-based LMD document, including Project Name, Summary, Additional Information, nodes with title/description semantics, edges, subgraphs, and current selection, without layout or style details.',
       parameters: {
         type: 'object',
         properties: {},
@@ -506,7 +546,7 @@ const aiToolDefinitions = [
     type: 'function',
     function: {
       name: 'apply_graph_operation_batch',
-      description: 'Apply structured semantic operations to the current LMD document. Supported operations include project meta updates, Additional Information updates, node label updates, node annotation updates, edge label updates, subgraph updates, and node/subgraph structural edits.',
+      description: 'Apply structured semantic operations to the current LMD document when the Diagram section is a flowchart/graph Mermaid diagram. Supported operations include project meta updates, Additional Information updates, node title/description label updates, edge label updates, subgraph updates, and node/subgraph structural edits.',
       parameters: {
         type: 'object',
         properties: {
@@ -535,7 +575,7 @@ const aiToolDefinitions = [
     type: 'function',
     function: {
       name: 'get_project_markdown',
-      description: 'Read the latest full LMD document, including Project Name, Summary, Diagram, Additional Information, Node Annotations, and lths-compat.',
+      description: 'Read the latest full LMD document, including Project Name, Summary, Diagram, Additional Information, and the final lths-compat block.',
       parameters: {
         type: 'object',
         properties: {},
@@ -547,7 +587,7 @@ const aiToolDefinitions = [
     type: 'function',
     function: {
       name: 'set_project_markdown',
-      description: 'Write the full LMD document and normalize it into the current structure: Project Name, Summary, Diagram, Content, Node Annotations, and lths-compat.',
+      description: 'Write the full LMD document and normalize it into the current structure: Project Name, Summary, Diagram, Content, and a final lths-compat block.',
       parameters: {
         type: 'object',
         properties: {
@@ -565,8 +605,11 @@ const aiToolDefinitions = [
 const aiToolRules = [
   'Prefer tools over guesswork whenever the user asks to change the document.',
   'Prefer apply_graph_operation_batch for structural diagram edits.',
-  'Use updateNodeAnnotation operations when the request is specifically about node annotations.',
-  'Treat the project as an LMD document: a single Markdown file with the sections Project Name, Summary, Diagram, Content, Node Annotations, and a final lths-compat block.',
+  'Treat the project as an LMD document: a single Markdown file with the sections Project Name, Summary, Diagram, Content, and a final lths-compat block.',
+  'Use the full LMD file syntax exactly. Do not invent old sections such as Node Annotations.',
+  'The current structured canvas model supports Mermaid flowchart/graph only.',
+  'Do not generate classDiagram, sequenceDiagram, stateDiagram, ER, UML-like structures, or other Mermaid diagram types unless the user explicitly asks for source-only Mermaid and accepts that it will not be editable on the canvas.',
+  'If the current Diagram is not a flowchart/graph, preserve it as source. Do not try to convert it into flowchart unless the user explicitly asks for a conversion.',
   'Prefer the smallest valid layer: graph operations first, section-preserving Markdown edits second, full rewrites last.',
   'Do not invent new top-level sections unless the user explicitly asks for them.',
   'Prefer preserving the existing section structure instead of rewriting the whole file.',
@@ -577,15 +620,42 @@ const aiToolRules = [
 
 const aiProjectFormatGuide = [
   'LMD document format:',
-  'LMD stands for a single-file Markdown document used by this editor.',
+  'LMD stands for a single-file Markdown document used by this editor and stored as a `.lmd` file.',
   '1. `# Project Name`',
   '2. `## Summary`',
   '3. `## Diagram` with one standard ```mermaid``` block',
   '4. `## Content` for Additional Information Markdown',
-  '5. `## Node Annotations` for node-level notes, keyed by `### `NodeId`` headings',
-  '6. final ```lths-compat``` block for editor-only layout state',
+  '5. final ```lths-compat``` block for editor-only layout state',
+  'Example:',
+  '```md',
+  '# Project Name',
+  '',
+  '## Summary',
+  '',
+  'Short project summary.',
+  '',
+  '## Diagram',
+  '',
+  '```mermaid',
+  'flowchart LR',
+  '  产品说明_a7c["整理需求与范围"]',
+  '  评审完成_p4k["通过"]',
+  '  产品说明_a7c -->|通过| 评审完成_p4k',
+  '```',
+  '',
+  '## Content',
+  '',
+  '- Any normal Markdown content can live here.',
+  '',
+  '```lths-compat',
+  'v1',
+  '```',
+  '```',
   'The Mermaid block should stay standard Mermaid syntax.',
-  'Node annotations live in Markdown, not inside Mermaid node syntax.',
+  'The current format does not use a separate `Node Annotations` section.',
+  'Canvas nodes conceptually have a title and a description. In source, the node ID is title-derived with a short unique suffix, and the Mermaid label stores the description only.',
+  'The current canvas editor and structured AI tools support flowchart/graph diagrams only.',
+  'Other Mermaid diagram types may exist in source form and preview correctly, but they should be preserved as source instead of being rewritten through flowchart graph operations.',
   'Edit the smallest valid layer possible. Prefer section-preserving changes over full rewrites.',
 ].join('\n');
 
@@ -607,7 +677,7 @@ function getProjectFallbackName(fileName?: string) {
     return 'Untitled LMD';
   }
 
-  return fileName.replace(/\.(lmd|md)$/i, '') || 'Untitled LMD';
+  return fileName.replace(/\.lmd$/i, '') || 'Untitled LMD';
 }
 
 function readStoredJson<T>(key: string, fallback: T): T {
@@ -738,6 +808,14 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
           <path d="M8.1 10.9l7.8-3.8M8.1 13.1l7.8 3.8" />
         </svg>
       );
+    case 'download':
+      return (
+        <svg {...props}>
+          <path d="M12 4v10" />
+          <path d="M8 10l4 4 4-4" />
+          <path d="M5 18h14" />
+        </svg>
+      );
     case 'cursor':
       return (
         <svg {...props}>
@@ -857,6 +935,13 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
           <path d="M9 13l2 2 4-4" />
         </svg>
       );
+    case 'search':
+      return (
+        <svg {...props}>
+          <circle cx="11" cy="11" r="5.5" />
+          <path d="M16 16l4 4" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -892,6 +977,16 @@ function isTypingTarget(target: EventTarget | null) {
     !input.disabled &&
     textLikeTypes.has(input.type)
   );
+}
+
+function focusControlWithoutScroll(element: HTMLInputElement | HTMLTextAreaElement) {
+  try {
+    (element as HTMLInputElement & { focus(options?: { preventScroll?: boolean }): void }).focus({
+      preventScroll: true,
+    });
+  } catch {
+    element.focus();
+  }
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -974,12 +1069,14 @@ function localizeLegacyHistoryEntry(entry: HistoryEntry): HistoryEntry {
 }
 
 function materializeDocument(candidate: GraphDocument): GraphDocument {
-  const normalizedEdges = candidate.edges.map(normalizeEdgeStyle);
+  const normalizedCandidate = normalizeFlowchartDocumentNodeIds(candidate);
+  const normalizedNodes = normalizedCandidate.nodes.map((node) => resizeNodeToContent(node, node.label));
+  const normalizedEdges = normalizedCandidate.edges.map(normalizeEdgeStyle);
   const layout: LayoutSidecar = {
-    version: candidate.layout.version,
-    viewport: { ...candidate.layout.viewport },
+    version: normalizedCandidate.layout.version,
+    viewport: { ...normalizedCandidate.layout.viewport },
     nodes: Object.fromEntries(
-      candidate.nodes.map((node) => [
+      normalizedNodes.map((node) => [
         node.id,
         {
           x: node.x,
@@ -990,31 +1087,32 @@ function materializeDocument(candidate: GraphDocument): GraphDocument {
       ]),
     ),
     subgraphs: Object.fromEntries(
-      candidate.subgraphs.map((subgraph) => [
+      normalizedCandidate.subgraphs.map((subgraph) => [
         subgraph.id,
         { collapsed: subgraph.collapsed },
       ]),
     ),
   };
 
-  const source = serializeMermaidDocument(
-    candidate.direction,
-    candidate.nodes,
-    normalizedEdges,
-    candidate.subgraphs,
-    candidate.unsupportedLines,
-  );
-  const projectName = candidate.projectName ?? 'Untitled Project';
-  const projectSummary = candidate.projectSummary ?? '';
-  const contentMarkdown = normalizeContentMarkdown(candidate.contentMarkdown ?? extractContentMarkdown(candidate.suffixMarkdown));
-  const nodeAnnotations = sanitizeNodeAnnotations(candidate.nodeAnnotations ?? getNodeAnnotationMap(candidate), candidate.nodes);
-  const extras = sanitizeCompatExtras(candidate.compat?.extras, candidate.nodes);
+  const source = normalizedCandidate.diagramType === 'flowchart'
+    ? serializeMermaidDocument(
+      normalizedCandidate.direction,
+      normalizedNodes,
+      normalizedEdges,
+      normalizedCandidate.subgraphs,
+      normalizedCandidate.unsupportedLines,
+    )
+    : normalizedCandidate.source.trim();
+  const projectName = normalizedCandidate.projectName ?? 'Untitled Project';
+  const projectSummary = normalizedCandidate.projectSummary ?? '';
+  const contentMarkdown = normalizeContentMarkdown(normalizedCandidate.contentMarkdown ?? extractContentMarkdown(normalizedCandidate.suffixMarkdown));
+  const extras = sanitizeCompatExtras(normalizedCandidate.compat?.extras);
   const compat = {
-    version: candidate.compat?.version ?? 1,
+    version: normalizedCandidate.compat?.version ?? 1,
     layout,
     editor: {
       localFileActions: {
-        enabled: candidate.compat?.editor?.localFileActions?.enabled ?? true,
+        enabled: normalizedCandidate.compat?.editor?.localFileActions?.enabled ?? true,
       },
     },
     extras,
@@ -1024,25 +1122,24 @@ function materializeDocument(candidate: GraphDocument): GraphDocument {
     projectSummary,
     prefixMarkdown: candidate.prefixMarkdown,
     contentMarkdown,
-    nodeAnnotations,
     mermaidSource: source,
     compat,
-    nodes: candidate.nodes,
-    subgraphs: candidate.subgraphs,
+    nodes: normalizedNodes,
+    subgraphs: normalizedCandidate.subgraphs,
   });
 
   return {
-    ...candidate,
+    ...normalizedCandidate,
+    nodes: normalizedNodes,
     edges: normalizedEdges,
     layout,
     source,
     markdown,
     projectName,
     projectSummary,
-    prefixMarkdown: candidate.prefixMarkdown ?? '',
-    suffixMarkdown: buildProjectSuffixMarkdown(contentMarkdown, nodeAnnotations),
+    prefixMarkdown: normalizedCandidate.prefixMarkdown ?? '',
+    suffixMarkdown: buildProjectSuffixMarkdown(contentMarkdown),
     contentMarkdown,
-    nodeAnnotations,
     compat,
   };
 }
@@ -1077,13 +1174,170 @@ function loadWorkspace(initialMarkdown?: string, fallbackName = 'Untitled Projec
   };
 }
 
-function nextNodeId(nodes: GraphNode[]) {
-  let index = nodes.length + 1;
-  while (nodes.some((node) => node.id === `N${index}`)) {
-    index += 1;
+function normalizeInlineEntityText(value: string) {
+  return value.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function splitEntityText(value: string) {
+  const normalized = normalizeInlineEntityText(value).trimEnd();
+  const [titleLine = '', ...restLines] = normalized.split('\n');
+  return {
+    title: titleLine.trim() || '未命名内容',
+    description: restLines.join('\n').trim(),
+  };
+}
+
+function splitEntityDraft(value: string) {
+  const normalized = normalizeInlineEntityText(value).trimEnd();
+  const [titleLine = '', ...restLines] = normalized.split('\n');
+  return {
+    title: titleLine,
+    description: restLines.join('\n').trim(),
+  };
+}
+
+const NODE_TITLE_ID_SAFE_PATTERN = /^[\p{L}\p{N}\s_:-]+$/u;
+
+function isNodeTitleIllegal(title: string) {
+  const normalized = title.normalize('NFKC').trim();
+  if (!normalized) {
+    return false;
   }
 
-  return `N${index}`;
+  if (!NODE_TITLE_ID_SAFE_PATTERN.test(normalized)) {
+    return true;
+  }
+
+  const withUnderscores = normalized.replace(/\s+/g, '_');
+  return normalizeEntityIdBase(normalized) !== withUnderscores;
+}
+
+function buildNodeTitleValidationMap(
+  nodes: GraphNode[],
+  editingNodeId: string | null,
+  editingValue: string,
+) {
+  const resolved = nodes.map((node) => {
+    const label = editingNodeId === node.id ? (editingValue || ' ') : node.label;
+    const parts = editingNodeId === node.id ? splitEntityDraft(label) : splitEntityText(label);
+    const title = parts.title.trim();
+    return {
+      id: node.id,
+      title,
+    };
+  });
+
+  const titleCounts = new Map<string, number>();
+  resolved.forEach(({ title }) => {
+    if (!title) {
+      return;
+    }
+    titleCounts.set(title, (titleCounts.get(title) ?? 0) + 1);
+  });
+
+  return new Map(
+    resolved.map(({ id, title }) => {
+      const duplicate = title.length > 0 && (titleCounts.get(title) ?? 0) > 1;
+      const illegal = isNodeTitleIllegal(title);
+      const reasons: string[] = [];
+      if (duplicate) {
+        reasons.push('节点标题重复');
+      }
+      if (illegal) {
+        reasons.push('节点标题包含非法字符');
+      }
+      return [id, {
+        duplicate,
+        illegal,
+        hasWarning: duplicate || illegal,
+        tooltip: reasons.join(' / '),
+      }];
+    }),
+  );
+}
+
+function composeEntityText(title: string, description = '') {
+  const normalizedTitle = title.trim() || '未命名内容';
+  const normalizedDescription = description.replace(/\r\n/g, '\n').trim();
+  return normalizedDescription
+    ? `${normalizedTitle}\n${normalizedDescription}`
+    : normalizedTitle;
+}
+
+function composeEntityDraft(title: string, description = '') {
+  const normalizedTitle = title.replace(/\r\n/g, '\n');
+  const normalizedDescription = description.replace(/\r\n/g, '\n').trimEnd();
+  return normalizedDescription
+    ? `${normalizedTitle}\n${normalizedDescription}`
+    : normalizedTitle;
+}
+
+function ensureInlineEntityFieldValue(value: string, field: InlineNodeField) {
+  const normalized = normalizeInlineEntityText(value);
+  if (field === 'description' && !normalized.includes('\n')) {
+    return `${normalized}\n`;
+  }
+
+  return normalized;
+}
+
+function getInlineEntityFieldValue(value: string, field: InlineNodeField) {
+  const parts = splitEntityDraft(value);
+  return field === 'title' ? parts.title : parts.description;
+}
+
+function setInlineEntityFieldValue(value: string, field: InlineNodeField, nextValue: string) {
+  const parts = splitEntityDraft(value);
+  return field === 'title'
+    ? composeEntityDraft(nextValue, parts.description)
+    : composeEntityDraft(parts.title, nextValue);
+}
+
+function shouldSelectAllInlineNodeField(value: string, field: InlineNodeField) {
+  if (field !== 'title') {
+    return false;
+  }
+
+  const normalized = value.trim();
+  return normalized === '新建节点' || normalized === '未命名内容';
+}
+
+function isPlaceholderNodeTitle(value: string) {
+  const normalized = value.trim();
+  return normalized === '新建节点' || normalized === '未命名内容';
+}
+
+function getEntitySelectionRange(value: string, field: InlineNodeField) {
+  const normalized = normalizeInlineEntityText(value);
+  const newlineIndex = normalized.indexOf('\n');
+  if (field === 'title') {
+    return {
+      start: 0,
+      end: newlineIndex < 0 ? normalized.length : newlineIndex,
+    };
+  }
+
+  if (newlineIndex < 0) {
+    return {
+      start: normalized.length,
+      end: normalized.length,
+    };
+  }
+
+  const start = newlineIndex + 1;
+  return {
+    start,
+    end: normalized.length,
+  };
+}
+
+function nextNodeId(nodes: GraphNode[], title = '新建节点', preserveCurrentId?: string) {
+  const usedIds = new Set(
+    nodes
+      .map((node) => node.id)
+      .filter((id) => id !== preserveCurrentId),
+  );
+  return buildEntityIdFromTitle(title || '未命名内容', usedIds, preserveCurrentId);
 }
 
 function buildNode(
@@ -1092,10 +1346,11 @@ function buildNode(
   position: Point,
   subgraphId: string | null,
 ): GraphNode {
-  const size = measureNodeContentSize(label);
+  const { title, description } = splitEntityText(label);
+  const size = measureNodeContentSize(title, description);
   return {
     id,
-    label,
+    label: composeEntityText(title, description),
     shape: 'rect',
     x: position.x,
     y: position.y,
@@ -1108,12 +1363,61 @@ function buildNode(
   };
 }
 
-function resizeNodeToContent(node: GraphNode, content: string) {
-  const size = measureNodeContentSize(content);
+function normalizeFlowchartDocumentNodeIds(candidate: GraphDocument) {
+  if (candidate.diagramType !== 'flowchart') {
+    return candidate;
+  }
+
+  const usedIds = new Set<string>();
+  const finalRemap = new Map<string, string>();
+
+  const nodes = candidate.nodes.map((node) => {
+    const parts = splitEntityText(node.label);
+    const nextId = buildEntityIdFromTitle(parts.title || '未命名内容', usedIds, node.id);
+    usedIds.add(nextId);
+    finalRemap.set(node.id, nextId);
+    return {
+      ...resizeNodeToContent(node, parts.title, parts.description),
+      id: nextId,
+    };
+  });
+
+  const edges = candidate.edges.map((edge) => ({
+    ...edge,
+    from: finalRemap.get(edge.from) ?? edge.from,
+    to: finalRemap.get(edge.to) ?? edge.to,
+  }));
+
+  const layout: LayoutSidecar = {
+    version: candidate.layout.version,
+    viewport: { ...candidate.layout.viewport },
+    nodes: Object.fromEntries(
+      Object.entries(candidate.layout.nodes).map(([id, value]) => [
+        finalRemap.get(id) ?? id,
+        { ...value },
+      ]),
+    ),
+    subgraphs: Object.fromEntries(
+      Object.entries(candidate.layout.subgraphs).map(([id, value]) => [id, { ...value }]),
+    ),
+  };
+
+  return {
+    ...candidate,
+    nodes,
+    edges,
+    layout,
+  };
+}
+
+function resizeNodeToContent(node: GraphNode, content: string, description?: string) {
+  const nextText = description === undefined ? content : composeEntityText(content, description);
+  const nextParts = splitEntityText(nextText);
+  const size = measureNodeContentSize(nextParts.title, nextParts.description);
 
   return {
     ...node,
-    label: content,
+    label: composeEntityText(nextParts.title, nextParts.description),
     width: size.width,
     height: size.height,
   };
@@ -1122,7 +1426,7 @@ function resizeNodeToContent(node: GraphNode, content: string) {
 function getShortcutNodePlacement(
   node: GraphNode,
   direction: Direction,
-  relation: 'linked' | 'sibling',
+  relation: 'linked' | 'sibling' | 'mirrored',
 ) {
   const gapX = 96;
   const gapY = 84;
@@ -1316,6 +1620,18 @@ function getContrastRatio(leftColor: string, rightColor: string) {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
+function getColorSaturation(color: string) {
+  const channels = parseColorChannels(color);
+  if (!channels) {
+    return 0;
+  }
+
+  const { r, g, b } = channels;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  return max === 0 ? 0 : (max - min) / max;
+}
+
 function getReadableLabelTextColor(background: string, preferred: string) {
   if (getContrastRatio(preferred, background) >= 4.5) {
     return preferred;
@@ -1327,6 +1643,36 @@ function getReadableLabelTextColor(background: string, preferred: string) {
   }
 
   return '#f8fafc';
+}
+
+function getEndpointAccentColor(endpoint: EdgeEndpointBox) {
+  return endpoint.stroke;
+}
+
+function shouldInheritSourceEdgeColor(strokeColor: string) {
+  const normalized = strokeColor.trim().toLowerCase();
+  if (normalized === defaultEdgeStyle.strokeColor.toLowerCase()) {
+    return true;
+  }
+
+  const explicitlyNeutral = new Set([
+    '#ffffff',
+    '#f8fafc',
+    '#f1f5f9',
+    '#e2e8f0',
+    '#dbe7f0',
+    '#d9e4ee',
+    '#e6eef5',
+    'rgb(255, 255, 255)',
+    'rgb(248, 250, 252)',
+    'rgb(241, 245, 249)',
+    'rgb(226, 232, 240)',
+  ]);
+  if (explicitlyNeutral.has(normalized)) {
+    return true;
+  }
+
+  return getRelativeLuminance(strokeColor) >= 0.72 && getColorSaturation(strokeColor) <= 0.38;
 }
 
 function trimMultilineBlock(value: string) {
@@ -1385,8 +1731,8 @@ function measureContentCard(markdown: string, collapsed = false) {
   if (collapsed) {
     const summary = buildContentCardSummary(markdown);
     return {
-      width: clamp(188 + summary.length * 4.1, 220, 340),
-      height: 96,
+      width: clamp(96 + summary.length * 2.15, 116, 152),
+      height: 38,
     };
   }
 
@@ -1394,8 +1740,8 @@ function measureContentCard(markdown: string, collapsed = false) {
   const content = normalizedMarkdown.trim();
   if (!content) {
     return {
-      width: 360,
-      height: 220,
+      width: 164,
+      height: 80,
     };
   }
 
@@ -1417,10 +1763,10 @@ function measureContentCard(markdown: string, collapsed = false) {
     .filter(Boolean).length;
 
   return {
-    width: clamp(320 + longestLine * 5.8, 400, 760),
+    width: clamp(150 + longestLine * 2.2, 168, 248),
     height: Math.max(
-      220,
-      104 + wrappedLines * 26 + Math.max(0, blockCount - 1) * 18 + (hasStructuredBlocks ? 20 : 0),
+      84,
+      58 + wrappedLines * 15 + Math.max(0, blockCount - 1) * 8 + (hasStructuredBlocks ? 6 : 0),
     ),
   };
 }
@@ -1557,62 +1903,30 @@ function renderMarkdownPreviewHtml(markdown: string) {
   return html.join('');
 }
 
-function getContentCardLayout(document: GraphDocument, size: { width: number; height: number }): ContentCardLayout {
+function getContentCardLayout(document: GraphDocument): ContentCardLayout {
   const raw = document.compat?.extras && typeof document.compat.extras === 'object'
     ? (document.compat.extras as Record<string, unknown>).contentBox
     : null;
-  const collapsed = Array.isArray(raw) && raw.length >= 3 && (raw[2] === 1 || raw[2] === true);
-
-  if (document.nodes.length === 0) {
-    return { x: 56, y: 56, collapsed };
-  }
-
-  const minX = Math.min(...document.nodes.map((node) => node.x));
-  const minY = Math.min(...document.nodes.map((node) => node.y));
-
+  const collapsed = raw == null
+    ? true
+    : Array.isArray(raw) && raw.length >= 3 && (raw[2] === 1 || raw[2] === true);
+  const width = Array.isArray(raw) && raw.length >= 2 && typeof raw[0] === 'number' && raw[0] >= CONTENT_CARD_MIN_WIDTH
+    ? raw[0]
+    : undefined;
+  const height = Array.isArray(raw) && raw.length >= 2 && typeof raw[1] === 'number' && raw[1] >= CONTENT_CARD_MIN_HEIGHT
+    ? raw[1]
+    : undefined;
   return {
-    x: Math.min(56, Math.max(32, minX - size.width - 68)),
-    y: Math.min(56, Math.max(32, minY - 24)),
+    x: 18,
+    y: 18,
     collapsed,
+    width,
+    height,
   };
-}
-
-function getNodeAnnotationMap(document: GraphDocument) {
-  const raw = document.nodeAnnotations ?? document.compat?.extras?.nodeNotes;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return {} as Record<string, string>;
-  }
-
-  return Object.fromEntries(
-    Object.entries(raw).filter((entry): entry is [string, string] =>
-      typeof entry[0] === 'string' &&
-      typeof entry[1] === 'string' &&
-      entry[1].trim().length > 0,
-    ),
-  );
-}
-
-function sanitizeNodeAnnotations(
-  nodeAnnotations: Record<string, string> | undefined,
-  nodes: GraphNode[],
-) {
-  if (!nodeAnnotations) {
-    return {} as Record<string, string>;
-  }
-
-  const existingNodeIds = new Set(nodes.map((node) => node.id));
-  return Object.fromEntries(
-    Object.entries(nodeAnnotations).filter((entry): entry is [string, string] =>
-      existingNodeIds.has(entry[0]) &&
-      typeof entry[1] === 'string' &&
-      entry[1].trim().length > 0,
-    ),
-  );
 }
 
 function sanitizeCompatExtras(
   extras: ProjectCompatExtras | undefined,
-  nodes: GraphNode[],
 ): ProjectCompatExtras | undefined {
   if (!extras) {
     return undefined;
@@ -1622,13 +1936,6 @@ function sanitizeCompatExtras(
 
   if (Array.isArray(extras.contentBox)) {
     nextExtras.contentBox = extras.contentBox;
-  }
-
-  if (extras.nodeNotes && typeof extras.nodeNotes === 'object' && !Array.isArray(extras.nodeNotes)) {
-    const filteredNodeNotes = sanitizeNodeAnnotations(extras.nodeNotes, nodes);
-    if (Object.keys(filteredNodeNotes).length > 0) {
-      nextExtras.nodeNotes = filteredNodeNotes;
-    }
   }
 
   Object.entries(extras).forEach(([key, value]) => {
@@ -1656,7 +1963,15 @@ function withContentCardLayout(document: GraphDocument, layout: ContentCardLayou
       ...compat,
       extras: {
         ...(compat.extras ?? {}),
-        contentBox: layout.collapsed ? [56, 56, 1] : [56, 56],
+        contentBox: (() => {
+          if (typeof layout.width === 'number' && typeof layout.height === 'number') {
+            return layout.collapsed
+              ? [Math.round(layout.width), Math.round(layout.height), 1] as [number, number, 1]
+              : [Math.round(layout.width), Math.round(layout.height)] as [number, number];
+          }
+
+          return layout.collapsed ? [56, 56, 1] as [number, number, 1] : [56, 56] as [number, number];
+        })(),
       },
     },
   };
@@ -1667,7 +1982,6 @@ function buildGraphSemanticSnapshotFromDocument(
   selection: SelectionState,
   revision: number,
 ): GraphSemanticSnapshot {
-  const nodeNotes = getNodeAnnotationMap(document);
   return {
     revision,
     project: {
@@ -1680,8 +1994,9 @@ function buildGraphSemanticSnapshotFromDocument(
       nodes: document.nodes.map((node) => ({
         id: node.id,
         label: node.label,
+        title: splitEntityText(node.label).title,
+        description: splitEntityText(node.label).description,
         subgraphId: node.subgraphId,
-        annotation: nodeNotes[node.id],
       })),
       edges: document.edges.map((edge) => ({
         id: edge.id,
@@ -1758,9 +2073,6 @@ function buildAiLockRules(settings: AiSettingsDraft) {
     settings.lockAdditionalInfo
       ? 'Do not modify Additional Information.'
       : 'Additional Information may be modified if needed.',
-    settings.lockAnnotations
-      ? 'Do not modify node annotations except to remove annotations of nodes that are deleted.'
-      : 'Node annotations may be modified if needed.',
     settings.lockDiagram
       ? 'Do not modify the flowchart structure.'
       : 'The flowchart structure may be modified if needed.',
@@ -1772,8 +2084,7 @@ function buildAiLockRules(settings: AiSettingsDraft) {
 function isDiagramOperation(operation: GraphOperation) {
   return (
     operation.type !== 'updateProjectMeta' &&
-    operation.type !== 'updateContentMarkdown' &&
-    operation.type !== 'updateNodeAnnotation'
+    operation.type !== 'updateContentMarkdown'
   );
 }
 
@@ -1790,11 +2101,6 @@ function filterGraphOperationsByAiLocks(
 
     if (settings.lockAdditionalInfo && operation.type === 'updateContentMarkdown') {
       warnings.push('Blocked Additional Information update because the Additional Information lock is enabled.');
-      return false;
-    }
-
-    if (settings.lockAnnotations && operation.type === 'updateNodeAnnotation') {
-      warnings.push('Blocked node annotation update because the Node Annotation lock is enabled.');
       return false;
     }
 
@@ -1831,11 +2137,6 @@ function applyAiLocksToMarkdown(
   if (settings.lockAdditionalInfo) {
     nextCandidate.contentMarkdown = current.contentMarkdown;
   }
-
-  if (settings.lockAnnotations) {
-    nextCandidate.nodeAnnotations = sanitizeNodeAnnotations(current.nodeAnnotations, nextCandidate.nodes);
-  }
-
   if (settings.lockDiagram) {
     nextCandidate.direction = current.direction;
     nextCandidate.nodes = structuredClone(current.nodes);
@@ -1917,7 +2218,6 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
   }
 
   if (selection.kind === 'node') {
-    const nodeAnnotations = getNodeAnnotationMap(document);
     return JSON.stringify({
       kind: 'node',
       items: document.nodes
@@ -1925,8 +2225,9 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
         .map((node) => ({
           id: node.id,
           label: node.label,
+          title: splitEntityText(node.label).title,
+          description: splitEntityText(node.label).description,
           subgraphId: node.subgraphId,
-          annotation: nodeAnnotations[node.id] ?? '',
         })),
     }, null, 2);
   }
@@ -1969,6 +2270,115 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
     markdown: normalizeContentMarkdown(document.contentMarkdown ?? extractContentMarkdown(document.suffixMarkdown)),
     id: CONTENT_CARD_ID,
   }, null, 2);
+}
+
+function buildHostSourceSelectionPayload(document: GraphDocument, selection: SelectionState) {
+  if (selection.kind === 'none' || selection.ids.length === 0) {
+    return { kind: 'none' as const };
+  }
+
+  if (selection.kind === 'node') {
+    return {
+      kind: 'node' as const,
+      nodeIds: document.nodes
+        .filter((node) => selection.ids.includes(node.id))
+        .map((node) => node.id),
+    };
+  }
+
+  if (selection.kind === 'edge') {
+    return {
+      kind: 'edge' as const,
+      edges: document.edges
+        .filter((edge) => selection.ids.includes(edge.id))
+        .map((edge) => ({
+          id: edge.id,
+          from: edge.from,
+          to: edge.to,
+          label: edge.label,
+          type: edge.type,
+        })),
+    };
+  }
+
+  if (selection.kind === 'subgraph') {
+    return {
+      kind: 'subgraph' as const,
+      subgraphIds: document.subgraphs
+        .filter((subgraph) => selection.ids.includes(subgraph.id))
+        .map((subgraph) => subgraph.id),
+    };
+  }
+
+  return { kind: 'content' as const };
+}
+
+function getConnectedNodeCluster(document: GraphDocument, startNodeId: string) {
+  const adjacency = new Map<string, Set<string>>();
+  const link = (left: string, right: string) => {
+    if (left === right) {
+      return;
+    }
+    if (!adjacency.has(left)) {
+      adjacency.set(left, new Set());
+    }
+    if (!adjacency.has(right)) {
+      adjacency.set(right, new Set());
+    }
+    adjacency.get(left)?.add(right);
+    adjacency.get(right)?.add(left);
+  };
+
+  const subgraphLookup = new Map(document.subgraphs.map((subgraph) => [subgraph.id, subgraph]));
+  const expandEndpointToNodeIds = (endpointId: string) => {
+    const directNode = document.nodes.find((node) => node.id === endpointId);
+    if (directNode) {
+      return [directNode.id];
+    }
+
+    if (subgraphLookup.has(endpointId)) {
+      return collectNodeIdsForSubgraph(endpointId, document.nodes, subgraphLookup);
+    }
+
+    return [];
+  };
+
+  document.nodes.forEach((node) => {
+    if (!adjacency.has(node.id)) {
+      adjacency.set(node.id, new Set());
+    }
+  });
+
+  for (const edge of document.edges) {
+    const fromNodeIds = expandEndpointToNodeIds(edge.from);
+    const toNodeIds = expandEndpointToNodeIds(edge.to);
+
+    for (const fromNodeId of fromNodeIds) {
+      for (const toNodeId of toNodeIds) {
+        link(fromNodeId, toNodeId);
+      }
+    }
+  }
+
+  const visited = new Set<string>();
+  const queue = [startNodeId];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+    for (const next of adjacency.get(current) ?? []) {
+      if (!visited.has(next)) {
+        queue.push(next);
+      }
+    }
+  }
+
+  return document.nodes
+    .filter((node) => visited.has(node.id))
+    .map((node) => node.id);
 }
 
 function parseAiToolArguments(raw: unknown) {
@@ -2060,7 +2470,7 @@ function getSubgraphAncestryIds(
 
 function buildEdgeEndpointOffsetMap(edges: GraphEdge[], endpoints: EdgeEndpointBox[]) {
   const endpointMap = new Map(endpoints.map((endpoint) => [endpoint.id, endpoint]));
-  const groups = new Map<string, Array<{ edgeId: string; end: 'from' | 'to'; angle: number }>>();
+  const groups = new Map<string, Array<{ edgeId: string; end: 'from' | 'to'; orderMetric: number }>>();
   const offsets = new Map<string, { from: number; to: number }>();
   const pairGroups = new Map<string, GraphEdge[]>();
 
@@ -2077,12 +2487,14 @@ function buildEdgeEndpointOffsetMap(edges: GraphEdge[], endpoints: EdgeEndpointB
     const toAnchor = getNodeAnchor(toEndpoint, fromCenter);
     const fromKey = `${edge.from}:${sideFromAnchor(fromAnchor)}`;
     const toKey = `${edge.to}:${sideFromAnchor(toAnchor)}`;
-    const fromAngle = Math.atan2(toCenter.y - fromCenter.y, toCenter.x - fromCenter.x);
-    const toAngle = Math.atan2(fromCenter.y - toCenter.y, fromCenter.x - toCenter.x);
+    const fromAxis = tangentAxisFromAnchor(fromAnchor);
+    const toAxis = tangentAxisFromAnchor(toAnchor);
+    const fromOrderMetric = toCenter.x * fromAxis.x + toCenter.y * fromAxis.y;
+    const toOrderMetric = fromCenter.x * toAxis.x + fromCenter.y * toAxis.y;
     const pairKey = [edge.from, edge.to].sort().join('::');
 
-    groups.set(fromKey, [...(groups.get(fromKey) ?? []), { edgeId: edge.id, end: 'from', angle: fromAngle }]);
-    groups.set(toKey, [...(groups.get(toKey) ?? []), { edgeId: edge.id, end: 'to', angle: toAngle }]);
+    groups.set(fromKey, [...(groups.get(fromKey) ?? []), { edgeId: edge.id, end: 'from', orderMetric: fromOrderMetric }]);
+    groups.set(toKey, [...(groups.get(toKey) ?? []), { edgeId: edge.id, end: 'to', orderMetric: toOrderMetric }]);
     pairGroups.set(pairKey, [...(pairGroups.get(pairKey) ?? []), edge]);
     offsets.set(edge.id, { from: 0, to: 0 });
   }
@@ -2141,7 +2553,7 @@ function buildEdgeEndpointOffsetMap(edges: GraphEdge[], endpoints: EdgeEndpointB
   });
 
   groups.forEach((entries) => {
-    const sorted = [...entries].sort((left, right) => left.angle - right.angle);
+    const sorted = [...entries].sort((left, right) => left.orderMetric - right.orderMetric);
     sorted.forEach((entry, index) => {
       if (reciprocalEdgeIds.has(entry.edgeId)) {
         return;
@@ -2151,7 +2563,7 @@ function buildEdgeEndpointOffsetMap(edges: GraphEdge[], endpoints: EdgeEndpointB
         return;
       }
 
-      const nextOffset = (index - (sorted.length - 1) / 2) * 16;
+      const nextOffset = (index - (sorted.length - 1) / 2) * 28;
       current[entry.end] = nextOffset;
       offsets.set(entry.edgeId, current);
     });
@@ -2241,31 +2653,98 @@ function buildEdgeGeometry(
     x: toAnchor.x + toAnchor.dirX * endInset + toNormal.x * endpointOffsets.to,
     y: toAnchor.y + toAnchor.dirY * endInset + toNormal.y * endpointOffsets.to,
   };
-  const laneInfluence = laneOffset * (Math.abs(laneOffset) >= 30 ? 0.66 : 0.52);
-  const controlA = {
-    x:
-      start.x +
-      fromAnchor.dirX * handleLength +
-      fromNormal.x * endpointOffsets.from * 0.48 +
-      centerNormal.x * laneInfluence,
-    y:
-      start.y +
-      fromAnchor.dirY * handleLength +
-      fromNormal.y * endpointOffsets.from * 0.48 +
-      centerNormal.y * laneInfluence,
+  const startOffsetVector = {
+    x: fromNormal.x * endpointOffsets.from,
+    y: fromNormal.y * endpointOffsets.from,
   };
-  const controlB = {
-    x:
-      end.x +
-      toAnchor.dirX * handleLength +
-      toNormal.x * endpointOffsets.to * 0.48 +
-      centerNormal.x * laneInfluence,
-    y:
-      end.y +
-      toAnchor.dirY * handleLength +
-      toNormal.y * endpointOffsets.to * 0.48 +
-      centerNormal.y * laneInfluence,
+  const endOffsetVector = {
+    x: toNormal.x * endpointOffsets.to,
+    y: toNormal.y * endpointOffsets.to,
   };
+  const combinedEndpointOffset = {
+    x: startOffsetVector.x + endOffsetVector.x,
+    y: startOffsetVector.y + endOffsetVector.y,
+  };
+  const combinedEndpointOffsetLength = Math.hypot(
+    combinedEndpointOffset.x,
+    combinedEndpointOffset.y,
+  );
+  const useEndpointDrivenBend = combinedEndpointOffsetLength >= 8;
+  const horizontalPassage = fromAnchor.dirX !== 0 && toAnchor.dirX !== 0;
+  const verticalPassage = fromAnchor.dirY !== 0 && toAnchor.dirY !== 0;
+  const normalProjection =
+    combinedEndpointOffset.x * centerNormal.x +
+    combinedEndpointOffset.y * centerNormal.y;
+  const bendSign = useEndpointDrivenBend
+    ? Math.sign(normalProjection || laneOffset || 1)
+    : Math.sign(laneOffset || 1);
+  const bendMagnitude = useEndpointDrivenBend
+    ? bendSign * Math.max(
+      Math.abs(laneOffset) * (Math.abs(laneOffset) >= 34 ? 0.82 : 0.66),
+      Math.abs(normalProjection) * 0.92,
+    )
+    : laneOffset * (Math.abs(laneOffset) >= 34 ? 0.72 : 0.56);
+  const bendVector = {
+    x: centerNormal.x * bendMagnitude,
+    y: centerNormal.y * bendMagnitude,
+  };
+  let controlA: Point;
+  let controlB: Point;
+
+  if (horizontalPassage) {
+    const axisGap = Math.abs(end.x - start.x);
+    const axialHandle = Math.min(handleLength, Math.max(18, axisGap * 0.34));
+    const routeOffset = Math.abs(laneOffset) >= 10
+      ? laneOffset * 0.74
+      : bendVector.y * 0.58;
+    controlA = {
+      x: start.x + fromAnchor.dirX * axialHandle,
+      y: start.y + routeOffset,
+    };
+    controlB = {
+      x: end.x + toAnchor.dirX * axialHandle,
+      y: end.y + routeOffset,
+    };
+  } else if (verticalPassage) {
+    const axisGap = Math.abs(end.y - start.y);
+    const axialHandle = Math.min(handleLength, Math.max(18, axisGap * 0.34));
+    const routeOffset = Math.abs(laneOffset) >= 10
+      ? laneOffset * 0.74
+      : bendVector.x * 0.58;
+    controlA = {
+      x: start.x + routeOffset,
+      y: start.y + fromAnchor.dirY * axialHandle,
+    };
+    controlB = {
+      x: end.x + routeOffset,
+      y: end.y + toAnchor.dirY * axialHandle,
+    };
+  } else {
+    controlA = {
+      x:
+        start.x +
+        fromAnchor.dirX * handleLength +
+        fromNormal.x * endpointOffsets.from * 0.48 +
+        bendVector.x,
+      y:
+        start.y +
+        fromAnchor.dirY * handleLength +
+        fromNormal.y * endpointOffsets.from * 0.48 +
+        bendVector.y,
+    };
+    controlB = {
+      x:
+        end.x +
+        toAnchor.dirX * handleLength +
+        toNormal.x * endpointOffsets.to * 0.48 +
+        bendVector.x,
+      y:
+        end.y +
+        toAnchor.dirY * handleLength +
+        toNormal.y * endpointOffsets.to * 0.48 +
+        bendVector.y,
+    };
+  }
   const mid = cubicPoint(start, controlA, controlB, end, 0.5);
   const label = cubicPoint(start, controlA, controlB, end, 0.68);
 
@@ -2306,19 +2785,19 @@ function buildEdgeLaneMap(edges: GraphEdge[]) {
       const [canonicalFrom, canonicalTo] = [sorted[0].from, sorted[0].to].sort((left, right) => left.localeCompare(right));
       const forward = sorted.filter((edge) => edge.from === canonicalFrom && edge.to === canonicalTo);
       const reverse = sorted.filter((edge) => !(edge.from === canonicalFrom && edge.to === canonicalTo));
-      const assignReciprocalOffsets = (directionEdges: GraphEdge[]) => {
+      const assignReciprocalOffsets = (directionEdges: GraphEdge[], baseSign: 1 | -1) => {
         const center = (directionEdges.length - 1) / 2;
         directionEdges.forEach((edge, index) => {
-          laneMap.set(edge.id, 40 + (index - center) * 18);
+          laneMap.set(edge.id, baseSign * (48 + (index - center) * 22));
         });
       };
 
-      assignReciprocalOffsets(forward);
-      assignReciprocalOffsets(reverse);
+      assignReciprocalOffsets(forward, -1);
+      assignReciprocalOffsets(reverse, 1);
       return;
     }
 
-    const spacing = 22;
+    const spacing = 34;
     sorted.forEach((edge, index) => {
       laneMap.set(edge.id, (index - (sorted.length - 1) / 2) * spacing);
     });
@@ -2341,8 +2820,8 @@ function assignReciprocalEndpointOffsets(
 
   const fromCenter = getNodeCenter(fromEndpoint);
   const toCenter = getNodeCenter(toEndpoint);
-  const baseSpread = 24;
-  const intraSpacing = 18;
+  const baseSpread = 46;
+  const intraSpacing = 28;
   const center = (directionEdges.length - 1) / 2;
 
   directionEdges.forEach((edge, index) => {
@@ -2452,12 +2931,13 @@ function duplicateNodesWithEdges(document: GraphDocument, sourceIds: string[], o
   const duplicatedNodes = document.nodes
     .filter((node) => ids.has(node.id))
     .map((node) => {
+      const title = splitEntityText(node.label).title || '未命名内容';
       const nextId = nextNodeId([
         ...document.nodes,
         ...Array.from(nodeIdMap.values()).map((id) =>
           buildNode(id, id, { x: 0, y: 0 }, null),
         ),
-      ]);
+      ], title);
       nodeIdMap.set(node.id, nextId);
       return {
         ...resizeNodeToContent(node, node.label),
@@ -2532,6 +3012,14 @@ function handleNativeSelectAllShortcut(
   return true;
 }
 
+function isCompositionConfirming(
+  event:
+    | React.KeyboardEvent<HTMLTextAreaElement>
+    | React.KeyboardEvent<HTMLInputElement>,
+) {
+  return event.nativeEvent.isComposing || event.keyCode === 229;
+}
+
 function intersects(
   rect: { x: number; y: number; width: number; height: number },
   box: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
@@ -2566,8 +3054,9 @@ function buildMiniMapModel(
   width = MINIMAP_WIDTH,
   height = MINIMAP_HEIGHT,
 ) {
+  const shapeRects = shapes.map((shape) => shape.rect);
   const allRects = [
-    ...shapes.map((shape) => shape.rect),
+    ...shapeRects,
     ...(viewportRect ? [viewportRect] : []),
   ];
 
@@ -2575,17 +3064,21 @@ function buildMiniMapModel(
     return null;
   }
 
-  const minX = Math.min(...allRects.map((rect) => rect.x));
-  const minY = Math.min(...allRects.map((rect) => rect.y));
-  const maxX = Math.max(...allRects.map((rect) => rect.x + rect.width));
-  const maxY = Math.max(...allRects.map((rect) => rect.y + rect.height));
-  const padding = 64;
-  const worldBounds = {
+  const contentSourceRects = shapeRects.length > 0 ? shapeRects : (viewportRect ? [viewportRect] : []);
+  const minX = Math.min(...contentSourceRects.map((rect) => rect.x));
+  const minY = Math.min(...contentSourceRects.map((rect) => rect.y));
+  const maxX = Math.max(...contentSourceRects.map((rect) => rect.x + rect.width));
+  const maxY = Math.max(...contentSourceRects.map((rect) => rect.y + rect.height));
+  const contentWidth = Math.max(1, maxX - minX);
+  const contentHeight = Math.max(1, maxY - minY);
+  const padding = clamp(Math.max(contentWidth, contentHeight) * 0.14, 72, 180);
+  const navigationBounds = {
     x: minX - padding,
     y: minY - padding,
-    width: Math.max(160, maxX - minX + padding * 2),
-    height: Math.max(120, maxY - minY + padding * 2),
+    width: Math.max(160, contentWidth + padding * 2),
+    height: Math.max(120, contentHeight + padding * 2),
   };
+  const worldBounds = navigationBounds;
   const scale = Math.min(width / worldBounds.width, height / worldBounds.height);
   const offsetX = (width - worldBounds.width * scale) / 2;
   const offsetY = (height - worldBounds.height * scale) / 2;
@@ -2604,6 +3097,8 @@ function buildMiniMapModel(
     offsetX,
     offsetY,
     worldBounds,
+    navigationBounds,
+    viewportWorldRect: viewportRect ? { ...viewportRect } : null,
     shapes: shapes.map((shape) => ({
       ...shape,
       projected: projectRect(shape.rect),
@@ -2622,8 +3117,61 @@ function downloadBlob(filename: string, blob: Blob) {
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
+  document.body.append(anchor);
   anchor.click();
+  anchor.remove();
   URL.revokeObjectURL(url);
+}
+
+async function saveBlobWithPicker(
+  filename: string,
+  blob: Blob,
+  suggestedType?: {
+    description: string;
+    mime: string;
+    extensions: string[];
+  },
+) {
+  const pickerWindow = window as Window & {
+    showSaveFilePicker?: (options?: {
+      suggestedName?: string;
+      excludeAcceptAllOption?: boolean;
+      types?: Array<{ description?: string; accept: Record<string, string[]> }>;
+    }) => Promise<{
+      createWritable?: () => Promise<{
+        write: (data: Blob) => Promise<void>;
+        close: () => Promise<void>;
+      }>;
+    }>;
+  };
+
+  if (pickerWindow.showSaveFilePicker) {
+    try {
+      const handle = await pickerWindow.showSaveFilePicker({
+        suggestedName: filename,
+        excludeAcceptAllOption: !!suggestedType,
+        types: suggestedType
+          ? [{
+              description: suggestedType.description,
+              accept: {
+                [suggestedType.mime]: suggestedType.extensions,
+              },
+            }]
+          : undefined,
+      });
+      const writable = await handle.createWritable?.();
+      if (writable) {
+        await writable.write(blob);
+        await writable.close();
+        return;
+      }
+    } catch {
+      downloadBlob(filename, blob);
+      return;
+    }
+  }
+
+  downloadBlob(filename, blob);
 }
 
 function sanitizeFilename(value: string, fallback = 'diagram') {
@@ -2657,36 +3205,69 @@ function sanitizeFilename(value: string, fallback = 'diagram') {
   return normalized || fallback;
 }
 
-function collectDocumentCssText() {
-  const chunks: string[] = [];
-
-  for (const stylesheet of Array.from(document.styleSheets)) {
-    try {
-      const rules = stylesheet.cssRules;
-      for (const rule of Array.from(rules)) {
-        chunks.push(rule.cssText);
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return chunks.join('\n');
-}
-
 function loadImageFromUrl(url: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
+    image.decoding = 'sync';
     image.onload = () => resolve(image);
     image.onerror = () => reject(new Error('Image load failed'));
     image.src = url;
   });
 }
 
+async function renderSvgMarkupToCanvasImage(svgMarkup: string, svgBlob: Blob) {
+  if ('createImageBitmap' in window) {
+    try {
+      const bitmap = await createImageBitmap(svgBlob);
+      return {
+        draw(context: CanvasRenderingContext2D, width: number, height: number) {
+          context.drawImage(bitmap, 0, 0, width, height);
+          bitmap.close?.();
+        },
+      };
+    } catch {
+      // fall through
+    }
+  }
+
+  const blobUrl = URL.createObjectURL(svgBlob);
+  try {
+    const image = await loadImageFromUrl(blobUrl);
+    return {
+      draw(context: CanvasRenderingContext2D, width: number, height: number) {
+        context.drawImage(image, 0, 0, width, height);
+      },
+    };
+  } catch {
+    URL.revokeObjectURL(blobUrl);
+  }
+  URL.revokeObjectURL(blobUrl);
+
+  try {
+    const encoded = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
+    const image = await loadImageFromUrl(encoded);
+    return {
+      draw(context: CanvasRenderingContext2D, width: number, height: number) {
+        context.drawImage(image, 0, 0, width, height);
+      },
+    };
+  } catch {
+    // fall through
+  }
+
+  const base64 = `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svgMarkup)))}`;
+  const image = await loadImageFromUrl(base64);
+  return {
+    draw(context: CanvasRenderingContext2D, width: number, height: number) {
+      context.drawImage(image, 0, 0, width, height);
+    },
+  };
+}
+
 function buildCanvasExportBounds(input: {
   nodes: GraphNode[];
   subgraphs: SubgraphFrame[];
-  contentRect: Rect;
+  contentRect?: Rect | null;
   edges: GraphEdge[];
   endpointMap: Map<string, EdgeEndpointBox>;
   laneMap: Map<string, number>;
@@ -2707,7 +3288,9 @@ function buildCanvasExportBounds(input: {
 
   input.nodes.forEach((node) => includeRect(node));
   input.subgraphs.forEach((frame) => includeRect(frame));
-  includeRect(input.contentRect);
+  if (input.contentRect) {
+    includeRect(input.contentRect);
+  }
 
   input.edges.forEach((edge) => {
     const fromNode = input.endpointMap.get(edge.from);
@@ -2759,6 +3342,55 @@ function buildCanvasExportBounds(input: {
     width: Math.ceil(maxX - minX),
     height: Math.ceil(maxY - minY),
   };
+}
+
+function escapeSvgText(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function wrapSvgTextLines(value: string, maxUnits: number) {
+  const normalized = value.replace(/\r\n/g, '\n');
+  const lines: string[] = [];
+
+  normalized.split('\n').forEach((rawLine) => {
+    if (!rawLine) {
+      lines.push('');
+      return;
+    }
+
+    let currentLine = '';
+    let currentUnits = 0;
+
+    Array.from(rawLine).forEach((character) => {
+      const nextUnits =
+        /[\u2e80-\u9fff\uac00-\ud7af]/.test(character)
+          ? 1.82
+          : /[A-Z0-9]/.test(character)
+            ? 1.26
+            : 1;
+
+      if (currentLine && currentUnits + nextUnits > maxUnits) {
+        lines.push(currentLine);
+        currentLine = character;
+        currentUnits = nextUnits;
+        return;
+      }
+
+      currentLine += character;
+      currentUnits += nextUnits;
+    });
+
+    if (currentLine) {
+      lines.push(currentLine);
+    }
+  });
+
+  return lines.length > 0 ? lines : [''];
 }
 
 function getVisibleSubgraphIds(subgraphs: GraphSubgraph[]) {
@@ -2923,6 +3555,117 @@ function collectNodeIdsForSubgraph(
   return nodes
     .filter((node) => belongsToSubgraph(node, subgraphId, lookup))
     .map((node) => node.id);
+}
+
+function collectLayoutScopeNodeIds(
+  document: GraphDocument,
+  selection: SelectionState,
+) {
+  if (selection.kind === 'none' || selection.kind === 'content' || selection.ids.length <= 1) {
+    return null;
+  }
+
+  const nodeIds = new Set<string>();
+  const visibleSubgraphs = getVisibleSubgraphIds(document.subgraphs);
+
+  if (selection.kind === 'node') {
+    selection.ids
+      .filter((id) => document.nodes.some((node) => node.id === id))
+      .forEach((id) => nodeIds.add(id));
+  } else if (selection.kind === 'subgraph') {
+    selection.ids.forEach((subgraphId) => {
+      collectNodeIdsForSubgraph(subgraphId, document.nodes, visibleSubgraphs).forEach((nodeId) => {
+        nodeIds.add(nodeId);
+      });
+    });
+  } else if (selection.kind === 'edge') {
+    const selectedEdges = document.edges.filter((edge) => selection.ids.includes(edge.id));
+    selectedEdges.forEach((edge) => {
+      if (document.nodes.some((node) => node.id === edge.from)) {
+        nodeIds.add(edge.from);
+      } else if (visibleSubgraphs.has(edge.from)) {
+        collectNodeIdsForSubgraph(edge.from, document.nodes, visibleSubgraphs).forEach((nodeId) => {
+          nodeIds.add(nodeId);
+        });
+      }
+
+      if (document.nodes.some((node) => node.id === edge.to)) {
+        nodeIds.add(edge.to);
+      } else if (visibleSubgraphs.has(edge.to)) {
+        collectNodeIdsForSubgraph(edge.to, document.nodes, visibleSubgraphs).forEach((nodeId) => {
+          nodeIds.add(nodeId);
+        });
+      }
+    });
+  }
+
+  return nodeIds.size > 1 ? nodeIds : null;
+}
+
+function buildLayoutScopeDocument(
+  document: GraphDocument,
+  scopedNodeIds: Set<string>,
+  selection: SelectionState,
+) {
+  const subgraphLookup = new Map(document.subgraphs.map((subgraph) => [subgraph.id, subgraph]));
+  const scopedSubgraphIds = new Set<string>(
+    selection.kind === 'subgraph' ? selection.ids.filter((id) => subgraphLookup.has(id)) : [],
+  );
+
+  document.nodes.forEach((node) => {
+    if (!scopedNodeIds.has(node.id)) {
+      return;
+    }
+
+    let current = node.subgraphId;
+    while (current) {
+      scopedSubgraphIds.add(current);
+      current = subgraphLookup.get(current)?.parentId ?? null;
+    }
+  });
+
+  const scopedNodes = document.nodes
+    .filter((node) => scopedNodeIds.has(node.id))
+    .map((node) => ({ ...node }));
+  const scopedSubgraphs = document.subgraphs
+    .filter((subgraph) => scopedSubgraphIds.has(subgraph.id))
+    .map((subgraph) => ({ ...subgraph }));
+  const scopedSubgraphIdSet = new Set(scopedSubgraphs.map((subgraph) => subgraph.id));
+  const scopedEdges = document.edges
+    .filter((edge) => {
+      const fromIncluded = scopedNodeIds.has(edge.from) || scopedSubgraphIdSet.has(edge.from);
+      const toIncluded = scopedNodeIds.has(edge.to) || scopedSubgraphIdSet.has(edge.to);
+      return fromIncluded && toIncluded;
+    })
+    .map((edge) => ({ ...edge }));
+
+  return {
+    ...document,
+    nodes: scopedNodes,
+    edges: scopedEdges,
+    subgraphs: scopedSubgraphs,
+  };
+}
+
+function mergeScopedLayoutNodes(
+  document: GraphDocument,
+  laidOutNodes: GraphNode[],
+) {
+  const laidOutNodeMap = new Map(laidOutNodes.map((node) => [node.id, node]));
+  return document.nodes.map((node) => {
+    const laidOutNode = laidOutNodeMap.get(node.id);
+    if (!laidOutNode) {
+      return node;
+    }
+
+    return {
+      ...node,
+      x: laidOutNode.x,
+      y: laidOutNode.y,
+      width: laidOutNode.width,
+      height: laidOutNode.height,
+    };
+  });
 }
 
 function removeSubgraphs(current: GraphDocument, rootIds: string[]) {
@@ -3231,7 +3974,8 @@ function createNodeFromSubgraph(
   subgraph: GraphSubgraph,
   frame: Pick<SubgraphFrame, 'x' | 'y' | 'width' | 'height'>,
 ): GraphNode {
-  const size = measureNodeContentSize(subgraph.title);
+  const parts = splitEntityText(subgraph.title);
+  const size = measureNodeContentSize(parts.title, parts.description);
   return {
     id: subgraph.id,
     label: subgraph.title,
@@ -4001,15 +4745,6 @@ function tidyDocumentNodes(document: GraphDocument) {
     return withNodeAxisPosition(node, direction, nextPrimary, nextMinor);
   });
 
-  const contentMarkdown = document.contentMarkdown ?? extractContentMarkdown(document.suffixMarkdown);
-  const contentLayout = getContentCardLayout(document, { width: 320, height: 180 });
-  const contentSize = measureContentCard(contentMarkdown, contentLayout.collapsed);
-  const contentRect = {
-    x: contentLayout.x,
-    y: contentLayout.y,
-    width: contentSize.width,
-    height: contentSize.height,
-  };
   const orderedNodes = [...relaxedNodes].sort((left, right) => {
     const primaryDelta = getNodePrimaryStart(left, direction) - getNodePrimaryStart(right, direction);
     if (primaryDelta !== 0) {
@@ -4025,7 +4760,7 @@ function tidyDocumentNodes(document: GraphDocument) {
   });
 
   const placed = new Map<string, GraphNode>();
-  const obstacles: Rect[] = [expandRect(contentRect, 16)];
+  const obstacles: Rect[] = [];
   orderedNodes.forEach((node) => {
     const original = nodeMap.get(node.id) ?? node;
     const resolvedRect = searchFreeRect(
@@ -4429,7 +5164,7 @@ export default function App() {
   const [localExplorerItems, setLocalExplorerItems] = useState<ExplorerItem[]>(defaultLocalProjectItems);
   const [activeLocalFileId, setActiveLocalFileId] = useState<string | null>(null);
   const [activeLocalDirectoryId, setActiveLocalDirectoryId] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(isVsCodeHost);
+  const [sidebarOpen, setSidebarOpen] = useState(!isVsCodeHost);
   const [inspectorOpen, setInspectorOpen] = useState(isVsCodeHost);
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     readStoredNumber(storageKeys.sidebarWidth, DEFAULT_SIDEBAR_WIDTH),
@@ -4464,12 +5199,15 @@ export default function App() {
   );
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved');
   const [searchQuery, setSearchQuery] = useState('');
+  const [canvasSearchOpen, setCanvasSearchOpen] = useState(false);
+  const [canvasSearchQuery, setCanvasSearchQuery] = useState('');
+  const [canvasSearchFocusIndex, setCanvasSearchFocusIndex] = useState(0);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [activeLocalExplorerItemId, setActiveLocalExplorerItemId] = useState<string | null>(null);
   const [hasLocalProjectAccess, setHasLocalProjectAccess] = useState(false);
   const [nodeInspectorDraft, setNodeInspectorDraft] = useState<NodeInspectorDraft>({
     label: '',
-    annotation: '',
+    description: '',
     shape: 'rect',
     fill: '#fff8ef',
     stroke: '#24404f',
@@ -4483,6 +5221,7 @@ export default function App() {
   });
   const [subgraphInspectorDraft, setSubgraphInspectorDraft] = useState<SubgraphInspectorDraft>({
     title: '',
+    description: '',
     collapsed: false,
     fill: defaultSubgraphStyle.fill,
     stroke: defaultSubgraphStyle.stroke,
@@ -4498,11 +5237,16 @@ export default function App() {
   });
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [editingLabel, setEditingLabel] = useState('');
+  const [editingNodeField, setEditingNodeField] = useState<InlineNodeField>('title');
+  const [editingNodeSelectAll, setEditingNodeSelectAll] = useState(false);
   const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
   const [editingEdgeLabel, setEditingEdgeLabel] = useState('');
   const [editingSubgraphId, setEditingSubgraphId] = useState<string | null>(null);
   const [editingSubgraphTitle, setEditingSubgraphTitle] = useState('');
+  const [editingSubgraphField, setEditingSubgraphField] = useState<InlineNodeField>('title');
   const [editingContent, setEditingContent] = useState(false);
+  const [svgPreviewOpen, setSvgPreviewOpen] = useState(false);
+  const [svgPreviewScale, setSvgPreviewScale] = useState(1);
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [dragTargetSubgraphId, setDragTargetSubgraphId] = useState<string | null>(null);
   const [dragTargetNodeId, setDragTargetNodeId] = useState<string | null>(null);
@@ -4513,10 +5257,19 @@ export default function App() {
   const [miniMapDragState, setMiniMapDragState] = useState<MiniMapDragState | null>(null);
   const [connectingState, setConnectingState] = useState<ConnectingState | null>(null);
   const [panelResizeState, setPanelResizeState] = useState<PanelResizeState | null>(null);
+  const [contentCardResizeState, setContentCardResizeState] = useState<ContentCardResizeState | null>(null);
   const [spacePressed, setSpacePressed] = useState(false);
   const workspaceRef = useRef<HTMLElement>(null);
+  const workspaceMainRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const canvasBoardRef = useRef<HTMLDivElement>(null);
+  const canvasSearchInputRef = useRef<HTMLInputElement>(null);
+  const nodeTitleEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const nodeDescriptionEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const nodeEditorShellRef = useRef<HTMLDivElement | null>(null);
+  const editingLabelRef = useRef(editingLabel);
+  const subgraphEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const searchRestoreViewportRef = useRef<ViewportState | null>(null);
   const localHandleEntriesRef = useRef<Record<string, LocalHandleEntry>>({});
   const localRootDirectoryRef = useRef<LocalProjectDirectoryHandle | null>(null);
   const nodeClipboardRef = useRef<NodeClipboardState | null>(null);
@@ -4524,6 +5277,7 @@ export default function App() {
   const documentRevisionRef = useRef(documentRevision);
   const aiLastMarkdownRef = useRef(aiLastMarkdown);
   const previousModeRef = useRef(mode);
+  const editingSubgraphTitleRef = useRef(editingSubgraphTitle);
   const gestureStateRef = useRef<GestureState | null>(null);
   const backgroundHoldRef = useRef<number | null>(null);
   const pendingBackgroundRef = useRef<{
@@ -4564,23 +5318,13 @@ export default function App() {
     [documentState.contentMarkdown, documentState.suffixMarkdown],
   );
   const contentCardLayout = useMemo(
-    () => getContentCardLayout(documentState, { width: 320, height: 180 }),
+    () => getContentCardLayout(documentState),
     [documentState],
   );
   const contentCardCollapsed = contentCardLayout.collapsed && !editingContent;
   const contentCardSize = useMemo(
     () => measureContentCard(editingContent ? contentInspectorDraft.markdown : contentMarkdown, contentCardCollapsed),
     [contentCardCollapsed, contentInspectorDraft.markdown, contentMarkdown, editingContent],
-  );
-  const contentCardRenderLayout = contentCardLayout;
-  const contentCardRect = useMemo(
-    () => ({
-      x: contentCardRenderLayout.x,
-      y: contentCardRenderLayout.y,
-      width: contentCardSize.width,
-      height: contentCardSize.height,
-    }),
-    [contentCardRenderLayout, contentCardSize],
   );
   const contentCardPreviewHtml = useMemo(
     () => renderMarkdownPreviewHtml(contentMarkdown),
@@ -4590,6 +5334,51 @@ export default function App() {
     () => buildContentCardSummary(contentMarkdown),
     [contentMarkdown],
   );
+  const contentCardBounds = useMemo(() => {
+    const measuredWidth = clamp(contentCardSize.width, CONTENT_CARD_MIN_WIDTH, CONTENT_CARD_MAX_WIDTH);
+    const measuredHeight = clamp(
+      contentCardSize.height,
+      contentCardCollapsed ? CONTENT_CARD_COLLAPSED_HEIGHT : CONTENT_CARD_MIN_HEIGHT,
+      CONTENT_CARD_MAX_HEIGHT,
+    );
+    const persistedWidth = typeof contentCardLayout.width === 'number'
+      ? clamp(contentCardLayout.width, CONTENT_CARD_MIN_WIDTH, CONTENT_CARD_MAX_WIDTH)
+      : measuredWidth;
+    const persistedHeight = typeof contentCardLayout.height === 'number'
+      ? clamp(contentCardLayout.height, CONTENT_CARD_MIN_HEIGHT, CONTENT_CARD_MAX_HEIGHT)
+      : measuredHeight;
+
+    return {
+      width: contentCardResizeState
+        ? clamp(contentCardResizeState.width, CONTENT_CARD_MIN_WIDTH, CONTENT_CARD_MAX_WIDTH)
+        : persistedWidth,
+      height: contentCardCollapsed
+        ? CONTENT_CARD_COLLAPSED_HEIGHT
+        : (contentCardResizeState
+            ? clamp(contentCardResizeState.height, CONTENT_CARD_MIN_HEIGHT, CONTENT_CARD_MAX_HEIGHT)
+            : persistedHeight),
+    };
+  }, [
+    contentCardCollapsed,
+    contentCardLayout.height,
+    contentCardLayout.width,
+    contentCardResizeState,
+    contentCardSize.height,
+    contentCardSize.width,
+  ]);
+  const contentCardStyle = useMemo(() => {
+    return {
+      left: isVsCodeHost ? 12 : 16,
+      top: isVsCodeHost ? 12 : 48,
+      width: contentCardBounds.width,
+      height: contentCardBounds.height,
+    };
+  }, [
+    contentCardBounds.height,
+    contentCardBounds.width,
+    isVsCodeHost,
+  ]);
+  const contentCardRect: Rect | null = null;
   const miniMapModel = useMemo(() => {
     const canvasBounds = canvasRef.current?.getBoundingClientRect();
     const viewport = documentState.layout.viewport;
@@ -4623,19 +5412,10 @@ export default function App() {
             selected: selection.kind === 'subgraph' && selectionContains(selection, frame.id),
           };
         }),
-        {
-          id: CONTENT_CARD_ID,
-          kind: 'content' as const,
-          rect: contentCardRect,
-          fill: 'rgba(248, 250, 252, 0.16)',
-          stroke: '#f8fafc',
-          selected: selection.kind === 'content',
-        },
       ],
       viewportRect,
     );
   }, [
-    contentCardRect,
     documentState.subgraphs,
     documentState.layout.viewport,
     previewNodes,
@@ -4644,6 +5424,10 @@ export default function App() {
   ]);
   const visibleNodes = previewNodes.filter(
     (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
+  );
+  const nodeTitleValidationMap = useMemo(
+    () => buildNodeTitleValidationMap(documentState.nodes, editingNodeId, editingLabel),
+    [documentState.nodes, editingLabel, editingNodeId],
   );
   const edgeEndpoints = useMemo<EdgeEndpointBox[]>(
     () => [
@@ -4741,14 +5525,13 @@ export default function App() {
     () => buildCanvasExportBounds({
       nodes: visibleNodes,
       subgraphs: subgraphFrames,
-      contentRect: contentCardRect,
+      contentRect: null,
       edges: visibleEdges,
       endpointMap: edgeEndpointMap,
       laneMap: edgeLaneMap,
       endpointOffsets: edgeEndpointOffsetMap,
     }),
     [
-      contentCardRect,
       edgeEndpointMap,
       edgeEndpointOffsetMap,
       edgeLaneMap,
@@ -4757,6 +5540,35 @@ export default function App() {
       visibleNodes,
     ],
   );
+  const liveEdgeMarkerEntries = useMemo(() => {
+    const markerMap = new Map<string, string>();
+    let markerIndex = 0;
+
+    visibleEdges.forEach((edge) => {
+      if (edge.type === 'line') {
+        return;
+      }
+
+      const normalizedEdge = normalizeEdgeStyle(edge);
+      const fromNode = edgeEndpointMap.get(edge.from);
+      if (!fromNode) {
+        return;
+      }
+
+      const inheritsSourceColor = shouldInheritSourceEdgeColor(normalizedEdge.strokeColor);
+      const edgeBaseColor = inheritsSourceColor ? getEndpointAccentColor(fromNode) : normalizedEdge.strokeColor;
+      if (!markerMap.has(edgeBaseColor)) {
+        markerMap.set(edgeBaseColor, `arrow-solid-${markerIndex}`);
+        markerIndex += 1;
+      }
+    });
+
+    return Array.from(markerMap.entries()).map(([color, id]) => ({ color, id }));
+  }, [edgeEndpointMap, visibleEdges]);
+  const liveEdgeMarkerIdMap = useMemo(
+    () => new Map(liveEdgeMarkerEntries.map((entry) => [entry.color, entry.id])),
+    [liveEdgeMarkerEntries],
+  );
   const allSubgraphFrames = useMemo(
     () => buildSubgraphFrames(documentState, framePreviewNodes),
     [documentState, framePreviewNodes],
@@ -4764,6 +5576,78 @@ export default function App() {
   const allSubgraphFrameMap = useMemo(
     () => new Map(allSubgraphFrames.map((frame) => [frame.id, frame])),
     [allSubgraphFrames],
+  );
+  const canvasSearchResults = useMemo<CanvasSearchResult[]>(() => {
+    const query = canvasSearchQuery.trim().toLowerCase();
+    if (!query) {
+      return [];
+    }
+
+    const results: CanvasSearchResult[] = [
+      ...documentState.subgraphs.flatMap((subgraph) => {
+        const frame = allSubgraphFrameMap.get(subgraph.id);
+        if (!frame) {
+          return [];
+        }
+        const parts = splitEntityText(subgraph.title);
+        const haystack = `${subgraph.id} ${parts.title} ${parts.description}`.toLowerCase();
+        if (!haystack.includes(query)) {
+          return [];
+        }
+        const exactBoost =
+          parts.title.toLowerCase().startsWith(query) || subgraph.id.toLowerCase().startsWith(query)
+            ? 0
+            : 1;
+        return [
+          {
+            id: subgraph.id,
+            kind: 'subgraph' as const,
+            label: parts.title,
+            meta: parts.description || subgraph.id,
+            rect: frame,
+            score: exactBoost,
+          },
+        ];
+      }),
+      ...visibleNodes.flatMap((node) => {
+        const parts = splitEntityText(node.label);
+        const haystack = `${node.id} ${parts.title} ${parts.description}`.toLowerCase();
+        if (!haystack.includes(query)) {
+          return [];
+        }
+        const exactBoost =
+          parts.title.toLowerCase().startsWith(query) || node.id.toLowerCase().startsWith(query)
+            ? 0
+            : 1;
+        return [
+          {
+            id: node.id,
+            kind: 'node' as const,
+            label: parts.title,
+            meta: parts.description || node.id,
+            rect: node,
+            score: 10 + exactBoost,
+          },
+        ];
+      }),
+    ];
+
+    return results
+      .sort((left, right) => {
+        if (left.score !== right.score) {
+          return left.score - right.score;
+        }
+        return left.label.localeCompare(right.label);
+      })
+      .slice(0, 10);
+  }, [allSubgraphFrameMap, canvasSearchQuery, documentState.subgraphs, visibleNodes]);
+  const canvasSearchNodeIds = useMemo(
+    () => new Set(canvasSearchResults.filter((item) => item.kind === 'node').map((item) => item.id)),
+    [canvasSearchResults],
+  );
+  const canvasSearchSubgraphIds = useMemo(
+    () => new Set(canvasSearchResults.filter((item) => item.kind === 'subgraph').map((item) => item.id)),
+    [canvasSearchResults],
   );
   const graphTreeItems = useMemo(
     () =>
@@ -4801,11 +5685,11 @@ export default function App() {
       },
       {
         id: 'cloud-diagram',
-        label: 'diagram.md',
+        label: 'diagram.lmd',
         meta: `${documentState.nodes.length} 节点 / ${documentState.edges.length} 连线`,
         depth: 2,
         kind: 'file',
-        path: 'cloud://projects/product-graph-platform/docs/diagram.md',
+        path: 'cloud://projects/product-graph-platform/docs/diagram.lmd',
         tabId: 'diagram',
         mode: 'canvas',
       },
@@ -4814,7 +5698,7 @@ export default function App() {
   );
   const activeCloudPath = useMemo(() => {
       const activeItem = cloudExplorerItems.find((item) => item.tabId === activeFileTab);
-      return activeItem?.path ?? 'cloud://projects/product-graph-platform/docs/diagram.md';
+      return activeItem?.path ?? 'cloud://projects/product-graph-platform/docs/diagram.lmd';
   }, [activeFileTab, cloudExplorerItems]);
   const activeLocalPath = useMemo(() => {
     const activeItem = activeLocalExplorerItemId
@@ -4934,7 +5818,7 @@ export default function App() {
   const standardizeCurrentProject = useCallback(() => {
     const fallbackName = (
       activeLocalItem?.kind === 'file'
-        ? activeLocalItem.label.replace(/\.md$/i, '')
+        ? activeLocalItem.label.replace(/\.(?:lmd|md)$/i, '')
         : documentRef.current.projectName
     ) ?? 'Untitled Project';
     const rawMarkdown = (sourceDraft || documentRef.current.markdown || '').trim();
@@ -4969,33 +5853,116 @@ export default function App() {
     setSelection((current) => (toggle ? toggleSelectionIds(current, kind, [id]) : { kind, ids: [id] }));
   }, []);
 
+  const selectConnectedNodeComponent = useCallback((nodeId: string) => {
+    const connectedIds = getConnectedNodeCluster(documentState, nodeId);
+    setSelection({
+      kind: 'node',
+      ids: connectedIds.length > 0 ? connectedIds : [nodeId],
+    });
+  }, [documentState]);
+
   const clearSelection = useCallback(() => {
     setSelection({ kind: 'none', ids: [] });
   }, []);
 
-  const startInlineEdit = useCallback((node: GraphNode) => {
+  const startInlineEdit = useCallback((node: GraphNode, field: InlineNodeField = 'title') => {
+    const currentParts = splitEntityText(node.label);
+    const preferredField: InlineNodeField = isPlaceholderNodeTitle(currentParts.title) ? 'title' : field;
+    const draftLabel = ensureInlineEntityFieldValue(node.label, preferredField);
     setEditingNodeId(node.id);
-    setEditingLabel(node.label);
+    setEditingNodeField(preferredField);
+    setEditingLabel(draftLabel);
+    setEditingNodeSelectAll(
+      shouldSelectAllInlineNodeField(
+        getInlineEntityFieldValue(draftLabel, preferredField),
+        preferredField,
+      ),
+    );
     setSelection({ kind: 'node', ids: [node.id] });
   }, []);
 
-  const commitInlineEdit = useCallback((nodeId: string) => {
-    commitDocument(
-      (current) => ({
-        ...current,
-        nodes: current.nodes.map((node) =>
+  const updateEditingNodeFieldValue = useCallback((field: InlineNodeField, nextValue: string) => {
+    setEditingLabel((current) => setInlineEntityFieldValue(current, field, nextValue));
+  }, []);
+
+  const persistInlineNodeDraft = useCallback((
+    nodeId: string,
+    options?: {
+      closeEditor?: boolean;
+      historyTitle?: string;
+      historyDetail?: string;
+    },
+  ) => {
+    const closeEditor = options?.closeEditor ?? false;
+    const historyTitle = options?.historyTitle ?? '已暂存节点';
+    const historyDetail = options?.historyDetail ?? '已暂存当前节点编辑草稿。';
+    const currentDocument = structuredClone(documentRef.current);
+    const currentNode = currentDocument.nodes.find((node) => node.id === nodeId);
+    if (!currentNode) {
+      if (closeEditor) {
+        setEditingNodeId(null);
+        setEditingNodeField('title');
+        setEditingNodeSelectAll(false);
+        setEditingLabel('');
+      }
+      return;
+    }
+
+    const { title, description } = splitEntityText(editingLabelRef.current);
+    const nextLabel = composeEntityText(title, description);
+    const nextId = nextNodeId(currentDocument.nodes, title || '未命名内容', nodeId);
+    const changed = currentNode.label !== nextLabel || currentNode.id !== nextId;
+
+    if (changed) {
+      const nextDocument = materializeDocument({
+        ...currentDocument,
+        nodes: currentDocument.nodes.map((node) =>
           node.id === nodeId
-            ? resizeNodeToContent(node, editingLabel.trim() || '未命名内容')
+            ? {
+                ...resizeNodeToContent(node, title, description),
+                id: nextId,
+              }
             : node,
         ),
-      }),
-      '已更新节点',
-      `已更新 ${nodeId} 的节点内容。`,
-    );
+        edges: currentDocument.edges.map((edge) => ({
+          ...edge,
+          from: edge.from === nodeId ? nextId : edge.from,
+          to: edge.to === nodeId ? nextId : edge.to,
+        })),
+      });
+      applyCommittedDocument(nextDocument, historyTitle, historyDetail, currentDocument);
+      setSelection((current) => (
+        current.kind === 'node'
+          ? {
+              kind: 'node',
+              ids: current.ids.map((id) => (id === nodeId ? nextId : id)),
+            }
+          : current
+      ));
+      if (!closeEditor) {
+        setEditingNodeId(nextId);
+        setEditingLabel(nextLabel);
+      }
+    }
 
-    setEditingNodeId(null);
-    setEditingLabel('');
-  }, [commitDocument, editingLabel]);
+    if (closeEditor) {
+      setEditingNodeId(null);
+      setEditingNodeField('title');
+      setEditingNodeSelectAll(false);
+      setEditingLabel('');
+      return;
+    }
+
+    setEditingNodeSelectAll(false);
+  }, [applyCommittedDocument]);
+
+  const commitInlineEdit = useCallback((nodeId: string) => {
+    persistInlineNodeDraft(nodeId, {
+      closeEditor: true,
+      historyTitle: '已更新节点',
+      historyDetail: `已更新 ${nodeId} 的节点内容。`,
+    });
+  }, [persistInlineNodeDraft]);
 
   const startEdgeInlineEdit = useCallback((edge: GraphEdge) => {
     setEditingEdgeId(edge.id);
@@ -5065,6 +6032,30 @@ export default function App() {
     [],
   );
 
+  const resetWorkbenchScrollOffsets = useCallback(() => {
+    const resetElementScroll = (element: HTMLElement | null) => {
+      if (!element) {
+        return;
+      }
+
+      if (element.scrollLeft !== 0 || element.scrollTop !== 0) {
+        element.scrollLeft = 0;
+        element.scrollTop = 0;
+      }
+    };
+
+    resetElementScroll(workspaceRef.current);
+    resetElementScroll(workspaceMainRef.current);
+    resetElementScroll(canvasRef.current);
+    resetElementScroll(document.scrollingElement as HTMLElement | null);
+    resetElementScroll(document.documentElement);
+    resetElementScroll(document.body);
+
+    if (window.scrollX !== 0 || window.scrollY !== 0) {
+      window.scrollTo(0, 0);
+    }
+  }, []);
+
   const pointFromClient = useCallback(
     (
       clientX: number,
@@ -5083,6 +6074,47 @@ export default function App() {
     },
     [documentState.layout.viewport],
   );
+
+  const keepNodeEditorVisibleInCanvas = useCallback((rect: Rect) => {
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    if (!bounds) {
+      return;
+    }
+
+    const viewport = documentRef.current.layout.viewport;
+    const marginX = 28;
+    const marginY = 24;
+    const left = viewport.x + rect.x * viewport.zoom;
+    const top = viewport.y + rect.y * viewport.zoom;
+    const width = rect.width * viewport.zoom;
+    const height = rect.height * viewport.zoom;
+    const right = left + width;
+    const bottom = top + height;
+
+    let nextX = viewport.x;
+    let nextY = viewport.y;
+
+    if (right > bounds.width - marginX) {
+      nextX -= right - (bounds.width - marginX);
+    }
+    if (left < marginX) {
+      nextX += marginX - left;
+    }
+    if (bottom > bounds.height - marginY) {
+      nextY -= bottom - (bounds.height - marginY);
+    }
+    if (top < marginY) {
+      nextY += marginY - top;
+    }
+
+    if (nextX !== viewport.x || nextY !== viewport.y) {
+      updateViewport(() => ({
+        ...viewport,
+        x: nextX,
+        y: nextY,
+      }));
+    }
+  }, [updateViewport]);
 
   const zoomViewportAtPoint = useCallback(
     (clientX: number, clientY: number, zoomFactor: number) => {
@@ -5151,6 +6183,47 @@ export default function App() {
     }));
   }, [updateViewport]);
 
+  const focusCanvasSearchResult = useCallback((result: CanvasSearchResult | null) => {
+    if (!result) {
+      return;
+    }
+
+    setMode('canvas');
+    setSelection({ kind: result.kind, ids: [result.id] });
+    focusViewportOnRect(result.rect, isMobileViewport ? 0.3 : 0.48);
+  }, [focusViewportOnRect, isMobileViewport]);
+
+  const focusCanvasSearchMatches = useCallback((results: CanvasSearchResult[]) => {
+    if (results.length === 0) {
+      return;
+    }
+
+    const bounds = results.reduce((accumulator, item) => {
+      const maxX = Math.max(accumulator.x + accumulator.width, item.rect.x + item.rect.width);
+      const maxY = Math.max(accumulator.y + accumulator.height, item.rect.y + item.rect.height);
+      const minX = Math.min(accumulator.x, item.rect.x);
+      const minY = Math.min(accumulator.y, item.rect.y);
+      return {
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY,
+      };
+    }, {
+      x: results[0].rect.x,
+      y: results[0].rect.y,
+      width: results[0].rect.width,
+      height: results[0].rect.height,
+    });
+
+    focusViewportOnRect({
+      x: bounds.x - 36,
+      y: bounds.y - 28,
+      width: bounds.width + 72,
+      height: bounds.height + 56,
+    }, isMobileViewport ? 0.3 : 0.46);
+  }, [focusViewportOnRect, isMobileViewport]);
+
   const focusSelectionInViewport = useCallback(() => {
     if (mode !== 'canvas') {
       return;
@@ -5172,7 +6245,6 @@ export default function App() {
     }
 
     if (selection.kind === 'content') {
-      focusViewportOnRect(contentCardRect, anchorY);
       return;
     }
 
@@ -5240,7 +6312,6 @@ export default function App() {
     }
   }, [
     allSubgraphFrameMap,
-    contentCardRect,
     documentState,
     focusViewportOnRect,
     isMobileViewport,
@@ -5249,14 +6320,28 @@ export default function App() {
   ]);
 
   const moveViewportFromMiniMapRect = useCallback((miniX: number, miniY: number) => {
-    if (!miniMapModel?.viewport) {
+    if (!miniMapModel?.viewport || !miniMapModel.viewportWorldRect) {
       return;
     }
 
-    const clampedMiniX = clamp(miniX, 0, miniMapModel.width - miniMapModel.viewport.width);
-    const clampedMiniY = clamp(miniY, 0, miniMapModel.height - miniMapModel.viewport.height);
-    const worldLeft = (clampedMiniX - miniMapModel.offsetX) / miniMapModel.scale + miniMapModel.worldBounds.x;
-    const worldTop = (clampedMiniY - miniMapModel.offsetY) / miniMapModel.scale + miniMapModel.worldBounds.y;
+    const unclampedMiniX = clamp(miniX, -miniMapModel.viewport.width, miniMapModel.width);
+    const unclampedMiniY = clamp(miniY, -miniMapModel.viewport.height, miniMapModel.height);
+    const proposedWorldLeft =
+      (unclampedMiniX - miniMapModel.offsetX) / miniMapModel.scale + miniMapModel.worldBounds.x;
+    const proposedWorldTop =
+      (unclampedMiniY - miniMapModel.offsetY) / miniMapModel.scale + miniMapModel.worldBounds.y;
+    const viewportWorld = miniMapModel.viewportWorldRect;
+    const navigationBounds = miniMapModel.navigationBounds;
+    const maxWorldLeft = navigationBounds.x + navigationBounds.width - viewportWorld.width;
+    const maxWorldTop = navigationBounds.y + navigationBounds.height - viewportWorld.height;
+    const worldLeft =
+      maxWorldLeft >= navigationBounds.x
+        ? clamp(proposedWorldLeft, navigationBounds.x, maxWorldLeft)
+        : navigationBounds.x + navigationBounds.width / 2 - viewportWorld.width / 2;
+    const worldTop =
+      maxWorldTop >= navigationBounds.y
+        ? clamp(proposedWorldTop, navigationBounds.y, maxWorldTop)
+        : navigationBounds.y + navigationBounds.height / 2 - viewportWorld.height / 2;
 
     updateViewport((viewport) => ({
       ...viewport,
@@ -5342,40 +6427,26 @@ export default function App() {
     }
 
     const ids = new Set(selection.ids);
+    const applyTextContent = selection.ids.length === 1;
     commitDocument(
-      (current) => {
-        const nextNodeAnnotations = {
-          ...(current.nodeAnnotations ?? {}),
-        };
-
-        selection.ids.forEach((nodeId) => {
-          const normalizedAnnotation = draft.annotation.trim();
-          if (normalizedAnnotation) {
-            nextNodeAnnotations[nodeId] = draft.annotation;
-            return;
-          }
-          delete nextNodeAnnotations[nodeId];
-        });
-
-        return {
-          ...current,
-          nodes: current.nodes.map((node) =>
-            ids.has(node.id)
-              ? resizeNodeToContent(
-                {
-                  ...node,
-                  shape: draft.shape,
-                  fill: draft.fill,
-                  stroke: draft.stroke,
-                  textColor: draft.textColor,
-                },
-                draft.label,
-              )
-              : node,
-          ),
-          nodeAnnotations: nextNodeAnnotations,
-        };
-      },
+      (current) => ({
+        ...current,
+        nodes: current.nodes.map((node) =>
+          ids.has(node.id)
+            ? resizeNodeToContent(
+              {
+                ...node,
+                shape: draft.shape,
+                fill: draft.fill,
+                stroke: draft.stroke,
+                textColor: draft.textColor,
+              },
+              applyTextContent ? draft.label : splitEntityText(node.label).title,
+              applyTextContent ? draft.description : splitEntityText(node.label).description,
+            )
+            : node,
+        ),
+      }),
       '已更新节点',
       `已更新 ${selection.ids.length} 个节点属性。`,
     );
@@ -5446,7 +6517,7 @@ export default function App() {
           ids.has(subgraph.id)
             ? {
                 ...subgraph,
-                title: draft.title,
+                title: composeEntityText(draft.title, draft.description),
                 collapsed: draft.collapsed,
                 fill: draft.fill,
                 stroke: draft.stroke,
@@ -5488,6 +6559,24 @@ export default function App() {
       collapsed ? '已折叠附加信息框。' : '已展开附加信息框。',
     );
   }, [commitDocument, contentCardLayout, editingContent]);
+
+  const beginContentCardResize = useCallback((
+    event: React.PointerEvent<HTMLDivElement>,
+    edge: ContentCardResizeState['edge'],
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
+    setContentCardResizeState({
+      edge,
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth: contentCardBounds.width,
+      startHeight: Math.max(contentCardBounds.height, CONTENT_CARD_MIN_HEIGHT),
+      width: contentCardBounds.width,
+      height: Math.max(contentCardBounds.height, CONTENT_CARD_MIN_HEIGHT),
+    });
+  }, [contentCardBounds.height, contentCardBounds.width]);
 
   const applyContentInspectorDraft = useCallback((draft: ContentInspectorDraft = contentInspectorDraft) => {
     commitDocument(
@@ -5536,7 +6625,8 @@ export default function App() {
   }, [commitDocument, projectInspectorDraft]);
 
   const commitSubgraphTitleEdit = useCallback((subgraphId: string, nextTitle = editingSubgraphTitle) => {
-    const normalizedTitle = nextTitle.trim() || '未命名分组';
+    const { title, description } = splitEntityText(nextTitle);
+    const normalizedTitle = composeEntityText(title || '未命名分组', description);
 
     commitDocument(
       (current) => ({
@@ -5552,12 +6642,14 @@ export default function App() {
     );
 
     setEditingSubgraphId(null);
+    setEditingSubgraphField('title');
     setEditingSubgraphTitle('');
   }, [commitDocument, editingSubgraphTitle]);
 
-  const startSubgraphTitleEdit = useCallback((subgraph: GraphSubgraph) => {
+  const startSubgraphTitleEdit = useCallback((subgraph: GraphSubgraph, field: InlineNodeField = 'title') => {
     setEditingSubgraphId(subgraph.id);
-    setEditingSubgraphTitle(subgraph.title);
+    setEditingSubgraphField(field);
+    setEditingSubgraphTitle(normalizeInlineEntityText(subgraph.title));
     setSelection({ kind: 'subgraph', ids: [subgraph.id] });
   }, []);
 
@@ -5598,25 +6690,47 @@ export default function App() {
 
   const compactLayout = useCallback(() => {
     commitDocument(
-      (current) => ({
-        ...current,
-        nodes: tidyDocumentNodes(current),
-      }),
+      (current) => {
+        const scopedNodeIds = collectLayoutScopeNodeIds(current, selection);
+        if (!scopedNodeIds) {
+          return {
+            ...current,
+            nodes: tidyDocumentNodes(current),
+          };
+        }
+
+        const scopedDocument = buildLayoutScopeDocument(current, scopedNodeIds, selection);
+        return {
+          ...current,
+          nodes: mergeScopedLayoutNodes(current, tidyDocumentNodes(scopedDocument)),
+        };
+      },
       '已整理布局',
       '已根据当前排布做理线、压缩间距和局部避让。',
     );
-  }, [commitDocument]);
+  }, [commitDocument, selection]);
 
   const autoLayout = useCallback(() => {
     commitDocument(
-      (current) => ({
-        ...current,
-        nodes: layoutDocumentNodes(current),
-      }),
+      (current) => {
+        const scopedNodeIds = collectLayoutScopeNodeIds(current, selection);
+        if (!scopedNodeIds) {
+          return {
+            ...current,
+            nodes: layoutDocumentNodes(current),
+          };
+        }
+
+        const scopedDocument = buildLayoutScopeDocument(current, scopedNodeIds, selection);
+        return {
+          ...current,
+          nodes: mergeScopedLayoutNodes(current, layoutDocumentNodes(scopedDocument)),
+        };
+      },
       '已重排布局',
       '已按拓扑结构重新布局，优先减少打结、遮挡和无效留白。',
     );
-  }, [commitDocument]);
+  }, [commitDocument, selection]);
 
   const createNodeAtForSources = useCallback((
     point: Point,
@@ -5624,24 +6738,24 @@ export default function App() {
     edgeType: GraphEdge['type'] = 'solid',
     forcedSubgraphId?: string | null,
   ) => {
-    const id = nextNodeId(documentState.nodes);
+    const id = nextNodeId(documentState.nodes, '新建节点');
     const selectionSubgraph =
       selection.kind === 'subgraph' && selection.ids.length === 1 ? selection.ids[0] : null;
     const targetSubgraphId = forcedSubgraphId === undefined ? selectionSubgraph : forcedSubgraphId;
-    const draftNode = buildNode(id, '新建内容', point, targetSubgraphId);
+    const draftNode = buildNode(id, '新建节点', point, targetSubgraphId);
     const subgraphExclusions = getSubgraphAncestryIds(targetSubgraphId, fullSubgraphLookup);
     const targetFrame = targetSubgraphId
       ? allSubgraphFrameMap.get(targetSubgraphId) ?? null
       : null;
     const safeRect = searchFreeRect(
       getNodeRectAt(draftNode, point),
-      buildCollisionObstacles(
-        documentState,
-        documentState.nodes,
-        new Set<string>(),
-        subgraphExclusions,
-        contentCardRect,
-      ),
+        buildCollisionObstacles(
+          documentState,
+          documentState.nodes,
+          new Set<string>(),
+          subgraphExclusions,
+          null,
+        ),
       sourceIds[0]
         ? (() => {
             const sourceEndpoint = edgeEndpointMap.get(sourceIds[0]);
@@ -5699,10 +6813,13 @@ export default function App() {
     );
 
     setSelection({ kind: 'node', ids: [id] });
+    setEditingNodeId(id);
+    setEditingNodeField('title');
+    setEditingNodeSelectAll(true);
+    setEditingLabel(newNode.label);
   }, [
     allSubgraphFrameMap,
     commitDocument,
-    contentCardRect,
     documentState,
     edgeEndpointMap,
     fullSubgraphLookup,
@@ -5725,7 +6842,7 @@ export default function App() {
 
   const createNodesFromShortcut = useCallback((
     sourceNodes: GraphNode[],
-    relation: 'linked' | 'sibling',
+    relation: 'linked' | 'sibling' | 'mirrored',
   ) => {
     if (sourceNodes.length === 0) {
       return;
@@ -5736,9 +6853,9 @@ export default function App() {
     const newEdges: GraphEdge[] = [];
 
     sourceNodes.forEach((sourceNode) => {
-      const id = nextNodeId(workingNodes);
+      const id = nextNodeId(workingNodes, '新建节点');
       const desiredPoint = getShortcutNodePlacement(sourceNode, documentState.direction, relation);
-      const draftNode = buildNode(id, '新建内容', desiredPoint, sourceNode.subgraphId);
+      const draftNode = buildNode(id, '新建节点', desiredPoint, sourceNode.subgraphId);
       const subgraphExclusions = getSubgraphAncestryIds(sourceNode.subgraphId, fullSubgraphLookup);
       const targetFrame = sourceNode.subgraphId
         ? allSubgraphFrameMap.get(sourceNode.subgraphId) ?? null
@@ -5751,7 +6868,7 @@ export default function App() {
           collisionNodes,
           new Set<string>(),
           subgraphExclusions,
-          contentCardRect,
+          null,
         ),
         {
           x: desiredPoint.x - sourceNode.x,
@@ -5785,6 +6902,20 @@ export default function App() {
           strokeColor: defaultEdgeStyle.strokeColor,
           strokeWidth: defaultEdgeStyle.strokeWidth,
         });
+      } else if (relation === 'mirrored') {
+        documentState.edges
+          .filter((edge) => edge.to === sourceNode.id)
+          .forEach((edge) => {
+            newEdges.push({
+              id: crypto.randomUUID(),
+              from: edge.from,
+              to: id,
+              label: edge.label,
+              type: edge.type,
+              strokeColor: edge.strokeColor,
+              strokeWidth: edge.strokeWidth,
+            });
+          });
       }
     });
 
@@ -5792,24 +6923,30 @@ export default function App() {
       (current) => ({
         ...current,
         nodes: [...current.nodes, ...newNodes],
-        edges: relation === 'linked' ? [...current.edges, ...newEdges] : current.edges,
+        edges: relation === 'sibling' ? current.edges : [...current.edges, ...newEdges],
       }),
-      relation === 'linked' ? '已创建节点' : '已创建同级节点',
+      relation === 'linked' ? '已创建节点' : relation === 'mirrored' ? '已镜像创建节点' : '已创建同级节点',
       sourceNodes.length > 1
         ? relation === 'linked'
           ? `已为 ${sourceNodes.length} 个选中节点分别创建并连接新节点。`
+          : relation === 'mirrored'
+            ? `已为 ${sourceNodes.length} 个选中节点分别创建同级镜像节点。`
           : `已为 ${sourceNodes.length} 个选中节点分别创建同级节点。`
         : relation === 'linked'
           ? `已创建 ${newNodes[0]?.id ?? '新节点'}，并从 ${sourceNodes[0]?.id ?? '当前节点'} 建立连接。`
+          : relation === 'mirrored'
+            ? `已在 ${sourceNodes[0]?.id ?? '当前节点'} 同层级创建 ${newNodes[0]?.id ?? '新节点'}，并复制其入线关系。`
           : `已在 ${sourceNodes[0]?.id ?? '当前节点'} 同层级创建 ${newNodes[0]?.id ?? '新节点'}。`,
     );
 
     setSelection({ kind: 'node', ids: newNodes.map((node) => node.id) });
     if (newNodes.length === 1) {
       setEditingNodeId(newNodes[0].id);
+      setEditingNodeField('title');
+      setEditingNodeSelectAll(true);
       setEditingLabel(newNodes[0].label);
     }
-  }, [allSubgraphFrameMap, commitDocument, contentCardRect, documentState, fullSubgraphLookup]);
+  }, [allSubgraphFrameMap, commitDocument, documentState, fullSubgraphLookup]);
 
   const deleteSelection = useCallback(() => {
     if (selection.kind === 'none' || selection.kind === 'content' || selection.ids.length === 0) {
@@ -5860,7 +6997,7 @@ export default function App() {
           ...Array.from(nodeIdMap.values()).map((id) =>
             buildNode(id, id, { x: 0, y: 0 }, null),
           ),
-        ]);
+        ], splitEntityText(node.label).title || '未命名内容');
         nodeIdMap.set(node.id, nextId);
         return {
           ...resizeNodeToContent(node, node.label),
@@ -5920,7 +7057,7 @@ export default function App() {
     const idMap = new Map<string, string>();
     const workingNodes = [...documentState.nodes];
     const pastedNodes = clipboard.nodes.map((node) => {
-      const nextId = nextNodeId(workingNodes);
+      const nextId = nextNodeId(workingNodes, splitEntityText(node.label).title || '未命名内容');
       idMap.set(node.id, nextId);
       const nextNode = {
         ...resizeNodeToContent(node, node.label),
@@ -6003,48 +7140,322 @@ export default function App() {
 
   const exportMarkdown = useCallback(() => {
     downloadFile(
-      `${(documentState.projectName ?? 'diagram').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'diagram'}.md`,
+      `${(documentState.projectName ?? 'diagram').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'diagram'}.lmd`,
       documentState.markdown ?? '',
       'text/markdown;charset=utf-8',
     );
   }, [documentState.markdown, documentState.projectName]);
 
-  const exportCanvasImage = useCallback(async () => {
-    const board = canvasBoardRef.current;
-    if (!board) {
-      return;
+  const buildCanvasSvgMarkup = useCallback(() => {
+    const bounds = canvasExportBounds;
+    if (!bounds.width || !bounds.height) {
+      return null;
     }
 
-    const clone = board.cloneNode(true) as HTMLDivElement;
-    clone.querySelectorAll(
-      '.graph-node__connector, .subgraph-frame__connector, .subgraph-frame__action, .content-card__action',
-    ).forEach((element) => element.remove());
-    clone.style.transform = `translate(${-canvasExportBounds.x}px, ${-canvasExportBounds.y}px)`;
-    clone.style.transformOrigin = 'top left';
+    const subgraphLookup = new Map(documentState.subgraphs.map((subgraph) => [subgraph.id, subgraph]));
+    const gridOffsetX = ((-bounds.x % 24) + 24) % 24;
+    const gridOffsetY = ((-bounds.y % 24) + 24) % 24;
+    const markerIds = new Map<string, string>();
+    const markerDefs: string[] = [];
 
-    const cssText = collectDocumentCssText();
-    const wrapperMarkup = `
-      <div xmlns="http://www.w3.org/1999/xhtml" style="width:${canvasExportBounds.width}px;height:${canvasExportBounds.height}px;overflow:hidden;position:relative;background:
-        linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px),
-        linear-gradient(180deg, rgba(17,19,23,1), rgba(20,23,29,1));
-        background-size:24px 24px,24px 24px,100% 100%;
-        background-position:${-canvasExportBounds.x}px ${-canvasExportBounds.y}px, ${-canvasExportBounds.x}px ${-canvasExportBounds.y}px, 0 0;">
-        <style>${cssText}</style>
-        ${clone.outerHTML}
-      </div>
-    `;
-    const svgMarkup = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="${canvasExportBounds.width}" height="${canvasExportBounds.height}" viewBox="0 0 ${canvasExportBounds.width} ${canvasExportBounds.height}">
-        <foreignObject width="100%" height="100%">${wrapperMarkup}</foreignObject>
+    const sceneX = -bounds.x;
+    const sceneY = -bounds.y;
+
+    const ensureMarkerId = (color: string) => {
+      const existing = markerIds.get(color);
+      if (existing) {
+        return existing;
+      }
+
+      const id = `edge-arrow-${markerIds.size}`;
+      markerIds.set(color, id);
+      markerDefs.push(`
+        <marker id="${id}" markerWidth="13.2" markerHeight="13.2" refX="10.6" refY="6.6" orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0 L13.2,6.6 L0,13.2 z" fill="${escapeSvgText(color)}" stroke="${escapeSvgText(mixColors(color, '#0f172a', 0.22))}" stroke-width="0.45" />
+        </marker>
+      `);
+      return id;
+    };
+
+    const buildShapeMarkup = (
+      shape: NodeShape,
+      rect: Rect,
+      attrs: Record<string, string | number>,
+    ) => {
+      const attrText = Object.entries(attrs)
+        .map(([key, value]) => ` ${key}="${escapeSvgText(String(value))}"`)
+        .join('');
+
+      switch (shape) {
+        case 'diamond': {
+          const points = [
+            `${rect.x + rect.width * 0.12},${rect.y + rect.height * 0.5}`,
+            `${rect.x + rect.width * 0.5},${rect.y + rect.height * 0.06}`,
+            `${rect.x + rect.width * 0.88},${rect.y + rect.height * 0.5}`,
+            `${rect.x + rect.width * 0.5},${rect.y + rect.height * 0.94}`,
+          ].join(' ');
+          return `<polygon points="${points}"${attrText} />`;
+        }
+        case 'hexagon': {
+          const points = [
+            `${rect.x + rect.width * 0.15},${rect.y}`,
+            `${rect.x + rect.width * 0.85},${rect.y}`,
+            `${rect.x + rect.width},${rect.y + rect.height * 0.5}`,
+            `${rect.x + rect.width * 0.85},${rect.y + rect.height}`,
+            `${rect.x + rect.width * 0.15},${rect.y + rect.height}`,
+            `${rect.x},${rect.y + rect.height * 0.5}`,
+          ].join(' ');
+          return `<polygon points="${points}"${attrText} />`;
+        }
+        case 'circle': {
+          return `<rect x="${rect.x}" y="${rect.y}" width="${rect.width}" height="${rect.height}" rx="${Math.min(rect.width, rect.height) / 2}" ry="${Math.min(rect.width, rect.height) / 2}"${attrText} />`;
+        }
+        case 'round': {
+          return `<rect x="${rect.x}" y="${rect.y}" width="${rect.width}" height="${rect.height}" rx="${Math.min(rect.height / 2, 999)}" ry="${Math.min(rect.height / 2, 999)}"${attrText} />`;
+        }
+        case 'database':
+        case 'subroutine':
+        case 'rect':
+        default:
+          return `<rect x="${rect.x}" y="${rect.y}" width="${rect.width}" height="${rect.height}" rx="18" ry="18"${attrText} />`;
+      }
+    };
+
+    const buildTextBlock = (
+      lines: string[],
+      centerX: number,
+      centerY: number,
+      lineHeight: number,
+      fontSize: number,
+      fontWeight: number,
+      fill: string,
+    ) => {
+      const startY = centerY - ((lines.length - 1) * lineHeight) / 2;
+      return `
+        <text x="${centerX}" fill="${escapeSvgText(fill)}" font-size="${fontSize}" font-weight="${fontWeight}" text-anchor="middle" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+          ${lines
+            .map(
+              (line, index) =>
+                `<tspan x="${centerX}" y="${startY + index * lineHeight}" dominant-baseline="middle">${escapeSvgText(line || ' ')}</tspan>`,
+            )
+            .join('')}
+        </text>
+      `;
+    };
+
+    const subgraphMarkup = [...subgraphFrames]
+      .sort((left, right) => left.depth - right.depth)
+      .map((frame) => {
+        const subgraph = subgraphLookup.get(frame.id);
+        if (!subgraph) {
+          return '';
+        }
+
+        const style = getSubgraphStyle(subgraph);
+        const parts = splitEntityText(subgraph.title);
+        const titleLines = wrapSvgTextLines(parts.title, Math.max(9, Math.floor((frame.width - 80) / 10)));
+        const descriptionLines = parts.description
+          ? wrapSvgTextLines(parts.description, Math.max(9, Math.floor((frame.width - 80) / 8)))
+          : [];
+        const headerFill = mixColors(style.stroke, style.fill, 0.82);
+        const titleText = buildTextBlock(
+          titleLines,
+          frame.x + frame.width / 2,
+          frame.y + 20 + (descriptionLines.length > 0 ? 0 : 1),
+          20,
+          15,
+          780,
+          style.textColor,
+        );
+        const descriptionText = descriptionLines.length > 0
+          ? buildTextBlock(
+              descriptionLines,
+              frame.x + frame.width / 2,
+              frame.y + 42,
+              15,
+              11,
+              540,
+              withAlpha(style.textColor, 0.78),
+            )
+          : '';
+
+        const summaryChips = subgraph.collapsed
+          ? frame.summaryLabels.slice(0, 4).map((label, index) => {
+              const chipX = frame.x + 24;
+              const chipY = frame.y + frame.headerHeight + 20 + index * 24;
+              return `
+                <rect x="${chipX}" y="${chipY}" width="${Math.min(frame.width - 48, 168)}" height="18" rx="9" fill="${escapeSvgText(withAlpha(style.fill, 0.5))}" stroke="${escapeSvgText(withAlpha(style.stroke, 0.16))}" stroke-width="0.8" />
+                <text x="${chipX + 10}" y="${chipY + 9}" dominant-baseline="middle" fill="${escapeSvgText(withAlpha(style.textColor, 0.82))}" font-size="10.5" font-weight="600" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">${escapeSvgText(label.split(/\r?\n/)[0])}</text>
+              `;
+            }).join('')
+          : '';
+
+        return `
+          <g>
+            <rect x="${frame.x}" y="${frame.y}" width="${frame.width}" height="${frame.height}" rx="20" ry="20" fill="${escapeSvgText(withAlpha(style.fill, 0.16))}" stroke="${escapeSvgText(style.stroke)}" stroke-width="2.2" />
+            <rect x="${frame.x}" y="${frame.y}" width="${frame.width}" height="${frame.headerHeight}" rx="20" ry="20" fill="${escapeSvgText(headerFill)}" />
+            <rect x="${frame.x}" y="${frame.y + frame.headerHeight - 20}" width="${frame.width}" height="20" fill="${escapeSvgText(headerFill)}" />
+            ${titleText}
+            ${descriptionText}
+            ${summaryChips}
+          </g>
+        `;
+      })
+      .join('');
+
+    const nodeMarkup = visibleNodes.map((node) => {
+      const parts = splitEntityText(node.label);
+      const titleLines = wrapSvgTextLines(parts.title, Math.max(8, Math.floor((node.width - 34) / 11)));
+      const descriptionLines = wrapSvgTextLines(
+        parts.description || '（空）',
+        Math.max(8, Math.floor((node.width - 30) / 8.5)),
+      );
+      const titleHeight = Math.min(
+        node.height - 22,
+        Math.max(parts.description ? 54 : 66, 24 + titleLines.length * 24 + (parts.description ? 6 : 14)),
+      );
+      const descriptionHeight = Math.max(22, node.height - titleHeight);
+      const clipId = `clip-node-${node.id.replace(/[^a-z0-9_-]+/gi, '-')}`;
+      const titleFill = mixColors(node.stroke, node.fill, 0.84);
+      const bodyFill = mixColors(node.fill, '#ffffff', 0.04);
+      const emptyDescription = !parts.description;
+      const titleBlock = buildTextBlock(
+        titleLines,
+        node.x + node.width / 2,
+        node.y + titleHeight / 2,
+        22,
+        17,
+        800,
+        node.textColor,
+      );
+      const descriptionBlock = buildTextBlock(
+        descriptionLines,
+        node.x + node.width / 2,
+        node.y + titleHeight + descriptionHeight / 2,
+        18,
+        emptyDescription ? 12 : 14,
+        emptyDescription ? 560 : 560,
+        emptyDescription ? withAlpha(node.textColor, 0.44) : node.textColor,
+      );
+
+      return `
+        <g>
+          <defs>
+            <clipPath id="${clipId}">
+              ${buildShapeMarkup(node.shape, node, {})}
+            </clipPath>
+          </defs>
+          ${buildShapeMarkup(node.shape, node, {
+            fill: bodyFill,
+            stroke: node.stroke,
+            'stroke-width': 2.8,
+          })}
+          <g clip-path="url(#${clipId})">
+            <rect x="${node.x}" y="${node.y}" width="${node.width}" height="${titleHeight}" fill="${escapeSvgText(titleFill)}" />
+            <rect x="${node.x}" y="${node.y + titleHeight}" width="${node.width}" height="${descriptionHeight}" fill="${escapeSvgText(bodyFill)}" />
+            <line x1="${node.x}" y1="${node.y + titleHeight}" x2="${node.x + node.width}" y2="${node.y + titleHeight}" stroke="${escapeSvgText(withAlpha(node.stroke, 0.22))}" stroke-width="1" />
+          </g>
+          ${titleBlock}
+          ${descriptionBlock}
+        </g>
+      `;
+    }).join('');
+
+    const edgeMarkup = visibleEdges.map((edge) => {
+      const normalizedEdge = normalizeEdgeStyle(edge);
+      const fromNode = edgeEndpointMap.get(edge.from);
+      const toNode = edgeEndpointMap.get(edge.to);
+      if (!fromNode || !toNode) {
+        return '';
+      }
+
+      const isGroupEdge = fromNode.kind === 'subgraph' || toNode.kind === 'subgraph';
+      const geometry = buildEdgeGeometry(
+        fromNode,
+        toNode,
+        edgeLaneMap.get(edge.id) ?? 0,
+        edgeEndpointOffsetMap.get(edge.id),
+      );
+      const inheritsSourceColor = shouldInheritSourceEdgeColor(normalizedEdge.strokeColor);
+      const edgeBaseColor = inheritsSourceColor ? getEndpointAccentColor(fromNode) : normalizedEdge.strokeColor;
+      const baseStrokeWidth = isGroupEdge ? normalizedEdge.strokeWidth * 2 : normalizedEdge.strokeWidth;
+      const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 4.2 : 3.2);
+      const outlineStroke = mixColors(edgeBaseColor, '#0f172a', isGroupEdge ? 0.56 : 0.46);
+      const outlineWidth = visualStrokeWidth + (isGroupEdge ? 0.34 : 0.26);
+      const markerId = edge.type === 'line' ? null : ensureMarkerId(edgeBaseColor);
+      const labelMetrics = edge.label ? measureEdgeLabelBadge(edge.label) : null;
+      const labelBackground = mixColors(edgeBaseColor, '#f8fafc', inheritsSourceColor ? 0.66 : 0.76);
+      const labelBorder = withAlpha(edgeBaseColor, 0.84);
+      const labelTextColor = getReadableLabelTextColor(labelBackground, edgeBaseColor);
+      const edgeLabelLines = edge.label ? edge.label.split(/\r?\n/) : [];
+
+      return `
+        <g>
+          <path d="${geometry.path}" fill="none" stroke="${escapeSvgText(outlineStroke)}" stroke-opacity="${isGroupEdge ? 0.44 : 0.34}" stroke-width="${outlineWidth}" stroke-linecap="round" stroke-linejoin="round" ${markerId ? `marker-end="url(#${markerId})"` : ''} />
+          <path d="${geometry.path}" fill="none" stroke="${escapeSvgText(edgeBaseColor)}" stroke-width="${visualStrokeWidth}" stroke-linecap="round" stroke-linejoin="round" ${markerId ? `marker-end="url(#${markerId})"` : ''} />
+          ${
+            edge.label
+              ? `
+                <rect x="${geometry.label.x - (labelMetrics?.width ?? 54) / 2}" y="${geometry.label.y - (labelMetrics?.height ?? 22) / 2}" width="${labelMetrics?.width ?? 54}" height="${labelMetrics?.height ?? 22}" rx="11" fill="${escapeSvgText(labelBackground)}" stroke="${escapeSvgText(labelBorder)}" stroke-width="1" />
+                <text x="${geometry.label.x}" fill="${escapeSvgText(labelTextColor)}" font-size="12" font-weight="650" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace">
+                  ${edgeLabelLines
+                    .map(
+                      (line, index) =>
+                        `<tspan x="${geometry.label.x}" y="${geometry.label.y + ((index - (edgeLabelLines.length - 1) / 2) * 16)}" dominant-baseline="middle">${escapeSvgText(line || ' ')}</tspan>`,
+                    )
+                    .join('')}
+                </text>
+              `
+              : ''
+          }
+        </g>
+      `;
+    }).join('');
+
+    const svg = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="${bounds.width}" height="${bounds.height}" viewBox="0 0 ${bounds.width} ${bounds.height}">
+        <defs>
+          <linearGradient id="canvas-export-bg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#111317" />
+            <stop offset="100%" stop-color="#14171d" />
+          </linearGradient>
+          <pattern id="canvas-export-grid" width="24" height="24" patternUnits="userSpaceOnUse" patternTransform="translate(${gridOffsetX} ${gridOffsetY})">
+            <path d="M 24 0 L 0 0 0 24" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
+          </pattern>
+          ${markerDefs.join('')}
+        </defs>
+        <rect width="${bounds.width}" height="${bounds.height}" fill="url(#canvas-export-bg)" />
+        <rect width="${bounds.width}" height="${bounds.height}" fill="url(#canvas-export-grid)" />
+        <g transform="translate(${sceneX} ${sceneY})">
+          ${subgraphMarkup}
+          ${edgeMarkup}
+          ${nodeMarkup}
+        </g>
       </svg>
     `;
 
+    return svg;
+  }, [
+    canvasExportBounds,
+    documentState.subgraphs,
+    edgeEndpointMap,
+    edgeEndpointOffsetMap,
+    edgeLaneMap,
+    subgraphFrames,
+    visibleEdges,
+    visibleNodes,
+  ]);
+
+  const exportCanvasImage = useCallback(async () => {
+    const svgMarkup = buildCanvasSvgMarkup();
+    if (!svgMarkup) {
+      return;
+    }
+
     const svgBlob = new Blob([svgMarkup], { type: 'image/svg+xml;charset=utf-8' });
-    const svgUrl = URL.createObjectURL(svgBlob);
+    setSaveStatus('saving');
 
     try {
-      const image = await loadImageFromUrl(svgUrl);
       const canvas = document.createElement('canvas');
       const scale = Math.min(2, window.devicePixelRatio || 1.5);
       canvas.width = Math.ceil(canvasExportBounds.width * scale);
@@ -6055,7 +7466,8 @@ export default function App() {
       }
 
       context.scale(scale, scale);
-      context.drawImage(image, 0, 0, canvasExportBounds.width, canvasExportBounds.height);
+      const renderedImage = await renderSvgMarkupToCanvasImage(svgMarkup, svgBlob);
+      renderedImage.draw(context, canvasExportBounds.width, canvasExportBounds.height);
 
       const pngBlob = await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob((blob) => {
@@ -6063,30 +7475,50 @@ export default function App() {
             resolve(blob);
             return;
           }
-          reject(new Error('PNG export failed'));
+          try {
+            const dataUrl = canvas.toDataURL('image/png');
+            const [header, body] = dataUrl.split(',');
+            if (!header.includes('image/png') || !body) {
+              reject(new Error('PNG export failed'));
+              return;
+            }
+            const binary = atob(body);
+            const buffer = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+              buffer[index] = binary.charCodeAt(index);
+            }
+            resolve(new Blob([buffer], { type: 'image/png' }));
+          } catch {
+            reject(new Error('PNG export failed'));
+          }
         }, 'image/png');
       });
 
-      downloadBlob(
+      await saveBlobWithPicker(
         `${sanitizeFilename(documentState.projectName ?? activeTab.label, 'diagram')}.png`,
         pngBlob,
+        {
+          description: 'PNG image',
+          mime: 'image/png',
+          extensions: ['.png'],
+        },
       );
+      setSaveStatus('saved');
     } catch {
-      downloadFile(
-        `${sanitizeFilename(documentState.projectName ?? activeTab.label, 'diagram')}.svg`,
-        svgMarkup,
-        'image/svg+xml;charset=utf-8',
-      );
-    } finally {
-      URL.revokeObjectURL(svgUrl);
+      setSaveStatus('error');
     }
-  }, [activeTab.label, canvasExportBounds, documentState.projectName]);
+  }, [
+    activeTab.label,
+    buildCanvasSvgMarkup,
+    canvasExportBounds.height,
+    canvasExportBounds.width,
+    documentState.projectName,
+  ]);
 
-  const copySource = useCallback(() => {
-    navigator.clipboard
-      .writeText(documentState.markdown ?? '')
-      .catch(() => {});
-  }, [documentState.markdown]);
+  const svgPreviewMarkup = useMemo(
+    () => (svgPreviewOpen ? buildCanvasSvgMarkup() ?? '' : ''),
+    [buildCanvasSvgMarkup, svgPreviewOpen],
+  );
 
   const goToMode = useCallback((nextMode: EditorMode) => {
     if (isVsCodeHost) {
@@ -6119,7 +7551,7 @@ export default function App() {
       const parsed = materializeDocument(
         parseProjectMarkdown(
           content,
-          file.name.replace(/\.md$/i, ''),
+          file.name.replace(/\.lmd$/i, ''),
           documentRef.current.layout,
         ),
       );
@@ -6251,10 +7683,10 @@ export default function App() {
         excludeAcceptAllOption: true,
         types: [
           {
-            description: 'Markdown',
+            description: 'LMD',
             accept: {
-              'text/markdown': ['.md'],
-              'text/plain': ['.md'],
+              'text/markdown': ['.lmd'],
+              'text/plain': ['.lmd'],
             },
           },
         ],
@@ -6268,7 +7700,7 @@ export default function App() {
       const item: ExplorerItem = {
         id: 'local-file-standalone',
         label: file.name,
-        meta: 'Markdown 工程',
+        meta: 'LMD 工程',
         depth: 1,
         kind: 'file',
         path: `local-file://${file.name}`,
@@ -6279,11 +7711,11 @@ export default function App() {
 
       const rootItem: ExplorerItem = {
         id: 'local-project',
-        label: file.name.replace(/\.md$/i, '') || 'local-file',
+        label: file.name.replace(/\.lmd$/i, '') || 'local-file',
         meta: '本地 Markdown 文件',
         depth: 0,
         kind: 'project',
-        path: `local-file://${file.name.replace(/\.md$/i, '') || 'local-file'}`,
+        path: `local-file://${file.name.replace(/\.lmd$/i, '') || 'local-file'}`,
         parentId: null,
       };
 
@@ -6332,10 +7764,10 @@ export default function App() {
       existingNames.add(name.toLowerCase());
     }
 
-    let filename = 'untitled.md';
+    let filename = 'untitled.lmd';
     let index = 2;
     while (existingNames.has(filename.toLowerCase())) {
-      filename = `untitled-${index}.md`;
+      filename = `untitled-${index}.lmd`;
       index += 1;
     }
 
@@ -6344,7 +7776,7 @@ export default function App() {
       const writable = await fileHandle.createWritable();
       await writable.write(
         createProjectMarkdownTemplate(
-          filename.replace(/\.md$/i, ''),
+          filename.replace(/\.lmd$/i, ''),
           'flowchart LR\n  Start[Start]',
         ),
       );
@@ -6374,12 +7806,12 @@ export default function App() {
       return;
     }
 
-    const nextNameInput = window.prompt('Rename Markdown file', item.label)?.trim();
+    const nextNameInput = window.prompt('Rename LMD file', item.label)?.trim();
     if (!nextNameInput) {
       return;
     }
 
-    const nextFilename = /\.md$/i.test(nextNameInput) ? nextNameInput : `${nextNameInput}.md`;
+    const nextFilename = /\.lmd$/i.test(nextNameInput) ? nextNameInput : `${nextNameInput}.lmd`;
     if (nextFilename === item.label) {
       return;
     }
@@ -6509,11 +7941,29 @@ export default function App() {
   }, [documentState]);
 
   useEffect(() => {
+    if (!isVsCodeHost && documentState.diagramType !== 'flowchart' && mode === 'canvas') {
+      setMode('source');
+    }
+  }, [documentState.diagramType, isVsCodeHost, mode]);
+
+  useEffect(() => {
+    editingLabelRef.current = editingLabel;
+  }, [editingLabel]);
+
+  useEffect(() => {
+    editingSubgraphTitleRef.current = editingSubgraphTitle;
+  }, [editingSubgraphTitle]);
+
+  useEffect(() => {
     documentRevisionRef.current = documentRevision;
   }, [documentRevision]);
 
   useEffect(() => {
     function syncViewportMode() {
+      if (isVsCodeHost) {
+        setIsMobileViewport(false);
+        return;
+      }
       setIsMobileViewport(window.innerWidth <= 820);
     }
 
@@ -6522,7 +7972,7 @@ export default function App() {
     return () => {
       window.removeEventListener('resize', syncViewportMode);
     };
-  }, []);
+  }, [isVsCodeHost]);
 
   useEffect(() => {
     const navigatorWithMemory = navigator as Navigator & { deviceMemory?: number };
@@ -6703,6 +8153,17 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (!isVsCodeHost) {
+      return;
+    }
+
+    vscodeApiRef.current?.postMessage({
+      type: 'lmd/revealSelection',
+      selection: buildHostSourceSelectionPayload(documentRef.current, selection),
+    });
+  }, [documentState.markdown, isVsCodeHost, selection]);
+
+  useEffect(() => {
     if (mode !== 'canvas') {
       setSidebarOpen(!isMobileViewport);
       setInspectorOpen(!isMobileViewport);
@@ -6781,6 +8242,17 @@ export default function App() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+        event.preventDefault();
+        if (!canvasSearchOpen) {
+          searchRestoreViewportRef.current = { ...documentRef.current.layout.viewport };
+        }
+        setCanvasSearchOpen(true);
+        setCanvasSearchQuery('');
+        setCanvasSearchFocusIndex(0);
+        return;
+      }
+
       if (isTypingTarget(event.target)) {
         return;
       }
@@ -6836,7 +8308,7 @@ export default function App() {
         event.key === 'Tab'
       ) {
         event.preventDefault();
-        createNodesFromShortcut(selectedNodesForShortcut, 'linked');
+        createNodesFromShortcut(selectedNodesForShortcut, event.shiftKey ? 'mirrored' : 'linked');
         return;
       }
 
@@ -6920,6 +8392,9 @@ export default function App() {
       }
 
       if ((event.metaKey || event.ctrlKey) && event.key === '3') {
+        if (isVsCodeHost) {
+          return;
+        }
         event.preventDefault();
         goToMode('history');
         return;
@@ -6927,11 +8402,25 @@ export default function App() {
 
       if (event.key === 'Escape') {
         event.preventDefault();
+        if (canvasSearchOpen) {
+          if (searchRestoreViewportRef.current) {
+            const restoreViewport = searchRestoreViewportRef.current;
+            updateViewport(() => restoreViewport);
+          }
+          searchRestoreViewportRef.current = null;
+          setCanvasSearchOpen(false);
+          setCanvasSearchQuery('');
+          setCanvasSearchFocusIndex(0);
+          return;
+        }
         setHelpDialogOpen(false);
         setEditingNodeId(null);
+        setEditingNodeField('title');
+        setEditingNodeSelectAll(false);
         setEditingLabel('');
         setEditingEdgeId(null);
         setEditingEdgeLabel('');
+        setEditingSubgraphField('title');
         setEditingContent(false);
         clearSelection();
         setConnectingState(null);
@@ -6956,7 +8445,7 @@ export default function App() {
         const targetNode = documentState.nodes.find((node) => node.id === selection.ids[0]);
         if (targetNode) {
           event.preventDefault();
-          startInlineEdit(targetNode);
+          startInlineEdit(targetNode, 'description');
         }
         return;
       }
@@ -6984,7 +8473,7 @@ export default function App() {
         const targetSubgraph = documentState.subgraphs.find((subgraph) => subgraph.id === selection.ids[0]);
         if (targetSubgraph) {
           event.preventDefault();
-          startSubgraphTitleEdit(targetSubgraph);
+          startSubgraphTitleEdit(targetSubgraph, 'description');
         }
         return;
       }
@@ -7017,6 +8506,7 @@ export default function App() {
     clearSelection,
     copySelection,
     createNodesFromShortcut,
+    canvasSearchOpen,
     documentState.nodes,
     documentState.subgraphs,
     deleteSelection,
@@ -7025,6 +8515,7 @@ export default function App() {
     editingEdgeId,
     editingNodeId,
     helpDialogOpen,
+    isVsCodeHost,
     goToMode,
     mode,
     redoDocument,
@@ -7310,17 +8801,17 @@ export default function App() {
                 }
 
                 const workingLookup = getVisibleSubgraphIds(workingDocument.subgraphs);
-                workingDocument = {
-                  ...workingDocument,
-                  nodes: resolveDraggedNodeCollision(
-                    workingDocument,
-                    dragState.ids,
-                    workingDocument.nodes,
-                    workingLookup,
-                    collisionTargetSubgraphId,
-                    contentCardRect,
-                  ),
-                };
+                    workingDocument = {
+                      ...workingDocument,
+                      nodes: resolveDraggedNodeCollision(
+                        workingDocument,
+                        dragState.ids,
+                        workingDocument.nodes,
+                        workingLookup,
+                        collisionTargetSubgraphId,
+                        null,
+                      ),
+                    };
 
                 if (resolvedTargetEdgeId && dragState.ids.length === 1) {
                   workingDocument = insertDraggedEndpointIntoEdge(
@@ -7408,7 +8899,7 @@ export default function App() {
                     workingDocument.nodes,
                     workingLookup,
                     collisionTargetSubgraphId,
-                    contentCardRect,
+                    null,
                   ),
                 };
 
@@ -7429,7 +8920,7 @@ export default function App() {
                 desiredNodes,
                 fullSubgraphLookup,
                 null,
-                contentCardRect,
+                null,
               );
 
               return {
@@ -7475,12 +8966,6 @@ export default function App() {
               boxState.toggle
                 ? toggleSelectionIds(current, 'subgraph', nextSubgraphIds)
                 : { kind: 'subgraph', ids: nextSubgraphIds },
-            );
-          } else if (intersects(rect, contentCardRect)) {
-            setSelection((current) =>
-              boxState.toggle
-                ? toggleSelectionIds(current, 'content', [CONTENT_CARD_ID])
-                : { kind: 'content', ids: [CONTENT_CARD_ID] },
             );
           } else {
             const nextEdgeIds = visibleEdges
@@ -7667,6 +9152,10 @@ export default function App() {
   }
 
   function startBackgroundInteraction(event: ReactPointerEvent<HTMLDivElement>) {
+    if (canvasSearchOpen) {
+      setCanvasSearchOpen(false);
+    }
+
     if (event.button === 1) {
       event.preventDefault();
       setPanState({
@@ -7826,38 +9315,6 @@ export default function App() {
     });
   }
 
-  function startContentDrag(event: ReactPointerEvent<HTMLDivElement>) {
-    if (editingContent) {
-      return;
-    }
-
-    const target = event.target as HTMLElement;
-    if (target.closest('button, input, textarea, a')) {
-      return;
-    }
-
-    if (event.button === 1) {
-      event.preventDefault();
-      event.stopPropagation();
-      setPanState({
-        origin: { x: event.clientX, y: event.clientY },
-        initialViewport: { ...documentState.layout.viewport },
-      });
-      return;
-    }
-
-    if (event.button !== 0) {
-      return;
-    }
-
-    event.stopPropagation();
-    if (event.shiftKey) {
-      setSelection((current) => toggleSelectionIds(current, 'content', [CONTENT_CARD_ID]));
-      return;
-    }
-    setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
-  }
-
   function startSubgraphDrag(
     event: ReactPointerEvent<HTMLDivElement>,
     subgraphId: string,
@@ -7961,6 +9418,14 @@ export default function App() {
     selection.kind === 'node' && selection.ids.length === 1
       ? documentState.nodes.find((node) => node.id === selection.ids[0]) ?? null
       : null;
+  const selectedNodes = useMemo(
+    () => (
+      selection.kind === 'node'
+        ? documentState.nodes.filter((node) => selection.ids.includes(node.id))
+        : []
+    ),
+    [documentState.nodes, selection.ids, selection.kind],
+  );
   const selectedEdge =
     selection.kind === 'edge' && selection.ids.length === 1
       ? (() => {
@@ -7974,15 +9439,22 @@ export default function App() {
       : null;
   const selectedContent =
     selection.kind === 'content' && selection.ids[0] === CONTENT_CARD_ID;
-  const nodeAnnotationMap = useMemo(
-    () => getNodeAnnotationMap(documentState),
-    [documentState],
-  );
-  const selectedNodePresetId = selectedNode
+  const nodeStyleSelectionSource =
+    selectedNodes.length === 1
+      ? selectedNodes[0]
+      : selectedNodes.length > 1 &&
+          selectedNodes.every((node) =>
+            node.fill === selectedNodes[0]?.fill &&
+            node.stroke === selectedNodes[0]?.stroke &&
+            node.textColor === selectedNodes[0]?.textColor,
+          )
+        ? selectedNodes[0]
+        : null;
+  const selectedNodePresetId = nodeStyleSelectionSource
     ? nodeStylePresets.find((preset) =>
-      preset.fill === selectedNode.fill &&
-      preset.stroke === selectedNode.stroke &&
-      preset.textColor === selectedNode.textColor,
+      preset.fill === nodeStyleSelectionSource.fill &&
+      preset.stroke === nodeStyleSelectionSource.stroke &&
+      preset.textColor === nodeStyleSelectionSource.textColor,
     )?.id ?? null
     : null;
   const selectionLabel =
@@ -7995,9 +9467,7 @@ export default function App() {
   const visibleLeftPanels = isVsCodeHost
     ? leftPanelMeta.filter((item) => item.id === 'graph')
     : leftPanelMeta;
-  const visibleModeMeta = isVsCodeHost
-    ? modeMeta.filter((entry) => entry.id === 'canvas')
-    : modeMeta;
+  const visibleModeMeta = isVsCodeHost ? [] : modeMeta;
   const vscodeFileLabel = hostConfig.fileName ?? 'untitled.lmd';
   const supportsLocalProjectPicker =
     typeof (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function';
@@ -8031,10 +9501,10 @@ export default function App() {
   const appShellClassName = `app-shell${isMobileViewport ? ' app-shell--mobile' : ''}${isConstrainedDevice ? ' app-shell--constrained' : ''}${isVsCodeHost ? ' app-shell--vscode' : ''}`;
   const mobileOverlayOpen = isMobileViewport && (showSidebar || mobileSourcePreviewOpen);
   const workspaceStyle = useMemo(() => ({
-    '--nav-width': `${NAV_RAIL_WIDTH}px`,
+    '--nav-width': `${isVsCodeHost ? 0 : NAV_RAIL_WIDTH}px`,
     '--sidebar-width': showSidebar ? `${clampPanelWidth('left', sidebarWidth)}px` : '0px',
     '--inspector-width': showInspector ? `${clampPanelWidth('right', inspectorWidth)}px` : '0px',
-  }) as CSSProperties, [clampPanelWidth, inspectorWidth, showInspector, showSidebar, sidebarWidth]);
+  }) as CSSProperties, [clampPanelWidth, inspectorWidth, isVsCodeHost, showInspector, showSidebar, sidebarWidth]);
   const startPanelResize = useCallback((side: 'left' | 'right', event: ReactPointerEvent<HTMLDivElement>) => {
     if (isMobileViewport) {
       return;
@@ -8050,19 +9520,21 @@ export default function App() {
   }, [inspectorWidth, isMobileViewport, sidebarWidth]);
 
   useEffect(() => {
-    if (!selectedNode) {
+    if (selectedNodes.length === 0) {
       return;
     }
+    const primaryNode = selectedNodes[0];
+    const parts = splitEntityText(primaryNode.label);
 
     setNodeInspectorDraft({
-      label: selectedNode.label,
-      annotation: nodeAnnotationMap[selectedNode.id] ?? '',
-      shape: selectedNode.shape,
-      fill: selectedNode.fill,
-      stroke: selectedNode.stroke,
-      textColor: selectedNode.textColor,
+      label: parts.title,
+      description: parts.description,
+      shape: primaryNode.shape,
+      fill: primaryNode.fill,
+      stroke: primaryNode.stroke,
+      textColor: primaryNode.textColor,
     });
-  }, [nodeAnnotationMap, selectedNode]);
+  }, [selectedNodes]);
 
   useEffect(() => {
     if (!selectedEdge) {
@@ -8081,9 +9553,11 @@ export default function App() {
     if (!selectedSubgraph) {
       return;
     }
+    const parts = splitEntityText(selectedSubgraph.title);
 
     setSubgraphInspectorDraft({
-      title: selectedSubgraph.title,
+      title: parts.title,
+      description: parts.description,
       collapsed: selectedSubgraph.collapsed,
       fill: selectedSubgraph.fill,
       stroke: selectedSubgraph.stroke,
@@ -8128,7 +9602,139 @@ export default function App() {
 
     setEditingSubgraphId(null);
     setEditingSubgraphTitle('');
+    setEditingSubgraphField('title');
   }, [selection.kind]);
+
+  useEffect(() => {
+    if (!editingNodeId) {
+      return;
+    }
+
+    const editor = editingNodeField === 'title'
+      ? nodeTitleEditorRef.current
+      : nodeDescriptionEditorRef.current;
+    if (!editor) {
+      return;
+    }
+
+    const value = getInlineEntityFieldValue(editingLabelRef.current, editingNodeField);
+    window.requestAnimationFrame(() => {
+      focusControlWithoutScroll(editor);
+      const caretPosition = value.length;
+      if (editingNodeSelectAll) {
+        editor.select();
+        editor.selectionStart = 0;
+        editor.selectionEnd = value.length;
+      } else {
+        editor.selectionStart = caretPosition;
+        editor.selectionEnd = caretPosition;
+      }
+      if (editingNodeSelectAll) {
+        setEditingNodeSelectAll(false);
+      }
+    });
+  }, [editingNodeField, editingNodeId, editingNodeSelectAll]);
+
+  useEffect(() => {
+    if (!editingNodeId) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      persistInlineNodeDraft(editingNodeId, {
+        historyTitle: '已暂存节点',
+        historyDetail: '已根据输入停顿自动暂存节点草稿。',
+      });
+    }, 1200);
+
+    return () => window.clearTimeout(timer);
+  }, [editingLabel, editingNodeId, persistInlineNodeDraft]);
+
+  useEffect(() => {
+    if (!editingSubgraphId || !subgraphEditorRef.current) {
+      return;
+    }
+
+    const editor = subgraphEditorRef.current;
+    const range = getEntitySelectionRange(editingSubgraphTitleRef.current, editingSubgraphField);
+    window.requestAnimationFrame(() => {
+      focusControlWithoutScroll(editor);
+      editor.selectionStart = range.start;
+      editor.selectionEnd = range.end;
+    });
+  }, [editingSubgraphField, editingSubgraphId]);
+
+  useLayoutEffect(() => {
+    if (!editingNodeId && !editingSubgraphId && !editingContent) {
+      return;
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      resetWorkbenchScrollOffsets();
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    contentInspectorDraft.markdown,
+    editingContent,
+    editingLabel,
+    editingNodeId,
+    editingSubgraphId,
+    editingSubgraphTitle,
+    resetWorkbenchScrollOffsets,
+  ]);
+
+  useLayoutEffect(() => {
+    if (!editingNodeId) {
+      return;
+    }
+
+    const editingNode = documentState.nodes.find((node) => node.id === editingNodeId) ?? null;
+    if (!editingNode) {
+      return;
+    }
+
+    const { title, description } = splitEntityText(editingLabel || ' ');
+    const nextSize = measureNodeContentSize(title, description);
+    keepNodeEditorVisibleInCanvas({
+      x: editingNode.x,
+      y: editingNode.y,
+      width: nextSize.width,
+      height: nextSize.height,
+    });
+  }, [
+    documentState.nodes,
+    editingLabel,
+    editingNodeId,
+    keepNodeEditorVisibleInCanvas,
+  ]);
+
+  useEffect(() => {
+    if (!editingNodeId && !editingSubgraphId && !editingContent) {
+      return;
+    }
+
+    const handleScroll = () => {
+      resetWorkbenchScrollOffsets();
+    };
+
+    const scrollTargets = [workspaceRef.current, workspaceMainRef.current, canvasRef.current]
+      .filter((target): target is HTMLElement => target instanceof HTMLElement);
+
+    scrollTargets.forEach((target) => {
+      target.addEventListener('scroll', handleScroll, { passive: true });
+    });
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    window.visualViewport?.addEventListener('scroll', handleScroll, { passive: true });
+
+    return () => {
+      scrollTargets.forEach((target) => {
+        target.removeEventListener('scroll', handleScroll);
+      });
+      window.removeEventListener('scroll', handleScroll);
+      window.visualViewport?.removeEventListener('scroll', handleScroll);
+    };
+  }, [editingContent, editingNodeId, editingSubgraphId, resetWorkbenchScrollOffsets]);
 
   useEffect(() => {
     localStorage.setItem(storageKeys.aiSettings, JSON.stringify(aiSettings));
@@ -8154,6 +9760,38 @@ export default function App() {
       localStorage.removeItem(storageKeys.aiLastMarkdown);
     }
   }, [aiLastMarkdown]);
+
+  useEffect(() => {
+    if (!canvasSearchOpen) {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      canvasSearchInputRef.current?.focus();
+      canvasSearchInputRef.current?.select();
+    });
+  }, [canvasSearchOpen]);
+
+  useEffect(() => {
+    if (!canvasSearchOpen) {
+      return;
+    }
+
+    if (!searchRestoreViewportRef.current) {
+      searchRestoreViewportRef.current = { ...documentState.layout.viewport };
+    }
+
+    setCanvasSearchFocusIndex(0);
+    if (canvasSearchQuery.trim()) {
+      focusCanvasSearchMatches(canvasSearchResults);
+    }
+  }, [
+    canvasSearchOpen,
+    canvasSearchQuery,
+    canvasSearchResults,
+    documentState.layout.viewport,
+    focusCanvasSearchMatches,
+  ]);
 
   useEffect(() => {
     if (!panelResizeState || isMobileViewport) {
@@ -8193,6 +9831,85 @@ export default function App() {
       document.body.style.userSelect = previousUserSelect;
     };
   }, [clampPanelWidth, isMobileViewport, panelResizeState]);
+
+  useEffect(() => {
+    if (!contentCardResizeState) {
+      return;
+    }
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor =
+      contentCardResizeState.edge === 'right'
+        ? 'ew-resize'
+        : contentCardResizeState.edge === 'bottom'
+          ? 'ns-resize'
+          : 'nwse-resize';
+    document.body.style.userSelect = 'none';
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const deltaX = event.clientX - contentCardResizeState.startX;
+      const deltaY = event.clientY - contentCardResizeState.startY;
+      const nextWidth = clamp(
+        contentCardResizeState.startWidth +
+          (contentCardResizeState.edge === 'bottom' ? 0 : deltaX),
+        CONTENT_CARD_MIN_WIDTH,
+        CONTENT_CARD_MAX_WIDTH,
+      );
+      const nextHeight = clamp(
+        contentCardResizeState.startHeight +
+          (contentCardResizeState.edge === 'right' ? 0 : deltaY),
+        CONTENT_CARD_MIN_HEIGHT,
+        CONTENT_CARD_MAX_HEIGHT,
+      );
+
+      setContentCardResizeState((current) => (
+        current
+          ? {
+              ...current,
+              width: nextWidth,
+              height: nextHeight,
+            }
+          : current
+      ));
+    };
+
+    const stopResize = () => {
+      setContentCardResizeState((current) => {
+        if (!current) {
+          return current;
+        }
+
+        const finalWidth = clamp(current.width, CONTENT_CARD_MIN_WIDTH, CONTENT_CARD_MAX_WIDTH);
+        const finalHeight = clamp(current.height, CONTENT_CARD_MIN_HEIGHT, CONTENT_CARD_MAX_HEIGHT);
+        commitDocument(
+          (document) => withContentCardLayout(document, {
+            ...contentCardLayout,
+            width: finalWidth,
+            height: finalHeight,
+          }),
+          '已调整附加信息',
+          '已更新附加信息窗口尺寸。',
+        );
+
+        return null;
+      });
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopResize);
+    window.addEventListener('pointercancel', stopResize);
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopResize);
+      window.removeEventListener('pointercancel', stopResize);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+  }, [commitDocument, contentCardLayout, contentCardResizeState]);
 
   useEffect(() => {
     if (isMobileViewport) {
@@ -8289,10 +10006,11 @@ export default function App() {
           break;
         }
         case 'createNode': {
+          const nextLabel = operation.label?.trim() || '新建节点';
+          const nextParts = splitEntityText(nextLabel);
           const nodeId = operation.nodeId && !next.nodes.some((node) => node.id === operation.nodeId)
             ? operation.nodeId
-            : nextNodeId(next.nodes);
-          const label = operation.label?.trim() || '新建内容';
+            : nextNodeId(next.nodes, nextParts.title || '新建节点');
           const subgraphId = operation.subgraphId ?? null;
           if (subgraphId && !next.subgraphs.some((subgraph) => subgraph.id === subgraphId)) {
             warnings.push(`Missing subgraph: ${subgraphId}`);
@@ -8302,7 +10020,7 @@ export default function App() {
             ...next,
             nodes: [
               ...next.nodes,
-              buildNode(nodeId, label, getOperationNodePlacement(next, subgraphId), subgraphId),
+              buildNode(nodeId, nextLabel, getOperationNodePlacement(next, subgraphId), subgraphId),
             ],
           };
           applied += 1;
@@ -8322,27 +10040,6 @@ export default function App() {
           applied += 1;
           break;
         }
-        case 'updateNodeAnnotation': {
-          if (!next.nodes.some((node) => node.id === operation.nodeId)) {
-            warnings.push(`Missing node: ${operation.nodeId}`);
-            break;
-          }
-          const normalizedAnnotation = trimMultilineBlock(operation.annotation);
-          const nextAnnotations = {
-            ...(next.nodeAnnotations ?? {}),
-          };
-          if (normalizedAnnotation) {
-            nextAnnotations[operation.nodeId] = normalizedAnnotation;
-          } else {
-            delete nextAnnotations[operation.nodeId];
-          }
-          next = {
-            ...next,
-            nodeAnnotations: nextAnnotations,
-          };
-          applied += 1;
-          break;
-        }
         case 'deleteNode': {
           if (!next.nodes.some((node) => node.id === operation.nodeId)) {
             warnings.push(`Missing node: ${operation.nodeId}`);
@@ -8352,9 +10049,6 @@ export default function App() {
             ...next,
             nodes: next.nodes.filter((node) => node.id !== operation.nodeId),
             edges: next.edges.filter((edge) => edge.from !== operation.nodeId && edge.to !== operation.nodeId),
-            nodeAnnotations: Object.fromEntries(
-              Object.entries(next.nodeAnnotations ?? {}).filter(([nodeId]) => nodeId !== operation.nodeId),
-            ),
           };
           applied += 1;
           break;
@@ -8847,20 +10541,10 @@ export default function App() {
         <div className="workbench-tabs" aria-label="已打开文件">
           {isVsCodeHost && !isMobileViewport ? (
             <div className="vscode-commandbar" role="toolbar" aria-label="LMD_EDITER 工具栏">
-              <div className="vscode-commandbar__file" title={vscodeFileLabel}>
-                <span className="vscode-commandbar__badge">LMD_EDITER</span>
+              <div className="vscode-commandbar__title" title={vscodeFileLabel}>
                 <strong>{vscodeFileLabel}</strong>
               </div>
               <div className="vscode-commandbar__tools">
-                <button
-                  aria-label="图谱"
-                  className={showSidebar && leftPanel === 'graph' ? 'icon-button has-tooltip is-active' : 'icon-button has-tooltip'}
-                  data-tooltip="图谱"
-                  onClick={() => toggleLeftPanel('graph')}
-                  type="button"
-                >
-                  <WorkbenchIcon name="graph" />
-                </button>
                 <button
                   aria-label="新建节点"
                   className="icon-button has-tooltip"
@@ -8937,7 +10621,7 @@ export default function App() {
                   <WorkbenchIcon name="source" />
                 </button>
                 <button
-                  aria-label="属性"
+                  aria-label={showInspector ? '隐藏属性栏' : '显示属性栏'}
                   className={showInspector ? 'icon-button has-tooltip is-active' : 'icon-button has-tooltip'}
                   data-tooltip="属性"
                   onClick={() => openInspectorView('properties')}
@@ -8946,10 +10630,13 @@ export default function App() {
                   <WorkbenchIcon name="inspect" />
                 </button>
                 <button
-                  aria-label="导出画布图片"
+                  aria-label="查看 SVG 预览"
                   className="icon-button has-tooltip"
-                  data-tooltip="导出图片"
-                  onClick={exportCanvasImage}
+                  data-tooltip="SVG 预览"
+                  onClick={() => {
+                    setSvgPreviewScale(1);
+                    setSvgPreviewOpen(true);
+                  }}
                   type="button"
                 >
                   <WorkbenchIcon name="preview" />
@@ -8974,115 +10661,182 @@ export default function App() {
           ) : (
             <div className="desktop-commandbar" role="toolbar" aria-label="顶部命令栏">
               <div className="desktop-command-group">
-                <span className="desktop-command-group__label">{desktopCommandGroups[0].label}</span>
                 <button
-                  className={showSidebar && leftPanel === 'files' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  aria-label="文件面板"
+                  className={showSidebar && leftPanel === 'files' ? 'desktop-command-button desktop-command-button--icon has-tooltip is-active' : 'desktop-command-button desktop-command-button--icon has-tooltip'}
+                  data-tooltip="文件面板"
                   onClick={() => toggleLeftPanel('files')}
                   type="button"
                 >
-                  文件
+                  <WorkbenchIcon name="files" />
                 </button>
                 <button
-                  className={showSidebar && leftPanel === 'graph' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  aria-label="图谱面板"
+                  className={showSidebar && leftPanel === 'graph' ? 'desktop-command-button desktop-command-button--icon has-tooltip is-active' : 'desktop-command-button desktop-command-button--icon has-tooltip'}
+                  data-tooltip="图谱面板"
                   onClick={() => toggleLeftPanel('graph')}
                   type="button"
                 >
-                  图谱
-                </button>
-                <button className="desktop-command-button" onClick={exportMarkdown} type="button">
-                  导出
-                </button>
-                <button className="desktop-command-button" onClick={exportCanvasImage} type="button">
-                  导出图片
+                  <WorkbenchIcon name="graph" />
                 </button>
                 <button
+                  aria-label="打开 LMD"
                   className={
                     supportsLocalMarkdownPicker || supportsLocalProjectPicker
-                      ? 'desktop-command-button'
-                      : 'desktop-command-button is-disabled'
+                      ? 'desktop-command-button desktop-command-button--icon has-tooltip'
+                      : 'desktop-command-button desktop-command-button--icon has-tooltip is-disabled'
                   }
+                  data-tooltip="打开 LMD"
                   onClick={() => {
                     void openLocalMarkdownFile();
                   }}
                   type="button"
                 >
-                  打开 MD
+                  <WorkbenchIcon name="files" />
+                </button>
+                <button
+                  aria-label="导出 LMD"
+                  className="desktop-command-button desktop-command-button--icon has-tooltip"
+                  data-tooltip="导出 LMD"
+                  onClick={exportMarkdown}
+                  type="button"
+                >
+                  <WorkbenchIcon name="share" />
+                </button>
+                <button
+                  aria-label="导出 PNG"
+                  className="desktop-command-button desktop-command-button--icon has-tooltip"
+                  data-tooltip="导出 PNG"
+                  onClick={exportCanvasImage}
+                  type="button"
+                >
+                  <WorkbenchIcon name="preview" />
                 </button>
               </div>
 
               <div className="desktop-command-group">
-                <span className="desktop-command-group__label">{desktopCommandGroups[1].label}</span>
-                <button className="desktop-command-button" onClick={createNodeInViewportCenter} type="button">
-                  新建节点
+                <button
+                  aria-label="新建节点"
+                  className="desktop-command-button desktop-command-button--icon has-tooltip"
+                  data-tooltip="新建节点"
+                  onClick={createNodeInViewportCenter}
+                  type="button"
+                >
+                  <WorkbenchIcon name="node" />
                 </button>
                 <button
-                  className={selection.kind === 'node' && selection.ids.length > 0 ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  aria-label="复制"
+                  className={selection.kind === 'node' && selection.ids.length > 0 ? 'desktop-command-button desktop-command-button--icon has-tooltip' : 'desktop-command-button desktop-command-button--icon has-tooltip is-disabled'}
+                  data-tooltip="复制"
                   onClick={duplicateSelection}
                   type="button"
                 >
-                  复制
+                  <WorkbenchIcon name="copy" />
                 </button>
                 <button
-                  className={canGroupSelection ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  aria-label="分组"
+                  className={canGroupSelection ? 'desktop-command-button desktop-command-button--icon has-tooltip' : 'desktop-command-button desktop-command-button--icon has-tooltip is-disabled'}
+                  data-tooltip="分组"
                   onClick={wrapSelectionInSubgraph}
                   type="button"
                 >
-                  分组
+                  <WorkbenchIcon name="group" />
                 </button>
                 <button
-                  className={selection.kind !== 'none' ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  aria-label="删除"
+                  className={selection.kind !== 'none' ? 'desktop-command-button desktop-command-button--icon has-tooltip' : 'desktop-command-button desktop-command-button--icon has-tooltip is-disabled'}
+                  data-tooltip="删除"
                   onClick={deleteSelection}
                   type="button"
                 >
-                  删除
+                  <WorkbenchIcon name="trash" />
                 </button>
-                <button className="desktop-command-button" onClick={compactLayout} type="button">
-                  整理
+                <button
+                  aria-label="整理"
+                  className="desktop-command-button desktop-command-button--icon has-tooltip"
+                  data-tooltip="整理"
+                  onClick={compactLayout}
+                  type="button"
+                >
+                  <WorkbenchIcon name="tidy" />
                 </button>
-                <button className="desktop-command-button" onClick={autoLayout} type="button">
-                  布局
+                <button
+                  aria-label="布局"
+                  className="desktop-command-button desktop-command-button--icon has-tooltip"
+                  data-tooltip="布局"
+                  onClick={autoLayout}
+                  type="button"
+                >
+                  <WorkbenchIcon name="layout" />
                 </button>
-                <button className="desktop-command-button" onClick={standardizeCurrentProject} type="button">
-                  标准化
+                <button
+                  aria-label="标准化"
+                  className="desktop-command-button desktop-command-button--icon has-tooltip"
+                  data-tooltip="标准化"
+                  onClick={standardizeCurrentProject}
+                  type="button"
+                >
+                  <WorkbenchIcon name="standardize" />
                 </button>
               </div>
 
               <div className="desktop-command-group">
-                <span className="desktop-command-group__label">{desktopCommandGroups[2].label}</span>
                 <button
-                  className={mode === 'canvas' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  aria-label="画布模式"
+                  className={mode === 'canvas' ? 'desktop-command-button desktop-command-button--icon has-tooltip is-active' : 'desktop-command-button desktop-command-button--icon has-tooltip'}
+                  data-tooltip="画布模式"
                   onClick={() => goToMode('canvas')}
                   type="button"
                 >
-                  画布
+                  <WorkbenchIcon name="canvas" />
                 </button>
                 <button
-                  className={mode === 'source' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  aria-label="源码模式"
+                  className={mode === 'source' ? 'desktop-command-button desktop-command-button--icon has-tooltip is-active' : 'desktop-command-button desktop-command-button--icon has-tooltip'}
+                  data-tooltip="源码模式"
                   onClick={() => goToMode('source')}
                   type="button"
                 >
-                  源码
+                  <WorkbenchIcon name="source" />
                 </button>
                 <button
-                  className={showInspector && inspectorView === 'properties' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  aria-label="属性面板"
+                  className={showInspector && inspectorView === 'properties' ? 'desktop-command-button desktop-command-button--icon has-tooltip is-active' : 'desktop-command-button desktop-command-button--icon has-tooltip'}
+                  data-tooltip="属性面板"
                   onClick={() => openInspectorView('properties')}
                   type="button"
                 >
-                  属性
+                  <WorkbenchIcon name="inspect" />
                 </button>
                 <button
-                  className={showInspector && inspectorView === 'ai' ? 'desktop-command-button is-active' : 'desktop-command-button'}
+                  aria-label="AI 面板"
+                  className={showInspector && inspectorView === 'ai' ? 'desktop-command-button desktop-command-button--icon has-tooltip is-active' : 'desktop-command-button desktop-command-button--icon has-tooltip'}
+                  data-tooltip="AI 面板"
                   onClick={() => openInspectorView('ai')}
                   type="button"
                 >
-                  AI
+                  <WorkbenchIcon name="chat" />
                 </button>
                 <button
-                  className={selection.kind !== 'none' ? 'desktop-command-button' : 'desktop-command-button is-disabled'}
+                  aria-label="聚焦选中"
+                  className={selection.kind !== 'none' ? 'desktop-command-button desktop-command-button--icon has-tooltip' : 'desktop-command-button desktop-command-button--icon has-tooltip is-disabled'}
+                  data-tooltip="聚焦选中"
                   onClick={focusSelectionInViewport}
                   type="button"
                 >
-                  聚焦
+                  <WorkbenchIcon name="search" />
+                </button>
+                <button
+                  aria-label="SVG 预览"
+                  className="desktop-command-button desktop-command-button--icon has-tooltip"
+                  data-tooltip="SVG 预览"
+                  onClick={() => {
+                    setSvgPreviewScale(1);
+                    setSvgPreviewOpen(true);
+                  }}
+                  type="button"
+                >
+                  <WorkbenchIcon name="preview" />
                 </button>
               </div>
 
@@ -9094,33 +10848,8 @@ export default function App() {
           )}
         </div>
 
-        <div className="workbench-bar__actions">
-          {isVsCodeHost && !isMobileViewport ? (
-            <div
-              aria-label={
-                saveStatus === 'saving'
-                  ? '正在写入 LMD'
-                  : saveStatus === 'error'
-                    ? '同步异常'
-                    : 'LMD 已连接'
-              }
-              className={`status-pill status-pill--${saveStatus}`}
-              data-tooltip={
-                saveStatus === 'saving'
-                  ? '正在写入 LMD'
-                  : saveStatus === 'error'
-                    ? '同步异常'
-                    : 'LMD 已连接'
-              }
-            >
-              <span className="status-pill__dot" />
-              {saveStatus === 'saving'
-                ? '正在写入 LMD'
-                : saveStatus === 'error'
-                  ? '同步异常'
-                  : 'LMD 已连接'}
-            </div>
-          ) : (
+        {!isVsCodeHost || isMobileViewport ? (
+          <div className="workbench-bar__actions">
             <>
               <div className="presence-strip" aria-label="在线协作者">
                 {collaboratorPresets.map((collaborator) => (
@@ -9197,41 +10926,11 @@ export default function App() {
                   </button>
                 ))}
               </div>
-                ) : (
-                  <>
-                    <button
-                      aria-label="复制 Mermaid 源码"
-                      className="icon-button has-tooltip"
-                      data-tooltip="复制 Mermaid"
-                      onClick={copySource}
-                      type="button"
-                    >
-                      <WorkbenchIcon name="copy" />
-                    </button>
-                    <button
-                      aria-label="导出当前画布图片"
-                      className="icon-button has-tooltip"
-                      data-tooltip="导出图片"
-                      onClick={exportCanvasImage}
-                      type="button"
-                    >
-                      <WorkbenchIcon name="preview" />
-                    </button>
-                    <button
-                      aria-label="导出标准 Markdown"
-                      className="icon-button icon-button--primary has-tooltip"
-                      data-tooltip="导出 Markdown"
-                      onClick={exportMarkdown}
-                      type="button"
-                    >
-                      <WorkbenchIcon name="share" />
-                    </button>
-                  </>
-                )}
+                ) : null}
               </div>
             </>
-          )}
-        </div>
+          </div>
+        ) : null}
       </header>
 
       <main className={workspaceClassName} ref={workspaceRef} style={workspaceStyle}>
@@ -9248,21 +10947,23 @@ export default function App() {
           />
         ) : null}
 
-        <nav className="nav-rail" aria-label="工作台导航">
-          {visibleLeftPanels.map((item) => (
-            <button
-              aria-label={item.label}
-              className={leftPanel === item.id ? 'nav-rail__button has-tooltip is-active' : 'nav-rail__button has-tooltip'}
-              data-tooltip={item.label}
-              key={item.id}
-              onClick={() => toggleLeftPanel(item.id)}
-              type="button"
-            >
-              <WorkbenchIcon name={item.icon} />
-              <span className="nav-rail__label">{item.label}</span>
-            </button>
-          ))}
-        </nav>
+        {!isVsCodeHost ? (
+          <nav className="nav-rail" aria-label="工作台导航">
+            {visibleLeftPanels.map((item) => (
+              <button
+                aria-label={item.label}
+                className={leftPanel === item.id ? 'nav-rail__button has-tooltip is-active' : 'nav-rail__button has-tooltip'}
+                data-tooltip={item.label}
+                key={item.id}
+                onClick={() => toggleLeftPanel(item.id)}
+                type="button"
+              >
+                <WorkbenchIcon name={item.icon} />
+                <span className="nav-rail__label">{item.label}</span>
+              </button>
+            ))}
+          </nav>
+        ) : null}
 
         {!isMobileViewport ? (
           <button
@@ -9311,7 +11012,13 @@ export default function App() {
                 <input
                   value={searchQuery}
                   onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder={leftPanel === 'files' ? '查找文件、节点、源码' : '查找图层、节点、分组'}
+                  placeholder={
+                    isVsCodeHost
+                      ? '查找节点、分组'
+                      : leftPanel === 'files'
+                        ? '查找文件、节点、源码'
+                        : '查找图层、节点、分组'
+                  }
                 />
               </label>
             </section>
@@ -9357,7 +11064,7 @@ export default function App() {
                     }}
                     type="button"
                   >
-                    打开 MD
+                    打开 LMD
                   </button>
                   <button
                     className={supportsLocalProjectPicker ? 'ghost-button' : 'ghost-button is-disabled'}
@@ -9470,7 +11177,7 @@ export default function App() {
                   </>
                 ) : (
                   <div className="explorer-empty">
-                    打开一个本地目录后，这里会以文件管理器方式显示 Markdown 工程。
+                    打开一个本地目录后，这里会以文件管理器方式显示 LMD 工程。
                   </div>
                 )}
               </section>
@@ -9573,8 +11280,8 @@ export default function App() {
 
         </aside>
 
-        <section className={`workspace-main workspace-main--${mode}`}>
-          {!isMobileViewport ? (
+        <section className={`workspace-main workspace-main--${mode}`} ref={workspaceMainRef}>
+          {!isMobileViewport && !isVsCodeHost ? (
             <div className="desktop-mode-strip" role="tablist" aria-label="桌面模式切换">
               {modeMeta.map((entry) => (
                 <button
@@ -9596,6 +11303,86 @@ export default function App() {
                 <span className="canvas-status-pill">{activeModeLabel}</span>
                 <span className="canvas-status-pill">{selectionLabel}</span>
                 <span className="canvas-status-pill">{documentState.nodes.length} 个节点</span>
+              </div>
+
+              <div className={`canvas-search${canvasSearchOpen ? ' is-open' : ''}`}>
+                <label className="canvas-search__field">
+                  <WorkbenchIcon name="search" />
+                  <input
+                    ref={canvasSearchInputRef}
+                    onBlur={() => {
+                      if (!canvasSearchQuery.trim()) {
+                        searchRestoreViewportRef.current = null;
+                        setCanvasSearchOpen(false);
+                      }
+                    }}
+                    onChange={(event) => {
+                      setCanvasSearchOpen(true);
+                      setCanvasSearchQuery(event.target.value);
+                    }}
+                    onKeyDown={(event) => {
+                      if (handleNativeSelectAllShortcut(event)) {
+                        return;
+                      }
+
+                      if (event.key === 'Escape') {
+                        event.preventDefault();
+                        if (searchRestoreViewportRef.current) {
+                          const restoreViewport = searchRestoreViewportRef.current;
+                          updateViewport(() => restoreViewport);
+                        }
+                        searchRestoreViewportRef.current = null;
+                        setCanvasSearchOpen(false);
+                        setCanvasSearchQuery('');
+                        setCanvasSearchFocusIndex(0);
+                        canvasRef.current?.focus();
+                        return;
+                      }
+
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        focusCanvasSearchResult(canvasSearchResults[canvasSearchFocusIndex] ?? canvasSearchResults[0] ?? null);
+                        return;
+                      }
+
+                      if (event.key === 'Tab' && canvasSearchResults.length > 0) {
+                        event.preventDefault();
+                        setCanvasSearchFocusIndex((current) => {
+                          const nextIndex = event.shiftKey
+                            ? (current - 1 + canvasSearchResults.length) % canvasSearchResults.length
+                            : (current + 1) % canvasSearchResults.length;
+                          focusCanvasSearchResult(canvasSearchResults[nextIndex] ?? null);
+                          return nextIndex;
+                        });
+                      }
+                    }}
+                    placeholder="查找节点 / 分组"
+                    type="text"
+                    value={canvasSearchQuery}
+                  />
+                </label>
+                {canvasSearchOpen && canvasSearchResults.length > 0 ? (
+                  <div className="canvas-search__results">
+                    {canvasSearchResults.map((result, index) => (
+                      <button
+                        className={index === canvasSearchFocusIndex ? 'canvas-search__result is-active' : 'canvas-search__result'}
+                        key={`${result.kind}-${result.id}`}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => {
+                          setCanvasSearchFocusIndex(index);
+                          focusCanvasSearchResult(result);
+                        }}
+                        type="button"
+                      >
+                        <span className={`canvas-search__result-marker canvas-search__result-marker--${result.kind}`} />
+                        <span className="canvas-search__result-copy">
+                          <strong>{result.label}</strong>
+                          <small>{result.meta}</small>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
 
               <div
@@ -9640,11 +11427,12 @@ export default function App() {
                       return null;
                     }
                     const subgraphStyle = getSubgraphStyle(subgraph);
+                    const subgraphParts = splitEntityText(subgraph.title);
 
                     return (
                       <div
                         key={frame.id}
-                        className={`subgraph-frame${selection.kind === 'subgraph' && selectionContains(selection, frame.id) ? ' is-selected' : ''}${dragTargetSubgraphId === frame.id ? ' is-drop-target' : ''}${subgraph.collapsed ? ' is-collapsed' : ''}`}
+                        className={`subgraph-frame${selection.kind === 'subgraph' && selectionContains(selection, frame.id) ? ' is-selected' : ''}${dragTargetSubgraphId === frame.id ? ' is-drop-target' : ''}${subgraph.collapsed ? ' is-collapsed' : ''}${canvasSearchSubgraphIds.has(frame.id) ? ' is-search-match' : ''}`}
                         data-edge-endpoint-id={frame.id}
                         onDoubleClick={(event) => {
                           if (isMobileViewport) {
@@ -9700,13 +11488,17 @@ export default function App() {
                         >
                           <div className="subgraph-frame__header-copy">
                             {editingSubgraphId === frame.id ? (
-                              <input
-                                autoFocus
+                              <textarea
                                 className="subgraph-frame__title-input"
+                                ref={subgraphEditorRef}
                                 onBlur={() => commitSubgraphTitleEdit(frame.id)}
                                 onChange={(event) => setEditingSubgraphTitle(event.target.value)}
                                 onKeyDown={(event) => {
                                   if (handleNativeSelectAllShortcut(event)) {
+                                    return;
+                                  }
+
+                                  if (isCompositionConfirming(event)) {
                                     return;
                                   }
 
@@ -9716,13 +11508,21 @@ export default function App() {
                                     return;
                                   }
 
+                                  if (event.key === 'Tab') {
+                                    event.preventDefault();
+                                    setEditingSubgraphField((current) => (current === 'title' ? 'description' : 'title'));
+                                    return;
+                                  }
+
                                   if (event.key === 'Escape') {
                                     event.preventDefault();
                                     setEditingSubgraphId(null);
+                                    setEditingSubgraphField('title');
                                     setEditingSubgraphTitle('');
                                   }
                                 }}
                                 onPointerDown={(event) => event.stopPropagation()}
+                                rows={Math.max(2, editingSubgraphTitle.split(/\r?\n/).length)}
                                 value={editingSubgraphTitle}
                               />
                             ) : (
@@ -9730,10 +11530,17 @@ export default function App() {
                                 className="subgraph-frame__title-button"
                                 onDoubleClick={(event) => {
                                   event.stopPropagation();
-                                  startSubgraphTitleEdit(subgraph);
+                                  const target = event.target as HTMLElement;
+                                  startSubgraphTitleEdit(
+                                    subgraph,
+                                    target.closest('.subgraph-frame__description') ? 'description' : 'title',
+                                  );
                                 }}
                               >
-                                {subgraph.title}
+                                <strong>{subgraphParts.title}</strong>
+                                {subgraphParts.description ? (
+                                  <small className="subgraph-frame__description">{subgraphParts.description}</small>
+                                ) : null}
                               </span>
                             )}
                           </div>
@@ -9802,136 +11609,27 @@ export default function App() {
                     );
                   })}
 
-                  <div
-                    className={`content-card${selectedContent ? ' is-selected' : ''}${editingContent ? ' is-editing' : ''}${contentCardCollapsed ? ' is-collapsed' : ''}`}
-                    onDoubleClick={(event) => {
-                      event.stopPropagation();
-                      startContentInlineEdit();
-                    }}
-                    onWheelCapture={(event) => event.stopPropagation()}
-                    onPointerDown={(event) => {
-                      const target = event.target as HTMLElement;
-                      if (target.closest('.content-card__action, .content-card__editor')) {
-                        return;
-                      }
-
-                      if (target.closest('.content-card__header')) {
-                        startContentDrag(event);
-                        return;
-                      }
-
-                      event.stopPropagation();
-                      if (event.shiftKey) {
-                        setSelection((current) => toggleSelectionIds(current, 'content', [CONTENT_CARD_ID]));
-                        return;
-                      }
-                      setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
-                    }}
-                    style={{
-                      left: contentCardRenderLayout.x,
-                      top: contentCardRenderLayout.y,
-                      width: Math.min(contentCardSize.width, 520),
-                      height: Math.min(contentCardCollapsed ? contentCardSize.height : contentCardSize.height, contentCardCollapsed ? 120 : 420),
-                    }}
-                  >
-                    <div
-                      className="content-card__header"
-                      onPointerDown={startContentDrag}
-                    >
-                      <div className="content-card__header-copy">
-                        <span className="content-card__eyebrow">Additional</span>
-                        <strong>附加信息</strong>
-                      </div>
-                      <button
-                        aria-label={contentCardLayout.collapsed ? '展开附加信息' : '折叠附加信息'}
-                        className="content-card__action"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          toggleContentCollapsed();
-                        }}
-                        type="button"
-                      >
-                        <WorkbenchIcon name={contentCardLayout.collapsed ? 'plus' : 'minus'} />
-                      </button>
-                    </div>
-
-                    {editingContent ? (
-                      <textarea
-                        autoFocus
-                        className="content-card__editor"
-                        onBlur={commitContentInlineEdit}
-                        onChange={(event) =>
-                          setContentInspectorDraft({ markdown: event.target.value })
-                        }
-                        onDoubleClick={(event) => event.stopPropagation()}
-                        onKeyDown={(event) => {
-                          if (handleNativeSelectAllShortcut(event)) {
-                            return;
-                          }
-
-                          if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                            event.preventDefault();
-                            commitContentInlineEdit();
-                            event.currentTarget.blur();
-                            return;
-                          }
-
-                          if (event.key === 'Escape') {
-                            event.preventDefault();
-                            setEditingContent(false);
-                            setContentInspectorDraft({ markdown: contentMarkdown });
-                          }
-                        }}
-                        onPointerDown={(event) => event.stopPropagation()}
-                        onWheelCapture={(event) => event.stopPropagation()}
-                        rows={Math.max(8, contentInspectorDraft.markdown.split(/\r?\n/).length + 2)}
-                        spellCheck={false}
-                        value={contentInspectorDraft.markdown}
-                      />
-                    ) : contentCardCollapsed ? (
-                      <div className="content-card__summary">
-                        <p>{contentCardSummary}</p>
-                      </div>
-                    ) : (
-                      <div
-                        className="content-card__body"
-                        onDoubleClick={(event) => event.stopPropagation()}
-                        onWheelCapture={(event) => event.stopPropagation()}
-                        dangerouslySetInnerHTML={{ __html: contentCardPreviewHtml }}
-                      />
-                    )}
-                  </div>
-
                   <svg className="edge-layer" aria-hidden="true">
                     <defs>
-                      <marker
-                        id="arrow-outline"
-                        markerWidth="13.4"
-                        markerHeight="13.4"
-                        refX="10.6"
-                        refY="6.7"
-                        orient="auto"
-                        markerUnits="userSpaceOnUse"
-                      >
-                        <path d="M0,0 L13.4,6.7 L0,13.4 z" fill="rgba(255,255,255,0.56)" />
-                      </marker>
-                      <marker
-                        id="arrow-solid"
-                        markerWidth="11.2"
-                        markerHeight="11.2"
-                        refX="8.9"
-                        refY="5.6"
-                        orient="auto"
-                        markerUnits="userSpaceOnUse"
-                      >
-                        <path
-                          d="M0,0 L11.2,5.6 L0,11.2 z"
-                          fill="context-stroke"
-                          fillOpacity="1"
-                          stroke="rgba(255,255,255,0.68)"
-                          strokeWidth="0.7"
-                        />
-                      </marker>
+                      {liveEdgeMarkerEntries.map((entry) => (
+                        <marker
+                          id={entry.id}
+                          key={entry.id}
+                          markerWidth="13.2"
+                          markerHeight="13.2"
+                          refX="10.6"
+                          refY="6.6"
+                          orient="auto"
+                          markerUnits="userSpaceOnUse"
+                        >
+                          <path
+                            d="M0,0 L13.2,6.6 L0,13.2 z"
+                            fill={entry.color}
+                            stroke={mixColors(entry.color, '#0f172a', 0.22)}
+                            strokeWidth="0.45"
+                          />
+                        </marker>
+                      ))}
                     </defs>
                     {visibleEdges.map((edge) => {
                       const normalizedEdge = normalizeEdgeStyle(edge);
@@ -9945,7 +11643,7 @@ export default function App() {
                       const isEdgeSelected =
                         selection.kind === 'edge' && selectionContains(selection, edge.id);
                       const inheritsSourceColor =
-                        normalizedEdge.strokeColor === defaultEdgeStyle.strokeColor;
+                        shouldInheritSourceEdgeColor(normalizedEdge.strokeColor);
 
                       const geometry = buildEdgeGeometry(
                         fromNode,
@@ -9954,22 +11652,23 @@ export default function App() {
                         edgeEndpointOffsetMap.get(edge.id),
                       );
                       const edgeBaseColor = inheritsSourceColor
-                        ? fromNode.stroke
+                        ? getEndpointAccentColor(fromNode)
                         : normalizedEdge.strokeColor;
                       const baseStrokeWidth = isGroupEdge
                         ? normalizedEdge.strokeWidth * 2
                         : normalizedEdge.strokeWidth;
-                      const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 2.8 : 2.05);
+                      const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 4.2 : 3.2);
                       const selectedEdgeStrokeWidth =
                         isEdgeSelected
-                          ? visualStrokeWidth + 0.8
+                          ? visualStrokeWidth + 0.9
                           : visualStrokeWidth;
-                      const displayStroke = withAlpha(edgeBaseColor, isGroupEdge ? 0.97 : 0.95);
-                      const outlineWidth = selectedEdgeStrokeWidth + (isGroupEdge ? 0.95 : 0.75);
+                      const displayStroke = withAlpha(edgeBaseColor, 1);
+                      const outlineStroke = mixColors(edgeBaseColor, '#0f172a', isGroupEdge ? 0.56 : 0.5);
+                      const outlineWidth = selectedEdgeStrokeWidth + (isGroupEdge ? 0.34 : 0.26);
                       const labelBackground = mixColors(
                         edgeBaseColor,
                         '#f8fafc',
-                        inheritsSourceColor ? 0.82 : 0.86,
+                        inheritsSourceColor ? 0.66 : 0.76,
                       );
                       const labelTextColor = getReadableLabelTextColor(
                         labelBackground,
@@ -9980,6 +11679,9 @@ export default function App() {
                       const liveEdgeLabel = editingEdgeId === edge.id ? editingEdgeLabel || ' ' : edge.label;
                       const liveEdgeLabelMetrics = measureEdgeLabelBadge(liveEdgeLabel);
                       const edgeLabelLines = edge.label.split(/\r?\n/);
+                      const arrowMarkerId = edge.type === 'line'
+                        ? undefined
+                        : liveEdgeMarkerIdMap.get(edgeBaseColor);
 
                       return (
                         <g key={edge.id}>
@@ -9987,7 +11689,6 @@ export default function App() {
                             <path
                               className={`edge-path edge-path--selection${isGroupEdge ? ' is-group-edge' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
                               d={geometry.path}
-                              markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-outline)'}
                               pointerEvents="none"
                               stroke={withAlpha(edgeBaseColor, 0.9)}
                               strokeWidth={selectedEdgeStrokeWidth + (isGroupEdge ? 8 : 7)}
@@ -9996,16 +11697,15 @@ export default function App() {
                           <path
                             className={`edge-path edge-path--outline edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
                             d={geometry.path}
-                            markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-outline)'}
                             pointerEvents="none"
-                            stroke="#f8fafc"
-                            strokeOpacity={0.72}
+                            stroke={outlineStroke}
+                            strokeOpacity={isEdgeSelected ? 0.48 : 0.36}
                             strokeWidth={outlineWidth}
                           />
                           <path
                             className={`edge-path edge-path--main edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
                             d={geometry.path}
-                            markerEnd={edge.type === 'line' ? undefined : 'url(#arrow-solid)'}
+                            markerEnd={arrowMarkerId ? `url(#${arrowMarkerId})` : undefined}
                             pointerEvents="none"
                             stroke={displayStroke}
                             strokeWidth={selectedEdgeStrokeWidth}
@@ -10146,13 +11846,19 @@ export default function App() {
                         <path
                           className="edge-path edge-path--preview edge-path--insert-preview"
                           d={dragInsertPreview.first.path}
-                          markerEnd="url(#arrow-solid)"
+                          markerEnd={(() => {
+                            const marker = liveEdgeMarkerEntries.find((entry) => entry.color === dragInsertPreview.stroke);
+                            return marker ? `url(#${marker.id})` : undefined;
+                          })()}
                           stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
                         />
                         <path
                           className="edge-path edge-path--preview edge-path--insert-preview"
                           d={dragInsertPreview.second.path}
-                          markerEnd="url(#arrow-solid)"
+                          markerEnd={(() => {
+                            const marker = liveEdgeMarkerEntries.find((entry) => entry.color === dragInsertPreview.stroke);
+                            return marker ? `url(#${marker.id})` : undefined;
+                          })()}
                           stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
                         />
                       </>
@@ -10169,7 +11875,18 @@ export default function App() {
 
                           return buildPreviewEdgePath(originNode, connectingState.current, connectingState.handleSide);
                         })()}
-                        markerEnd={connectingState.edgeType === 'line' ? undefined : 'url(#arrow-solid)'}
+                        markerEnd={(() => {
+                          if (connectingState.edgeType === 'line') {
+                            return undefined;
+                          }
+                          const originNode = edgeEndpointMap.get(connectingState.fromId);
+                          if (!originNode) {
+                            return undefined;
+                          }
+                          const color = withAlpha(originNode.stroke, 0.9);
+                          const marker = liveEdgeMarkerEntries.find((entry) => entry.color === color);
+                          return marker ? `url(#${marker.id})` : undefined;
+                        })()}
                         stroke={(() => {
                           const originNode = edgeEndpointMap.get(connectingState.fromId);
                           return originNode ? withAlpha(originNode.stroke, 0.9) : undefined;
@@ -10182,12 +11899,14 @@ export default function App() {
                     const selected = selection.kind === 'node' && selectionContains(selection, node.id);
                     const isEditing = editingNodeId === node.id;
                     const liveContent = isEditing ? editingLabel || ' ' : node.label;
-                    const liveSize = isEditing ? measureNodeContentSize(liveContent) : node;
+                    const liveParts = isEditing ? splitEntityDraft(liveContent) : splitEntityText(liveContent);
+                    const liveSize = isEditing ? measureNodeContentSize(liveParts.title, liveParts.description) : node;
+                    const validation = nodeTitleValidationMap.get(node.id);
 
                     return (
                       <div
                         key={node.id}
-                        className={`graph-node graph-node--${node.shape}${selected ? ' is-selected' : ''}${hoveredNodeId === node.id ? ' is-hovered' : ''}${dragTargetNodeId === node.id ? ' is-drop-target' : ''}`}
+                        className={`graph-node graph-node--${node.shape}${selected ? ' is-selected' : ''}${hoveredNodeId === node.id ? ' is-hovered' : ''}${dragTargetNodeId === node.id ? ' is-drop-target' : ''}${canvasSearchNodeIds.has(node.id) ? ' is-search-match' : ''}${validation?.hasWarning ? ' has-warning' : ''}${validation?.duplicate ? ' has-duplicate-title' : ''}${validation?.illegal ? ' has-illegal-title' : ''}`}
                         data-edge-endpoint-id={node.id}
                         data-node-id={node.id}
                         onDoubleClick={(event) => {
@@ -10195,7 +11914,19 @@ export default function App() {
                             return;
                           }
                           event.stopPropagation();
-                          startInlineEdit(node);
+                          if (event.metaKey || event.ctrlKey) {
+                            selectConnectedNodeComponent(node.id);
+                            return;
+                          }
+                          const target = event.target as HTMLElement;
+                          const nextField = target.closest('.graph-node__description')
+                            ? 'description'
+                            : 'title';
+                          if (isEditing) {
+                            setEditingNodeField(nextField);
+                            return;
+                          }
+                          startInlineEdit(node, nextField);
                         }}
                         onMouseEnter={() => setHoveredNodeId(node.id)}
                         onMouseLeave={() => setHoveredNodeId((current) => (current === node.id ? null : current))}
@@ -10208,8 +11939,12 @@ export default function App() {
                           background: node.fill,
                           borderColor: node.stroke,
                           color: node.textColor,
-                        }}
+                          '--node-fill': node.fill,
+                          '--node-stroke': node.stroke,
+                          '--node-text': node.textColor,
+                        } as CSSProperties}
                         tabIndex={0}
+                        title={validation?.tooltip || undefined}
                       >
                         <button
                           aria-label="从节点左侧拖出连线"
@@ -10221,52 +11956,136 @@ export default function App() {
                         </button>
 
                         {isEditing ? (
-                          <textarea
-                            autoFocus
-                            className="graph-node__editor"
-                            onBlur={() => commitInlineEdit(node.id)}
-                            onChange={(event) => setEditingLabel(event.target.value)}
+                          <div
+                            className={`graph-node__editor-shell${liveParts.description ? '' : ' graph-node__editor-shell--description-empty'}`}
+                            ref={nodeEditorShellRef}
                             onPointerDown={(event) => event.stopPropagation()}
-                            onKeyDown={(event) => {
-                              if (handleNativeSelectAllShortcut(event)) {
-                                return;
-                              }
-
-                              if (
-                                event.key === 'Enter' &&
-                                (event.shiftKey || event.ctrlKey || event.altKey)
-                              ) {
-                                event.preventDefault();
-                                const textarea = event.currentTarget;
-                                const start = textarea.selectionStart;
-                                const end = textarea.selectionEnd;
-                                const nextValue = `${editingLabel.slice(0, start)}\n${editingLabel.slice(end)}`;
-                                setEditingLabel(nextValue);
+                          >
+                            <textarea
+                              className={`graph-node__editor graph-node__editor--title${editingNodeField === 'title' ? ' is-active' : ''}`}
+                              ref={nodeTitleEditorRef}
+                              onBlur={() => {
                                 window.requestAnimationFrame(() => {
-                                  textarea.selectionStart = start + 1;
-                                  textarea.selectionEnd = start + 1;
+                                  if (nodeEditorShellRef.current?.contains(document.activeElement)) {
+                                    persistInlineNodeDraft(node.id, {
+                                      historyTitle: '已暂存节点',
+                                      historyDetail: '已在切换编辑区域时暂存节点草稿。',
+                                    });
+                                    return;
+                                  }
+                                  commitInlineEdit(node.id);
                                 });
-                                return;
-                              }
+                              }}
+                              onChange={(event) => updateEditingNodeFieldValue('title', event.target.value)}
+                              onKeyDown={(event) => {
+                                if (handleNativeSelectAllShortcut(event)) {
+                                  return;
+                                }
 
-                              if (event.key === 'Enter') {
-                                event.preventDefault();
-                                commitInlineEdit(node.id);
-                                return;
-                              }
+                                if (isCompositionConfirming(event)) {
+                                  return;
+                                }
 
-                              if (event.key === 'Escape') {
-                                event.preventDefault();
-                                setEditingNodeId(null);
-                                setEditingLabel('');
-                              }
-                            }}
-                            rows={1}
-                            style={{ minHeight: Math.max(liveSize.height - 28, 32) }}
-                            value={editingLabel}
-                          />
+                                if (event.key === 'Enter') {
+                                  event.preventDefault();
+                                  commitInlineEdit(node.id);
+                                  return;
+                                }
+
+                                if (event.key === 'Tab') {
+                                  event.preventDefault();
+                                  setEditingLabel((current) => ensureInlineEntityFieldValue(current, 'description'));
+                                  setEditingNodeField('description');
+                                  return;
+                                }
+
+                                  if (event.key === 'Escape') {
+                                    event.preventDefault();
+                                    setEditingNodeId(null);
+                                    setEditingNodeField('title');
+                                    setEditingNodeSelectAll(false);
+                                    setEditingLabel('');
+                                  }
+                              }}
+                              rows={1}
+                              placeholder="未命名内容"
+                              value={liveParts.title}
+                            />
+                            <textarea
+                              className={`graph-node__editor graph-node__editor--description${editingNodeField === 'description' ? ' is-active' : ''}`}
+                              ref={nodeDescriptionEditorRef}
+                              onBlur={() => {
+                                window.requestAnimationFrame(() => {
+                                  if (nodeEditorShellRef.current?.contains(document.activeElement)) {
+                                    persistInlineNodeDraft(node.id, {
+                                      historyTitle: '已暂存节点',
+                                      historyDetail: '已在切换编辑区域时暂存节点草稿。',
+                                    });
+                                    return;
+                                  }
+                                  commitInlineEdit(node.id);
+                                });
+                              }}
+                              onChange={(event) => updateEditingNodeFieldValue('description', event.target.value)}
+                              onKeyDown={(event) => {
+                                if (handleNativeSelectAllShortcut(event)) {
+                                  return;
+                                }
+
+                                if (isCompositionConfirming(event)) {
+                                  return;
+                                }
+
+                                if (
+                                  event.key === 'Enter' &&
+                                  (event.shiftKey || event.ctrlKey || event.altKey)
+                                ) {
+                                  event.preventDefault();
+                                  const textarea = event.currentTarget;
+                                  const start = textarea.selectionStart;
+                                  const end = textarea.selectionEnd;
+                                  const nextValue = `${liveParts.description.slice(0, start)}\n${liveParts.description.slice(end)}`;
+                                  updateEditingNodeFieldValue('description', nextValue);
+                                  window.requestAnimationFrame(() => {
+                                    textarea.selectionStart = start + 1;
+                                    textarea.selectionEnd = start + 1;
+                                  });
+                                  return;
+                                }
+
+                                if (event.key === 'Enter') {
+                                  event.preventDefault();
+                                  commitInlineEdit(node.id);
+                                  return;
+                                }
+
+                                if (event.key === 'Tab') {
+                                  event.preventDefault();
+                                  setEditingNodeField('title');
+                                  return;
+                                }
+
+                                if (event.key === 'Escape') {
+                                  event.preventDefault();
+                                  setEditingNodeId(null);
+                                  setEditingNodeField('title');
+                                  setEditingNodeSelectAll(false);
+                                  setEditingLabel('');
+                                }
+                              }}
+                              placeholder="（空）"
+                              rows={Math.max(2, liveParts.description.split('\n').length || 1)}
+                              style={{ minHeight: Math.max(liveSize.height - 66, 42) }}
+                              value={liveParts.description}
+                            />
+                          </div>
                         ) : (
-                          <div className="graph-node__content">{node.label}</div>
+                          <div className={`graph-node__content${liveParts.description ? '' : ' graph-node__content--description-empty'}`}>
+                            <div className="graph-node__title">{liveParts.title}</div>
+                            <div className={`graph-node__description${liveParts.description ? '' : ' graph-node__description--empty'}`}>
+                              {liveParts.description || '（空）'}
+                            </div>
+                          </div>
                         )}
 
                         <button
@@ -10295,6 +12114,118 @@ export default function App() {
                     )}
                   />
                 ) : null}
+
+                {(
+                  <div
+                    className={`content-card content-card--pinned${selectedContent ? ' is-selected' : ''}${editingContent ? ' is-editing' : ''}${contentCardCollapsed ? ' is-collapsed' : ''}`}
+                    onDoubleClick={(event) => {
+                      event.stopPropagation();
+                      startContentInlineEdit();
+                    }}
+                    onWheelCapture={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => {
+                      const target = event.target as HTMLElement;
+                      if (target.closest('.content-card__action, .content-card__editor, .content-card__resize-handle')) {
+                        return;
+                      }
+
+                      event.stopPropagation();
+                      if (event.shiftKey) {
+                        setSelection((current) => toggleSelectionIds(current, 'content', [CONTENT_CARD_ID]));
+                        return;
+                      }
+                      setSelection({ kind: 'content', ids: [CONTENT_CARD_ID] });
+                    }}
+                    style={contentCardStyle}
+                  >
+                    <div
+                      className="content-card__header"
+                      onPointerDown={(event) => {
+                        event.stopPropagation();
+                      }}
+                    >
+                      <div className="content-card__header-copy">
+                        <span className="content-card__eyebrow">Additional</span>
+                        <strong>附加信息</strong>
+                      </div>
+                      <button
+                        aria-label={contentCardLayout.collapsed ? '展开附加信息' : '折叠附加信息'}
+                        className="content-card__action"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleContentCollapsed();
+                        }}
+                        type="button"
+                      >
+                        <WorkbenchIcon name={contentCardLayout.collapsed ? 'plus' : 'minus'} />
+                      </button>
+                    </div>
+
+                        {editingContent ? (
+                          <textarea
+                            autoFocus
+                        className="content-card__editor"
+                        onBlur={commitContentInlineEdit}
+                        onChange={(event) =>
+                          setContentInspectorDraft({ markdown: event.target.value })
+                        }
+                        onDoubleClick={(event) => event.stopPropagation()}
+                        onKeyDown={(event) => {
+                          if (handleNativeSelectAllShortcut(event)) {
+                            return;
+                          }
+
+                          if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                            event.preventDefault();
+                            commitContentInlineEdit();
+                            event.currentTarget.blur();
+                            return;
+                          }
+
+                          if (event.key === 'Escape') {
+                            event.preventDefault();
+                            setEditingContent(false);
+                            setContentInspectorDraft({ markdown: contentMarkdown });
+                          }
+                        }}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onWheelCapture={(event) => event.stopPropagation()}
+                        rows={Math.max(8, contentInspectorDraft.markdown.split(/\r?\n/).length + 2)}
+                        spellCheck={false}
+                        value={contentInspectorDraft.markdown}
+                      />
+                    ) : contentCardCollapsed ? (
+                      <div className="content-card__summary">
+                        <p>{contentCardSummary}</p>
+                      </div>
+                    ) : (
+                        <div
+                          className="content-card__body"
+                          onDoubleClick={(event) => {
+                            event.stopPropagation();
+                            startContentInlineEdit();
+                          }}
+                          onWheelCapture={(event) => event.stopPropagation()}
+                          dangerouslySetInnerHTML={{ __html: contentCardPreviewHtml }}
+                        />
+                      )}
+                    <div
+                      aria-hidden="true"
+                      className="content-card__resize-handle content-card__resize-handle--right"
+                      onPointerDown={(event) => beginContentCardResize(event, 'right')}
+                    />
+                    <div
+                      aria-hidden="true"
+                      className="content-card__resize-handle content-card__resize-handle--bottom"
+                      onPointerDown={(event) => beginContentCardResize(event, 'bottom')}
+                    />
+                    <div
+                      aria-hidden="true"
+                      className="content-card__resize-handle content-card__resize-handle--corner"
+                      onPointerDown={(event) => beginContentCardResize(event, 'corner')}
+                    />
+                  </div>
+                )}
 
                 <div className="tool-dock" role="toolbar" aria-label="画布工具">
                   <button
@@ -10382,7 +12313,7 @@ export default function App() {
             </div>
           ) : null}
 
-          {mode === 'source' ? (
+          {!isVsCodeHost && mode === 'source' ? (
             <div className="source-mode">
               <section className="source-pane">
                 <div className="pane-header">
@@ -10451,7 +12382,7 @@ export default function App() {
             </div>
           ) : null}
 
-          {mode === 'history' ? (
+          {!isVsCodeHost && mode === 'history' ? (
             <div className="history-mode">
               <div className="pane-header">
                 <div>
@@ -10484,15 +12415,15 @@ export default function App() {
             <div className="mobile-sheet-handle" aria-hidden="true" />
           ) : null}
 
-          <div className="inspector-tabs" role="tablist" aria-label="右侧面板视图">
-            <button
-              className={inspectorView === 'properties' ? 'inspector-tab is-active' : 'inspector-tab'}
-              onClick={() => setInspectorView('properties')}
-              type="button"
-            >
-              属性
-            </button>
-            {!isVsCodeHost ? (
+          {!isVsCodeHost ? (
+            <div className="inspector-tabs" role="tablist" aria-label="右侧面板视图">
+              <button
+                className={inspectorView === 'properties' ? 'inspector-tab is-active' : 'inspector-tab'}
+                onClick={() => setInspectorView('properties')}
+                type="button"
+              >
+                属性
+              </button>
               <button
                 className={inspectorView === 'ai' ? 'inspector-tab is-active' : 'inspector-tab'}
                 onClick={() => setInspectorView('ai')}
@@ -10500,62 +12431,67 @@ export default function App() {
               >
                 AI
               </button>
-            ) : null}
-          </div>
+            </div>
+          ) : null}
 
           {inspectorView === 'properties' ? (
             <>
-          {selectedNode ? (
+          {selectedNodes.length > 0 ? (
             <section className="sidebar-card">
               <div className="sidebar-card__header">
                 <h2>节点</h2>
-                <span>{selectedNode.id}</span>
+                <span>{selectedNodes.length === 1 ? selectedNode?.id : `已选中 ${selectedNodes.length} 个`}</span>
               </div>
-              <label className="field">
-                <span>内容</span>
-                <textarea
-                  onBlur={() => applyNodeInspectorDraft()}
-                  onChange={(event) =>
-                    setNodeInspectorDraft((current) => ({ ...current, label: event.target.value }))
-                  }
-                  onKeyDown={(event) => {
-                    if (handleNativeSelectAllShortcut(event)) {
-                      return;
-                    }
+              {selectedNodes.length === 1 ? (
+                <>
+                  <label className="field">
+                    <span>ID / 标题</span>
+                    <input
+                      onBlur={() => applyNodeInspectorDraft()}
+                      onChange={(event) =>
+                        setNodeInspectorDraft((current) => ({ ...current, label: event.target.value }))
+                      }
+                      onKeyDown={(event) => {
+                        if (handleNativeSelectAllShortcut(event)) {
+                          return;
+                        }
 
-                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                      event.preventDefault();
-                      applyNodeInspectorDraft();
-                      event.currentTarget.blur();
-                    }
-                  }}
-                  rows={4}
-                  value={nodeInspectorDraft.label}
-                />
-              </label>
-              <label className="field">
-                <span>注释</span>
-                <textarea
-                  onBlur={() => applyNodeInspectorDraft()}
-                  onChange={(event) =>
-                    setNodeInspectorDraft((current) => ({ ...current, annotation: event.target.value }))
-                  }
-                  onKeyDown={(event) => {
-                    if (handleNativeSelectAllShortcut(event)) {
-                      return;
-                    }
+                        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                          event.preventDefault();
+                          applyNodeInspectorDraft();
+                          event.currentTarget.blur();
+                        }
+                      }}
+                      type="text"
+                      value={nodeInspectorDraft.label}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>描述</span>
+                    <textarea
+                      onBlur={() => applyNodeInspectorDraft()}
+                      onChange={(event) =>
+                        setNodeInspectorDraft((current) => ({ ...current, description: event.target.value }))
+                      }
+                      onKeyDown={(event) => {
+                        if (handleNativeSelectAllShortcut(event)) {
+                          return;
+                        }
 
-                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                      event.preventDefault();
-                      applyNodeInspectorDraft();
-                      event.currentTarget.blur();
-                    }
-                  }}
-                  placeholder="节点注释会写入 ## Node Annotations，并随节点生命周期自动清理。"
-                  rows={3}
-                  value={nodeInspectorDraft.annotation}
-                />
-              </label>
+                        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                          event.preventDefault();
+                          applyNodeInspectorDraft();
+                          event.currentTarget.blur();
+                        }
+                      }}
+                      rows={5}
+                      value={nodeInspectorDraft.description}
+                    />
+                  </label>
+                </>
+              ) : (
+                <p className="field-hint">多选时可批量修改样式与形状，文本内容保持不变。</p>
+              )}
               <label className="field">
                 <span>形状</span>
                 <select
@@ -10738,7 +12674,7 @@ export default function App() {
                 <span>{selectedSubgraph.id}</span>
               </div>
               <label className="field">
-                <span>标题</span>
+                <span>ID / 标题</span>
                 <input
                   onBlur={() => applySubgraphInspectorDraft()}
                   onChange={(event) =>
@@ -10756,6 +12692,28 @@ export default function App() {
                     }
                   }}
                   value={subgraphInspectorDraft.title}
+                />
+              </label>
+              <label className="field">
+                <span>描述</span>
+                <textarea
+                  onBlur={() => applySubgraphInspectorDraft()}
+                  onChange={(event) =>
+                    setSubgraphInspectorDraft((current) => ({ ...current, description: event.target.value }))
+                  }
+                  onKeyDown={(event) => {
+                    if (handleNativeSelectAllShortcut(event)) {
+                      return;
+                    }
+
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault();
+                      applySubgraphInspectorDraft();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  rows={4}
+                  value={subgraphInspectorDraft.description}
                 />
               </label>
               <label className="toggle-row">
@@ -11163,7 +13121,7 @@ export default function App() {
           />
         ) : null}
 
-        {isMobileViewport && mode === 'source' ? (
+        {!isVsCodeHost && isMobileViewport && mode === 'source' ? (
           <section className={`mobile-source-preview-sheet${mobileSourcePreviewOpen ? ' is-open' : ''}`}>
             <div className="mobile-sheet-handle" aria-hidden="true" />
             <div className="pane-header">
@@ -11221,6 +13179,89 @@ export default function App() {
         ) : null}
       </main>
 
+      {svgPreviewOpen ? (
+        <div
+          aria-label="SVG 预览"
+          className="svg-preview-backdrop"
+          onClick={() => setSvgPreviewOpen(false)}
+          role="presentation"
+        >
+          <section
+            aria-modal="true"
+            className="svg-preview"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <div className="svg-preview__toolbar">
+              <strong>线框 SVG 预览</strong>
+              <div className="svg-preview__actions">
+                <button
+                  aria-label="缩小"
+                  className="icon-button has-tooltip"
+                  data-tooltip="缩小"
+                  onClick={() => setSvgPreviewScale((current) => Math.max(0.5, Number((current - 0.1).toFixed(2))))}
+                  type="button"
+                >
+                  <WorkbenchIcon name="minus" />
+                </button>
+                <span className="svg-preview__scale">{Math.round(svgPreviewScale * 100)}%</span>
+                <button
+                  aria-label="放大"
+                  className="icon-button has-tooltip"
+                  data-tooltip="放大"
+                  onClick={() => setSvgPreviewScale((current) => Math.min(3, Number((current + 0.1).toFixed(2))))}
+                  type="button"
+                >
+                  <WorkbenchIcon name="plus" />
+                </button>
+                <button
+                  aria-label="重置缩放"
+                  className="icon-button has-tooltip"
+                  data-tooltip="重置"
+                  onClick={() => setSvgPreviewScale(1)}
+                  type="button"
+                >
+                  <WorkbenchIcon name="reset" />
+                </button>
+                <button
+                  aria-label="保存 PNG"
+                  className="svg-preview__save-button"
+                  onClick={exportCanvasImage}
+                  type="button"
+                >
+                  <WorkbenchIcon name="download" />
+                  <span>下载 PNG</span>
+                </button>
+                <button
+                  aria-label="关闭 SVG 预览"
+                  className="icon-button has-tooltip"
+                  data-tooltip="关闭"
+                  onClick={() => setSvgPreviewOpen(false)}
+                  type="button"
+                >
+                  <WorkbenchIcon name="chevron-right" />
+                </button>
+              </div>
+            </div>
+
+            <div className="svg-preview__body">
+              {svgPreviewMarkup ? (
+                <div
+                  className="svg-preview__canvas"
+                  dangerouslySetInnerHTML={{ __html: svgPreviewMarkup }}
+                  style={{ transform: `scale(${svgPreviewScale})` }}
+                />
+              ) : (
+                <div className="preview-empty">
+                  <h3>SVG 预览暂不可用</h3>
+                  <p>当前画布尚未生成有效的 SVG 快照。</p>
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {helpDialogOpen ? (
         <div
           aria-label="操作说明"
@@ -11260,7 +13301,7 @@ export default function App() {
               </article>
               <article className="help-card">
                 <strong>⌨️ 快捷键</strong>
-                <p>`Delete` 删除，`Ctrl/Cmd + G` 分组，`Ctrl/Cmd + C / V` 复制粘贴，`Alt + Drag` 复制并拖拽，`Ctrl/Cmd + Z` 撤回。</p>
+                <p>`Delete` 删除，`Ctrl/Cmd + G` 分组，`Ctrl/Cmd + C / V` 复制粘贴，`Alt + Drag` 复制并拖拽，`Ctrl/Cmd + Z` 撤回，`Ctrl/Cmd + 双击节点` 选中整块连通节点。</p>
               </article>
               <article className="help-card">
                 <strong>✍️ 编辑</strong>
@@ -11268,7 +13309,7 @@ export default function App() {
               </article>
               <article className="help-card">
                 <strong>🌿 快速新建</strong>
-                <p>双击空白会创建一个未链接的新节点；如果双击发生在组内，就直接创建在该组里。选中节点按 `Tab` 会在旁边快速新建并自动连线；多选时会为每个节点各建一个新节点。</p>
+                <p>双击空白会创建一个未链接的新节点；如果双击发生在组内，就直接创建在该组里。选中节点按 `Tab` 会在旁边快速新建并自动连线；按 `Shift + Tab` 会创建同级镜像节点，并复制当前节点的入线关系；多选时会为每个节点分别执行。</p>
               </article>
               <article className="help-card">
                 <strong>📦 分组层级</strong>
