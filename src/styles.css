@@ -1841,12 +1841,12 @@ select:focus-visible {
   box-sizing: border-box;
   padding: 0;
   border-radius: var(--radius-lg);
-  border: 2px solid color-mix(in srgb, var(--subgraph-stroke, #24404f) 85%, rgba(17, 24, 39, 0.16));
-  background: var(--subgraph-fill, #fff8ef);
+  border: 0;
+  background: transparent;
   text-align: left;
   color: var(--subgraph-text, #12212c);
-  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.2);
-  overflow: hidden;
+  box-shadow: none;
+  overflow: visible;
   z-index: 1;
   transition:
     transform 140ms ease,
@@ -1855,24 +1855,26 @@ select:focus-visible {
 }
 
 .subgraph-frame.is-selected {
-  border-color: color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 96%, white 4%);
-  transform: translateY(-2px);
-  box-shadow:
-    0 20px 34px rgba(0, 0, 0, 0.34),
-    0 0 0 2px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 62%, transparent),
-    0 0 0 8px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 18%, transparent);
+  transform: none;
+  box-shadow: none;
 }
 
 .subgraph-frame.is-drop-target {
-  border-color: color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 96%, white 4%);
-  transform: translateY(-2px);
-  box-shadow:
-    0 0 0 2px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 58%, transparent),
-    0 0 0 8px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 16%, transparent),
-    0 18px 32px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 16%, rgba(0, 0, 0, 0.2));
+  transform: none;
+  box-shadow: none;
+}
+
+.subgraph-frame.is-collapsed {
+  border: 2px solid color-mix(in srgb, var(--subgraph-stroke, #24404f) 85%, rgba(17, 24, 39, 0.16));
+  background: var(--subgraph-fill, #fff8ef);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.2);
+  overflow: hidden;
 }
 
 .subgraph-frame__header {
+  position: absolute;
+  left: 10px;
+  top: 10px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1883,10 +1885,40 @@ select:focus-visible {
   background: color-mix(in srgb, var(--subgraph-fill, #fff8ef) 92%, white 8%);
   cursor: grab;
   user-select: none;
+  border: 1px solid color-mix(in srgb, var(--subgraph-stroke, #24404f) 24%, transparent);
+  border-radius: 999px;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+  z-index: 2;
 }
 
 .subgraph-frame__header:active {
   cursor: grabbing;
+}
+
+.subgraph-frame.is-selected .subgraph-frame__header {
+  border-color: color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 96%, white 4%);
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 58%, transparent),
+    0 0 0 8px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 14%, transparent),
+    0 10px 22px rgba(0, 0, 0, 0.24);
+}
+
+.subgraph-frame.is-drop-target .subgraph-frame__header {
+  border-color: color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 96%, white 4%);
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 54%, transparent),
+    0 0 0 8px color-mix(in srgb, var(--subgraph-stroke, #38bdf8) 14%, transparent),
+    0 10px 22px rgba(0, 0, 0, 0.24);
+}
+
+.subgraph-frame.is-collapsed .subgraph-frame__header {
+  position: relative;
+  left: auto;
+  top: auto;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--subgraph-stroke, #24404f) 18%, transparent);
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .subgraph-frame__header-copy {
@@ -2919,10 +2951,14 @@ select:focus-visible {
 }
 
 .subgraph-frame.is-search-match {
+  box-shadow: none;
+}
+
+.subgraph-frame.is-search-match .subgraph-frame__header {
   box-shadow:
     0 0 0 2px rgba(59, 130, 246, 0.42),
     0 0 0 9px rgba(59, 130, 246, 0.12),
-    0 20px 40px rgba(0, 0, 0, 0.22);
+    0 10px 22px rgba(0, 0, 0, 0.22);
 }
 
 .svg-preview-backdrop {

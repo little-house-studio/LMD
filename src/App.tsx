@@ -6063,6 +6063,42 @@ export default function App() {
       visibleNodes,
     ],
   );
+  const canvasBoardBounds = useMemo(() => {
+    const canvasBounds = canvasRef.current?.getBoundingClientRect();
+    const viewport = documentState.layout.viewport;
+    const viewportRect = canvasBounds
+      ? {
+          x: -viewport.x / viewport.zoom,
+          y: -viewport.y / viewport.zoom,
+          width: canvasBounds.width / viewport.zoom,
+          height: canvasBounds.height / viewport.zoom,
+        }
+      : null;
+
+    const minX = Math.min(
+      canvasExportBounds.x,
+      viewportRect ? viewportRect.x - 240 : canvasExportBounds.x,
+    );
+    const minY = Math.min(
+      canvasExportBounds.y,
+      viewportRect ? viewportRect.y - 240 : canvasExportBounds.y,
+    );
+    const maxX = Math.max(
+      canvasExportBounds.x + canvasExportBounds.width,
+      viewportRect ? viewportRect.x + viewportRect.width + 240 : canvasExportBounds.x + canvasExportBounds.width,
+    );
+    const maxY = Math.max(
+      canvasExportBounds.y + canvasExportBounds.height,
+      viewportRect ? viewportRect.y + viewportRect.height + 240 : canvasExportBounds.y + canvasExportBounds.height,
+    );
+
+    return {
+      x: Math.floor(minX),
+      y: Math.floor(minY),
+      width: Math.max(1280, Math.ceil(maxX - minX)),
+      height: Math.max(720, Math.ceil(maxY - minY)),
+    };
+  }, [canvasExportBounds, documentState.layout.viewport]);
   const liveEdgeMarkerEntries = useMemo(() => {
     const markerMap = new Map<string, string>();
     let markerIndex = 0;
@@ -8963,6 +8999,12 @@ export default function App() {
       }
 
       if ((event.metaKey || event.ctrlKey) && event.key === '2') {
+        event.preventDefault();
+        goToMode('source');
+        return;
+      }
+
+      if ((event.metaKey || event.ctrlKey) && lowerKey === 'e' && selection.kind !== 'none') {
         event.preventDefault();
         goToMode('source');
         return;
@@ -12281,7 +12323,9 @@ export default function App() {
                   className="canvas-board"
                   ref={canvasBoardRef}
                   style={{
-                    transform: `translate(${documentState.layout.viewport.x}px, ${documentState.layout.viewport.y}px) scale(${documentState.layout.viewport.zoom})`,
+                    width: canvasBoardBounds.width,
+                    height: canvasBoardBounds.height,
+                    transform: `translate(${documentState.layout.viewport.x + canvasBoardBounds.x * documentState.layout.viewport.zoom}px, ${documentState.layout.viewport.y + canvasBoardBounds.y * documentState.layout.viewport.zoom}px) scale(${documentState.layout.viewport.zoom})`,
                   }}
                 >
                   {[...subgraphFrames].sort((left, right) => left.depth - right.depth).map((frame) => {
@@ -12333,8 +12377,8 @@ export default function App() {
                           selectSingle('subgraph', frame.id, event.shiftKey);
                         }}
                         style={{
-                          left: frame.x,
-                          top: frame.y,
+                          left: frame.x - canvasBoardBounds.x,
+                          top: frame.y - canvasBoardBounds.y,
                           width: frame.width,
                           height: frame.height,
                           '--depth': String(frame.depth),
@@ -12494,60 +12538,61 @@ export default function App() {
                         </marker>
                       ))}
                     </defs>
-                    {visibleEdges.map((edge) => {
-                      const normalizedEdge = normalizeEdgeStyle(edge);
-                      const fromNode = edgeEndpointMap.get(edge.from);
-                      const toNode = edgeEndpointMap.get(edge.to);
-                      if (!fromNode || !toNode) {
-                        return null;
-                      }
+                    <g transform={`translate(${-canvasBoardBounds.x} ${-canvasBoardBounds.y})`}>
+                      {visibleEdges.map((edge) => {
+                        const normalizedEdge = normalizeEdgeStyle(edge);
+                        const fromNode = edgeEndpointMap.get(edge.from);
+                        const toNode = edgeEndpointMap.get(edge.to);
+                        if (!fromNode || !toNode) {
+                          return null;
+                        }
 
-                      const isGroupEdge = fromNode.kind === 'subgraph' || toNode.kind === 'subgraph';
-                      const isEdgeSelected =
-                        selection.kind === 'edge' && selectionContains(selection, edge.id);
-                      const inheritsSourceColor =
-                        shouldInheritSourceEdgeColor(normalizedEdge.strokeColor);
+                        const isGroupEdge = fromNode.kind === 'subgraph' || toNode.kind === 'subgraph';
+                        const isEdgeSelected =
+                          selection.kind === 'edge' && selectionContains(selection, edge.id);
+                        const inheritsSourceColor =
+                          shouldInheritSourceEdgeColor(normalizedEdge.strokeColor);
 
-                      const geometry = buildEdgeGeometry(
-                        fromNode,
-                        toNode,
-                        edgeLaneMap.get(edge.id) ?? 0,
-                        edgeEndpointOffsetMap.get(edge.id),
-                      );
-                      const edgeBaseColor = inheritsSourceColor
-                        ? getEndpointAccentColor(fromNode)
-                        : normalizedEdge.strokeColor;
-                      const baseStrokeWidth = isGroupEdge
-                        ? normalizedEdge.strokeWidth * 2
-                        : normalizedEdge.strokeWidth;
-                      const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 4.2 : 3.2);
-                      const selectedEdgeStrokeWidth =
-                        isEdgeSelected
-                          ? visualStrokeWidth + 0.9
-                          : visualStrokeWidth;
-                      const displayStroke = withAlpha(edgeBaseColor, 1);
-                      const outlineStroke = mixColors(edgeBaseColor, '#0f172a', isGroupEdge ? 0.56 : 0.5);
-                      const outlineWidth = selectedEdgeStrokeWidth + (isGroupEdge ? 0.34 : 0.26);
-                      const labelBackground = mixColors(
-                        edgeBaseColor,
-                        '#f8fafc',
-                        inheritsSourceColor ? 0.66 : 0.76,
-                      );
-                      const labelTextColor = getReadableLabelTextColor(
-                        labelBackground,
-                        edgeBaseColor,
-                      );
-                      const labelBorder = withAlpha(edgeBaseColor, isEdgeSelected ? 0.82 : 0.64);
-                      const labelMetrics = edge.label ? measureEdgeLabelBadge(edge.label) : null;
-                      const liveEdgeLabel = editingEdgeId === edge.id ? editingEdgeLabel || ' ' : edge.label;
-                      const liveEdgeLabelMetrics = measureEdgeLabelBadge(liveEdgeLabel);
-                      const edgeLabelLines = edge.label.split(/\r?\n/);
-                      const arrowMarkerId = edge.type === 'line'
-                        ? undefined
-                        : liveEdgeMarkerIdMap.get(edgeBaseColor);
+                        const geometry = buildEdgeGeometry(
+                          fromNode,
+                          toNode,
+                          edgeLaneMap.get(edge.id) ?? 0,
+                          edgeEndpointOffsetMap.get(edge.id),
+                        );
+                        const edgeBaseColor = inheritsSourceColor
+                          ? getEndpointAccentColor(fromNode)
+                          : normalizedEdge.strokeColor;
+                        const baseStrokeWidth = isGroupEdge
+                          ? normalizedEdge.strokeWidth * 2
+                          : normalizedEdge.strokeWidth;
+                        const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 4.2 : 3.2);
+                        const selectedEdgeStrokeWidth =
+                          isEdgeSelected
+                            ? visualStrokeWidth + 0.9
+                            : visualStrokeWidth;
+                        const displayStroke = withAlpha(edgeBaseColor, 1);
+                        const outlineStroke = mixColors(edgeBaseColor, '#0f172a', isGroupEdge ? 0.56 : 0.5);
+                        const outlineWidth = selectedEdgeStrokeWidth + (isGroupEdge ? 0.34 : 0.26);
+                        const labelBackground = mixColors(
+                          edgeBaseColor,
+                          '#f8fafc',
+                          inheritsSourceColor ? 0.66 : 0.76,
+                        );
+                        const labelTextColor = getReadableLabelTextColor(
+                          labelBackground,
+                          edgeBaseColor,
+                        );
+                        const labelBorder = withAlpha(edgeBaseColor, isEdgeSelected ? 0.82 : 0.64);
+                        const labelMetrics = edge.label ? measureEdgeLabelBadge(edge.label) : null;
+                        const liveEdgeLabel = editingEdgeId === edge.id ? editingEdgeLabel || ' ' : edge.label;
+                        const liveEdgeLabelMetrics = measureEdgeLabelBadge(liveEdgeLabel);
+                        const edgeLabelLines = edge.label.split(/\r?\n/);
+                        const arrowMarkerId = edge.type === 'line'
+                          ? undefined
+                          : liveEdgeMarkerIdMap.get(edgeBaseColor);
 
-                      return (
-                        <g key={edge.id}>
+                        return (
+                          <g key={edge.id}>
                           {isEdgeSelected ? (
                             <path
                               className={`edge-path edge-path--selection${isGroupEdge ? ' is-group-edge' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
@@ -12700,62 +12745,63 @@ export default function App() {
                               </text>
                             </g>
                           ) : null}
-                        </g>
-                      );
-                    })}
+                          </g>
+                        );
+                      })}
 
-                    {dragInsertPreview ? (
-                      <>
+                      {dragInsertPreview ? (
+                        <>
+                          <path
+                            className="edge-path edge-path--preview edge-path--insert-preview"
+                            d={dragInsertPreview.first.path}
+                            markerEnd={(() => {
+                              const marker = liveEdgeMarkerEntries.find((entry) => entry.color === dragInsertPreview.stroke);
+                              return marker ? `url(#${marker.id})` : undefined;
+                            })()}
+                            stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
+                          />
+                          <path
+                            className="edge-path edge-path--preview edge-path--insert-preview"
+                            d={dragInsertPreview.second.path}
+                            markerEnd={(() => {
+                              const marker = liveEdgeMarkerEntries.find((entry) => entry.color === dragInsertPreview.stroke);
+                              return marker ? `url(#${marker.id})` : undefined;
+                            })()}
+                            stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
+                          />
+                        </>
+                      ) : null}
+
+                      {connectingState ? (
                         <path
-                          className="edge-path edge-path--preview edge-path--insert-preview"
-                          d={dragInsertPreview.first.path}
+                          className="edge-path edge-path--preview"
+                          d={(() => {
+                            const originNode = edgeEndpointMap.get(connectingState.fromId);
+                            if (!originNode) {
+                              return '';
+                            }
+
+                            return buildPreviewEdgePath(originNode, connectingState.current, connectingState.handleSide);
+                          })()}
                           markerEnd={(() => {
-                            const marker = liveEdgeMarkerEntries.find((entry) => entry.color === dragInsertPreview.stroke);
+                            if (connectingState.edgeType === 'line') {
+                              return undefined;
+                            }
+                            const originNode = edgeEndpointMap.get(connectingState.fromId);
+                            if (!originNode) {
+                              return undefined;
+                            }
+                            const color = withAlpha(originNode.stroke, 0.9);
+                            const marker = liveEdgeMarkerEntries.find((entry) => entry.color === color);
                             return marker ? `url(#${marker.id})` : undefined;
                           })()}
-                          stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
-                        />
-                        <path
-                          className="edge-path edge-path--preview edge-path--insert-preview"
-                          d={dragInsertPreview.second.path}
-                          markerEnd={(() => {
-                            const marker = liveEdgeMarkerEntries.find((entry) => entry.color === dragInsertPreview.stroke);
-                            return marker ? `url(#${marker.id})` : undefined;
+                          stroke={(() => {
+                            const originNode = edgeEndpointMap.get(connectingState.fromId);
+                            return originNode ? withAlpha(originNode.stroke, 0.9) : undefined;
                           })()}
-                          stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
                         />
-                      </>
-                    ) : null}
-
-                    {connectingState ? (
-                      <path
-                        className="edge-path edge-path--preview"
-                        d={(() => {
-                          const originNode = edgeEndpointMap.get(connectingState.fromId);
-                          if (!originNode) {
-                            return '';
-                          }
-
-                          return buildPreviewEdgePath(originNode, connectingState.current, connectingState.handleSide);
-                        })()}
-                        markerEnd={(() => {
-                          if (connectingState.edgeType === 'line') {
-                            return undefined;
-                          }
-                          const originNode = edgeEndpointMap.get(connectingState.fromId);
-                          if (!originNode) {
-                            return undefined;
-                          }
-                          const color = withAlpha(originNode.stroke, 0.9);
-                          const marker = liveEdgeMarkerEntries.find((entry) => entry.color === color);
-                          return marker ? `url(#${marker.id})` : undefined;
-                        })()}
-                        stroke={(() => {
-                          const originNode = edgeEndpointMap.get(connectingState.fromId);
-                          return originNode ? withAlpha(originNode.stroke, 0.9) : undefined;
-                        })()}
-                      />
-                    ) : null}
+                      ) : null}
+                    </g>
                   </svg>
 
                   {visibleNodes.map((node) => {
@@ -12795,8 +12841,8 @@ export default function App() {
                         onMouseLeave={() => setHoveredNodeId((current) => (current === node.id ? null : current))}
                         onPointerDown={(event) => startNodeDrag(event, node)}
                         style={{
-                          left: node.x,
-                          top: node.y,
+                          left: node.x - canvasBoardBounds.x,
+                          top: node.y - canvasBoardBounds.y,
                           width: liveSize.width,
                           height: liveSize.height,
                           background: node.fill,
