@@ -13,7 +13,6 @@ flowchart LR
     原生文本编辑器_p02["IDE 原生文本编辑器"]
     用户交互入口_u01["节点 / 连线 / 分组 / 搜索 / 导出"]
   end
-
   subgraph LMD协议与文件_g02["LMD 协议与单文件结构"]
     LMD文件_d01[".lmd 单文件真相源"]
     工程抬头_d02["Project Name / Summary"]
@@ -22,7 +21,6 @@ flowchart LR
     兼容层_d05["lths-compat 布局与窗口态"]
     标准化流程_d06["标准化 / 迁移 / 幂等修复"]
   end
-
   subgraph 共享编辑核心_g03["共享编辑核心"]
     App主控_c01["src/App.tsx 画布状态与宿主分支"]
     协议读写_c02["projectMarkdown.ts 解析 / 物化 / 标准化"]
@@ -32,7 +30,6 @@ flowchart LR
     本地存储_c06["storage.ts UI 偏好与浏览器态"]
     示例与样板_c07["sample.ts / skills/lmd-protocol"]
   end
-
   subgraph 画布与可视化_g04["画布与可视化能力"]
     节点系统_v01["标题 / 详细双层节点"]
     连线系统_v02["彩色继承线 / 箭头 / 标签 / 避让"]
@@ -42,7 +39,6 @@ flowchart LR
     整理布局_v06["整理与布局双模式"]
     导出链路_v07["SVG 预览 / PNG 导出"]
   end
-
   subgraph Web完整版能力_g05["Web 完整工作台"]
     文件工作区_w02["云端 / 本地 LMD 文件区"]
     AI工作区_w03["聊天 / 规则 / 工具调用"]
@@ -50,21 +46,18 @@ flowchart LR
     历史视图_w05["历史模式与记录"]
     源码模式_w06["内置源码查看与编辑"]
   end
-
   subgraph 插件版能力_g06["LMD_EDITER 插件版"]
     画布默认打开_p03["*.lmd 默认进入画布"]
     源码跳转选中_p04["点击源码切原生编辑器并选中范围"]
     插件精简策略_p05["删除 AI / 云端 / 历史 / 文件管理"]
     桥接消息层_p06["extension.cts Webview 消息桥"]
   end
-
   subgraph 构建与交付_g07["构建与交付"]
     Webview构建_b01["build:webview -> dist/"]
     扩展构建_b02["build:extension -> out/"]
     VSIX打包_b03["package:vsix -> LMD_EDITER.vsix"]
     静态部署_b04["Linux / Cloudflare 静态交付"]
   end
-
   subgraph 生产边界与判断_g08["生产边界与判断"]
     Flowchart改写边界_r01["结构化改写只支持 flowchart / graph"]
     非Flowchart保留_r02["classDiagram 等仅源码保留"]
@@ -75,7 +68,6 @@ flowchart LR
 
   用户交互入口_u01 -->|操作| 浏览器完整站点_w01
   用户交互入口_u01 -->|操作| 插件宿主壳_p01
-
   浏览器完整站点_w01 -->|载入| App主控_c01
   插件宿主壳_p01 -->|承载| 桥接消息层_p06
   桥接消息层_p06 -->|驱动| 画布默认打开_p03
@@ -83,19 +75,16 @@ flowchart LR
   画布默认打开_p03 -->|源码按钮| 源码跳转选中_p04
   源码跳转选中_p04 -->|切换并选中| 原生文本编辑器_p02
   插件精简策略_p05 -.->|裁掉外围功能| 画布默认打开_p03
-
   LMD文件_d01 -->|包含| 工程抬头_d02
   LMD文件_d01 -->|包含| 图正文_d03
   LMD文件_d01 -->|包含| 附加信息正文_d04
   LMD文件_d01 -->|包含| 兼容层_d05
   标准化流程_d06 -->|修正旧格式| LMD文件_d01
-
   工程抬头_d02 -->|解析| 协议读写_c02
   图正文_d03 -->|解析| 协议读写_c02
   附加信息正文_d04 -->|解析| 协议读写_c02
   兼容层_d05 -->|解析| 协议读写_c02
   标准化流程_d06 -->|调用| 协议读写_c02
-
   协议读写_c02 -->|构建运行态| 类型系统_c04
   类型系统_c04 -->|承载| App主控_c01
   ID生成策略_c05 -->|生成节点 ID| 协议读写_c02
@@ -103,7 +92,6 @@ flowchart LR
   App主控_c01 -->|读写文档| 协议读写_c02
   App主控_c01 -->|局部偏好| 本地存储_c06
   示例与样板_c07 -->|约束协议口径| 协议读写_c02
-
   App主控_c01 -->|渲染| 节点系统_v01
   App主控_c01 -->|渲染| 连线系统_v02
   App主控_c01 -->|渲染| 分组系统_v03
@@ -113,13 +101,11 @@ flowchart LR
   App主控_c01 -->|执行| 导出链路_v07
   Mermaid引擎_c03 -->|支撑| 整理布局_v06
   Mermaid引擎_c03 -->|支撑| 导出链路_v07
-
   浏览器完整站点_w01 -->|包含| 文件工作区_w02
   浏览器完整站点_w01 -->|包含| AI工作区_w03
   浏览器完整站点_w01 -->|包含| 协作状态_w04
   浏览器完整站点_w01 -->|包含| 历史视图_w05
   浏览器完整站点_w01 -->|包含| 源码模式_w06
-
   文件工作区_w02 -->|打开 / 新建 / 重命名| LMD文件_d01
   AI工作区_w03 -->|读取| 工程抬头_d02
   AI工作区_w03 -->|读取| 图正文_d03
@@ -127,12 +113,10 @@ flowchart LR
   AI工作区_w03 -->|工具调用| 协议读写_c02
   历史视图_w05 -->|来源| 本地存储_c06
   源码模式_w06 -->|编辑| LMD文件_d01
-
   Webview构建_b01 -->|产出| 静态部署_b04
   扩展构建_b02 -->|产出| VSIX打包_b03
   App主控_c01 -->|进入| Webview构建_b01
   桥接消息层_p06 -->|进入| 扩展构建_b02
-
   Flowchart改写边界_r01 -->|约束| Mermaid引擎_c03
   非Flowchart保留_r02 -->|约束| 协议读写_c02
   生产价值_r03 -->|支撑场景| LMD文件_d01
@@ -145,14 +129,12 @@ flowchart LR
   style 插件宿主壳_p01 fill:#eef2ff,stroke:#4f46e5,color:#1e1b4b
   style 原生文本编辑器_p02 fill:#f5f3ff,stroke:#7c3aed,color:#2e1065
   style 用户交互入口_u01 fill:#fff7db,stroke:#d97706,color:#422006
-
   style LMD文件_d01 fill:#fff8ef,stroke:#c2410c,color:#431407
   style 工程抬头_d02 fill:#ffe7d4,stroke:#ea580c,color:#431407
   style 图正文_d03 fill:#e0f2fe,stroke:#0284c7,color:#082f49
   style 附加信息正文_d04 fill:#dcfce7,stroke:#16a34a,color:#052e16
   style 兼容层_d05 fill:#f3f4f6,stroke:#6b7280,color:#111827
   style 标准化流程_d06 fill:#fef3c7,stroke:#ca8a04,color:#422006
-
   style App主控_c01 fill:#ffe3ea,stroke:#be123c,color:#4c0519
   style 协议读写_c02 fill:#fdf2f8,stroke:#db2777,color:#4a044e
   style Mermaid引擎_c03 fill:#ede9fe,stroke:#7c3aed,color:#2e1065
@@ -160,31 +142,19 @@ flowchart LR
   style ID生成策略_c05 fill:#ecfccb,stroke:#65a30d,color:#365314
   style 本地存储_c06 fill:#f1f5f9,stroke:#64748b,color:#0f172a
   style 示例与样板_c07 fill:#faf5ff,stroke:#9333ea,color:#3b0764
-
-  style 节点系统_v01 fill:#fff8ef,stroke:#24404f,color:#12212c
-  style 连线系统_v02 fill:#fff8ef,stroke:#24404f,color:#12212c
-  style 分组系统_v03 fill:#fff8ef,stroke:#24404f,color:#12212c
-  style 附加信息窗口_v04 fill:#fff8ef,stroke:#24404f,color:#12212c
-  style 搜索导航_v05 fill:#fff8ef,stroke:#24404f,color:#12212c
-  style 整理布局_v06 fill:#fff8ef,stroke:#24404f,color:#12212c
-  style 导出链路_v07 fill:#fff8ef,stroke:#24404f,color:#12212c
-
   style 文件工作区_w02 fill:#dbeafe,stroke:#2563eb,color:#0f172a
   style AI工作区_w03 fill:#ede9fe,stroke:#7c3aed,color:#2e1065
   style 协作状态_w04 fill:#dcfce7,stroke:#16a34a,color:#14532d
   style 历史视图_w05 fill:#fef3c7,stroke:#ca8a04,color:#422006
   style 源码模式_w06 fill:#f3f4f6,stroke:#6b7280,color:#111827
-
   style 画布默认打开_p03 fill:#e0e7ff,stroke:#4f46e5,color:#1e1b4b
   style 源码跳转选中_p04 fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
   style 插件精简策略_p05 fill:#fae8ff,stroke:#a21caf,color:#581c87
   style 桥接消息层_p06 fill:#eef2ff,stroke:#6366f1,color:#312e81
-
   style Webview构建_b01 fill:#cffafe,stroke:#0891b2,color:#083344
   style 扩展构建_b02 fill:#ddd6fe,stroke:#7c3aed,color:#2e1065
   style VSIX打包_b03 fill:#fee2e2,stroke:#dc2626,color:#450a0a
   style 静态部署_b04 fill:#ecfccb,stroke:#65a30d,color:#365314
-
   style Flowchart改写边界_r01 fill:#fee2e2,stroke:#dc2626,color:#450a0a
   style 非Flowchart保留_r02 fill:#fee2e2,stroke:#dc2626,color:#450a0a
   style 生产价值_r03 fill:#dcfce7,stroke:#16a34a,color:#14532d
@@ -480,5 +450,5 @@ ID 应该保持：
 基于当前协议、共享核心和单文件结构，这个项目有机会继续收敛到内网工作流与架构文档的生产场景；但这仍然取决于后续对布局算法、大图性能、导出稳定性和插件壳纯化的持续打磨。
 
 ```lths-compat
-v1;vp=80,100,0.82;cb=236,184
+v1;vp=361.751,143.84,0.468;n=浏览器完整站点_w01,-248,522|插件宿主壳_p01,-248,362|原生文本编辑器_p02,13792,1642|用户交互入口_u01,-508,362|LMD文件_d01,11300,120|工程抬头_d02,11560,280|图正文_d03,11560,600|附加信息正文_d04,11560,120|兼容层_d05,11560,440|标准化流程_d06,1680,120|App主控_c01,14160,280|协议读写_c02,14420,1240|Mermaid引擎_c03,7920,120|类型系统_c04,14680,280|ID生成策略_c05,3240,120|本地存储_c06,14420,120|示例与样板_c07,4800,120|节点系统_v01,14420,760|连线系统_v02,14420,920|分组系统_v03,14420,440|附加信息窗口_v04,14420,600|搜索导航_v05,14420,1080|整理布局_v06,14420,1560|导出链路_v07,14420,280|文件工作区_w02,640,440|AI工作区_w03,640,920|协作状态_w04,640,600|历史视图_w05,640,120|源码模式_w06,640,760|画布默认打开_p03,13900,120|源码跳转选中_p04,14160,120|插件精简策略_p05,6360,120|桥接消息层_p06,640,280|Webview构建_b01,14420,1720|扩展构建_b02,900,120|VSIX打包_b03,1160,120|静态部署_b04,14680,120|Flowchart改写边界_r01,7660,120|非Flowchart保留_r02,9480,120|生产价值_r03,11040,120|性能风险_r04,13120,120|插件性能判断_r05,13640,120;cb=236,184
 ```

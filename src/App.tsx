@@ -122,6 +122,49 @@ interface SubgraphFrame {
   summaryLabels: string[];
 }
 
+interface SubgraphBlobShape {
+  id: string;
+  bounds: Rect;
+  defaultBadgeAnchor: Point;
+  fieldThreshold: number;
+  depth: number;
+  collapsed: boolean;
+  primitives: BlobPrimitive[];
+  regions: Array<{
+    bounds: Rect;
+    path: string;
+  }>;
+}
+
+interface ContourSegment {
+  start: Point;
+  end: Point;
+}
+
+interface BlobRoundedRectPrimitive {
+  kind: 'rounded-rect';
+  rect: Rect;
+  radius: number;
+  softness: number;
+  weight: number;
+}
+
+interface BlobCapsulePrimitive {
+  kind: 'capsule';
+  start: Point;
+  end: Point;
+  radius: number;
+  softness: number;
+  weight: number;
+}
+
+type BlobPrimitive = BlobRoundedRectPrimitive | BlobCapsulePrimitive;
+
+interface SubgraphBadgeAnchor {
+  offsetX: number;
+  offsetY: number;
+}
+
 interface GraphTreeItem {
   id: string;
   depth: number;
@@ -177,6 +220,8 @@ interface NodeClipboardState {
 
 const PINCH_RESPONSE = 1.3;
 const WHEEL_PINCH_DIVISOR = 360;
+const MIN_CANVAS_ZOOM = 0.05;
+const MAX_CANVAS_ZOOM = 2.8;
 const NAV_RAIL_WIDTH = 38;
 const DEFAULT_SIDEBAR_WIDTH = 188;
 const DEFAULT_INSPECTOR_WIDTH = 320;
@@ -185,6 +230,8 @@ const CONTENT_CARD_MAX_WIDTH = 360;
 const CONTENT_CARD_COLLAPSED_HEIGHT = 38;
 const CONTENT_CARD_MIN_HEIGHT = 80;
 const CONTENT_CARD_MAX_HEIGHT = 320;
+const DEFAULT_CONTENT_CARD_X = 18;
+const DEFAULT_CONTENT_CARD_Y = 64;
 const MIN_SIDEBAR_WIDTH = 164;
 const MIN_INSPECTOR_WIDTH = 272;
 const MAX_SIDEBAR_WIDTH = 280;
@@ -400,13 +447,52 @@ const nodeStylePresets = [
   { id: 'night', label: '夜幕', fill: '#0f172a', stroke: '#60a5fa', textColor: '#f8fafc' },
 ] as const;
 
+const subgraphColorPresets = [
+  { fill: '#ffd8a8', stroke: '#f08c00', textColor: '#5f370e' },
+  { fill: '#c7d2fe', stroke: '#4f46e5', textColor: '#312e81' },
+  { fill: '#a7f3d0', stroke: '#059669', textColor: '#064e3b' },
+  { fill: '#fecdd3', stroke: '#e11d48', textColor: '#881337' },
+  { fill: '#bfdbfe', stroke: '#2563eb', textColor: '#1e3a8a' },
+  { fill: '#fde68a', stroke: '#ca8a04', textColor: '#713f12' },
+  { fill: '#d9f99d', stroke: '#65a30d', textColor: '#365314' },
+  { fill: '#fbcfe8', stroke: '#db2777', textColor: '#831843' },
+] as const;
+
 const collaboratorPresets = [
   { id: 'lin', name: 'Lin', role: '画布', color: '#f97316' },
   { id: 'mina', name: 'Mina', role: '源码', color: '#22c55e' },
   { id: 'kai', name: 'Kai', role: '评审', color: '#38bdf8' },
 ] as const;
 
-function getSubgraphStyle(subgraph: Pick<GraphSubgraph, 'fill' | 'stroke' | 'textColor'> | null | undefined) {
+function hashStringToNumber(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+function getSubgraphStyle(
+  subgraph: Pick<GraphSubgraph, 'id' | 'fill' | 'stroke' | 'textColor'> | null | undefined,
+) {
+  const hasCustomStyle =
+    subgraph != null &&
+    (
+      subgraph.fill !== defaultSubgraphStyle.fill ||
+      subgraph.stroke !== defaultSubgraphStyle.stroke ||
+      subgraph.textColor !== defaultSubgraphStyle.textColor
+    );
+  if (!hasCustomStyle) {
+    const preset = subgraphColorPresets[
+      hashStringToNumber(subgraph?.id ?? 'subgraph-default') % subgraphColorPresets.length
+    ];
+    return {
+      fill: preset.fill,
+      stroke: preset.stroke,
+      textColor: preset.textColor,
+    };
+  }
+
   return {
     fill: subgraph?.fill ?? defaultSubgraphStyle.fill,
     stroke: subgraph?.stroke ?? defaultSubgraphStyle.stroke,
@@ -1268,8 +1354,13 @@ function localizeLegacyHistoryEntry(entry: HistoryEntry): HistoryEntry {
   };
 }
 
-function materializeDocument(candidate: GraphDocument): GraphDocument {
-  const normalizedCandidate = normalizeFlowchartDocumentNodeIds(candidate);
+function materializeDocument(
+  candidate: GraphDocument,
+  options?: {
+    preserveNodeIds?: Iterable<string>;
+  },
+): GraphDocument {
+  const normalizedCandidate = normalizeFlowchartDocumentNodeIds(candidate, options);
   const normalizedNodes = normalizedCandidate.nodes.map((node) => resizeNodeToContent(node, node.label));
   const normalizedEdges = normalizedCandidate.edges.map(normalizeEdgeStyle);
   const layout: LayoutSidecar = {
@@ -1569,17 +1660,25 @@ function buildNode(
   };
 }
 
-function normalizeFlowchartDocumentNodeIds(candidate: GraphDocument) {
+function normalizeFlowchartDocumentNodeIds(
+  candidate: GraphDocument,
+  options?: {
+    preserveNodeIds?: Iterable<string>;
+  },
+) {
   if (candidate.diagramType !== 'flowchart') {
     return candidate;
   }
 
+  const preservedIds = new Set(options?.preserveNodeIds ?? []);
   const usedIds = new Set<string>();
   const finalRemap = new Map<string, string>();
 
   const nodes = candidate.nodes.map((node) => {
     const parts = splitEntityText(node.label);
-    const nextId = buildEntityIdFromTitle(parts.title || '未命名内容', usedIds, node.id);
+    const nextId = preservedIds.has(node.id)
+      ? node.id
+      : buildEntityIdFromTitle(parts.title || '未命名内容', usedIds, node.id);
     usedIds.add(nextId);
     finalRemap.set(node.id, nextId);
     return {
@@ -2113,18 +2212,56 @@ function getContentCardLayout(document: GraphDocument): ContentCardLayout {
   const raw = document.compat?.extras && typeof document.compat.extras === 'object'
     ? (document.compat.extras as Record<string, unknown>).contentBox
     : null;
+  const rawSize = document.compat?.extras && typeof document.compat.extras === 'object'
+    ? (document.compat.extras as Record<string, unknown>).contentBoxSize
+    : null;
+  const numericRaw = Array.isArray(raw) ? raw : null;
+  const numericRawSize = Array.isArray(rawSize) ? rawSize : null;
   const collapsed = raw == null
     ? true
-    : Array.isArray(raw) && raw.length >= 3 && (raw[2] === 1 || raw[2] === true);
-  const width = Array.isArray(raw) && raw.length >= 2 && typeof raw[0] === 'number' && raw[0] >= CONTENT_CARD_MIN_WIDTH
-    ? raw[0]
-    : undefined;
-  const height = Array.isArray(raw) && raw.length >= 2 && typeof raw[1] === 'number' && raw[1] >= CONTENT_CARD_MIN_HEIGHT
-    ? raw[1]
-    : undefined;
+    : numericRaw != null && numericRaw.length >= 3 && (numericRaw[2] === 1 || numericRaw[2] === true);
+
+  const resolvedSize = numericRawSize != null &&
+    numericRawSize.length >= 2 &&
+    typeof numericRawSize[0] === 'number' &&
+    typeof numericRawSize[1] === 'number'
+      ? {
+          width: numericRawSize[0],
+          height: numericRawSize[1],
+        }
+      : null;
+
+  const looksLikeLegacySize =
+    resolvedSize == null &&
+    numericRaw != null &&
+    numericRaw.length >= 2 &&
+    typeof numericRaw[0] === 'number' &&
+    typeof numericRaw[1] === 'number' &&
+    numericRaw[0] >= CONTENT_CARD_MIN_WIDTH &&
+    numericRaw[0] <= CONTENT_CARD_MAX_WIDTH &&
+    numericRaw[1] >= CONTENT_CARD_MIN_HEIGHT &&
+    numericRaw[1] <= CONTENT_CARD_MAX_HEIGHT;
+
+  const width = resolvedSize?.width ?? (looksLikeLegacySize && numericRaw != null ? numericRaw[0] : undefined);
+  const height = resolvedSize?.height ?? (looksLikeLegacySize && numericRaw != null ? numericRaw[1] : undefined);
+  const x =
+    numericRaw != null &&
+    numericRaw.length >= 2 &&
+    typeof numericRaw[0] === 'number' &&
+    !looksLikeLegacySize
+      ? numericRaw[0]
+      : DEFAULT_CONTENT_CARD_X;
+  const y =
+    numericRaw != null &&
+    numericRaw.length >= 2 &&
+    typeof numericRaw[1] === 'number' &&
+    !looksLikeLegacySize
+      ? numericRaw[1]
+      : DEFAULT_CONTENT_CARD_Y;
+
   return {
-    x: 18,
-    y: 18,
+    x,
+    y,
     collapsed,
     width,
     height,
@@ -2169,15 +2306,13 @@ function withContentCardLayout(document: GraphDocument, layout: ContentCardLayou
       ...compat,
       extras: {
         ...(compat.extras ?? {}),
-        contentBox: (() => {
-          if (typeof layout.width === 'number' && typeof layout.height === 'number') {
-            return layout.collapsed
-              ? [Math.round(layout.width), Math.round(layout.height), 1] as [number, number, 1]
-              : [Math.round(layout.width), Math.round(layout.height)] as [number, number];
-          }
-
-          return layout.collapsed ? [56, 56, 1] as [number, number, 1] : [56, 56] as [number, number];
-        })(),
+        contentBox: layout.collapsed
+          ? [Math.round(layout.x), Math.round(layout.y), 1] as [number, number, 1]
+          : [Math.round(layout.x), Math.round(layout.y)] as [number, number],
+        contentBoxSize:
+          typeof layout.width === 'number' && typeof layout.height === 'number'
+            ? [Math.round(layout.width), Math.round(layout.height)] as [number, number]
+            : undefined,
       },
     },
   };
@@ -2225,6 +2360,7 @@ function buildGraphSemanticSnapshotFromDocument(
     selection: {
       kind: selection.kind,
       ids: [...selection.ids],
+      ...(selection.subgraphIds?.length ? { subgraphIds: [...selection.subgraphIds] } : {}),
     },
   };
 }
@@ -2428,7 +2564,7 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
   }
 
   if (selection.kind === 'node') {
-    return document.nodes
+    const nodeContext = document.nodes
       .filter((node) => selection.ids.includes(node.id))
       .map((node) => {
         const parts = splitEntityText(node.label);
@@ -2442,6 +2578,16 @@ function buildSelectionContext(document: GraphDocument, selection: SelectionStat
         ].join('\n');
       })
       .join('\n\n');
+    const subgraphContext = document.subgraphs
+      .filter((subgraph) => (selection.subgraphIds ?? []).includes(subgraph.id))
+      .map((subgraph) => [
+        `Subgraph ${subgraph.id}`,
+        `title: ${subgraph.title || '（空）'}`,
+        `parent: ${subgraph.parentId ?? 'none'}`,
+        `collapsed: ${subgraph.collapsed ? 'true' : 'false'}`,
+      ].join('\n'))
+      .join('\n\n');
+    return subgraphContext ? `${nodeContext}\n\n${subgraphContext}` : nodeContext;
   }
 
   if (selection.kind === 'edge') {
@@ -2482,13 +2628,18 @@ function buildSelectionContextSummary(document: GraphDocument, selection: Select
   }
 
   if (selection.kind === 'node') {
-    return document.nodes
+    const nodeSummary = document.nodes
       .filter((node) => selection.ids.includes(node.id))
       .map((node) => {
         const parts = splitEntityText(node.label);
         return `${parts.title || node.id} [${node.id}]`;
       })
       .join('；');
+    const subgraphSummary = document.subgraphs
+      .filter((subgraph) => (selection.subgraphIds ?? []).includes(subgraph.id))
+      .map((subgraph) => `${splitEntityText(subgraph.title).title || subgraph.id} [${subgraph.id}]`)
+      .join('；');
+    return subgraphSummary ? `${nodeSummary}；分组：${subgraphSummary}` : nodeSummary;
   }
 
   if (selection.kind === 'edge') {
@@ -2718,6 +2869,9 @@ function buildHostSourceSelectionPayload(document: GraphDocument, selection: Sel
       nodeIds: document.nodes
         .filter((node) => selection.ids.includes(node.id))
         .map((node) => node.id),
+      subgraphIds: document.subgraphs
+        .filter((subgraph) => (selection.subgraphIds ?? []).includes(subgraph.id))
+        .map((subgraph) => subgraph.id),
     };
   }
 
@@ -2746,6 +2900,148 @@ function buildHostSourceSelectionPayload(document: GraphDocument, selection: Sel
   }
 
   return { kind: 'content' as const };
+}
+
+function escapeSelectionPattern(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function mergeTextRanges(ranges: Array<{ start: number; end: number }>) {
+  if (ranges.length === 0) {
+    return null;
+  }
+
+  return ranges.reduce((merged, range) => ({
+    start: Math.min(merged.start, range.start),
+    end: Math.max(merged.end, range.end),
+  }));
+}
+
+function buildLineStartOffsets(lines: string[]) {
+  const offsets: number[] = [];
+  let offset = 0;
+  lines.forEach((line) => {
+    offsets.push(offset);
+    offset += line.length + 1;
+  });
+  return offsets;
+}
+
+function lineRangeToTextRange(
+  lineStarts: number[],
+  lines: string[],
+  startLine: number,
+  endLine: number,
+) {
+  const start = lineStarts[startLine] ?? 0;
+  const end = (lineStarts[endLine] ?? 0) + (lines[endLine]?.length ?? 0);
+  return { start, end };
+}
+
+function findMermaidBlockTextLines(source: string) {
+  const lines = source.replace(/\r\n/g, '\n').split('\n');
+  const lineStarts = buildLineStartOffsets(lines);
+  const startLine = lines.findIndex((line) => /^```mermaid\s*$/.test(line.trim()));
+  if (startLine < 0) {
+    return null;
+  }
+
+  for (let index = startLine + 1; index < lines.length; index += 1) {
+    if (/^```\s*$/.test(lines[index].trim())) {
+      return {
+        lines,
+        lineStarts,
+        startLine: startLine + 1,
+        endLine: Math.max(startLine + 1, index - 1),
+      };
+    }
+  }
+
+  return null;
+}
+
+function findContentSectionTextRange(source: string) {
+  const lines = source.replace(/\r\n/g, '\n').split('\n');
+  const lineStarts = buildLineStartOffsets(lines);
+  const startLine = lines.findIndex((line) => /^##\s+Content\s*$/.test(line));
+  if (startLine < 0) {
+    return null;
+  }
+
+  let endLine = lines.length - 1;
+  for (let index = startLine + 1; index < lines.length; index += 1) {
+    if (/^##\s+/.test(lines[index])) {
+      endLine = Math.max(startLine, index - 1);
+      break;
+    }
+  }
+
+  return lineRangeToTextRange(lineStarts, lines, startLine, endLine);
+}
+
+function findNodeTextRanges(source: string, nodeIds: string[]) {
+  const block = findMermaidBlockTextLines(source);
+  if (!block) {
+    return [];
+  }
+
+  return nodeIds.flatMap((nodeId) => {
+    const pattern = new RegExp(`^\\s*${escapeSelectionPattern(nodeId)}(?=\\s*[\\[\\(\\{])`);
+    for (let index = block.startLine; index <= block.endLine; index += 1) {
+      const line = block.lines[index] ?? '';
+      if (!pattern.test(line)) {
+        continue;
+      }
+
+      return [lineRangeToTextRange(block.lineStarts, block.lines, index, index)];
+    }
+
+    return [];
+  });
+}
+
+function findSubgraphTextRanges(source: string, subgraphIds: string[]) {
+  const block = findMermaidBlockTextLines(source);
+  if (!block) {
+    return [];
+  }
+
+  return subgraphIds.flatMap((subgraphId) => {
+    const pattern = new RegExp(`^\\s*subgraph\\s+${escapeSelectionPattern(subgraphId)}(?=\\s|\\[|$)`);
+    for (let index = block.startLine; index <= block.endLine; index += 1) {
+      const line = block.lines[index] ?? '';
+      if (!pattern.test(line)) {
+        continue;
+      }
+
+      return [lineRangeToTextRange(block.lineStarts, block.lines, index, index)];
+    }
+
+    return [];
+  });
+}
+
+function resolveLocalSourceSelectionRange(
+  source: string,
+  selection: ReturnType<typeof buildHostSourceSelectionPayload>,
+) {
+  if (selection.kind === 'none') {
+    return null;
+  }
+
+  if (selection.kind === 'content') {
+    return findContentSectionTextRange(source);
+  }
+
+  if (selection.kind === 'node') {
+    return mergeTextRanges(findNodeTextRanges(source, selection.nodeIds));
+  }
+
+  if (selection.kind === 'subgraph') {
+    return mergeTextRanges(findSubgraphTextRanges(source, selection.subgraphIds));
+  }
+
+  return null;
 }
 
 function getConnectedNodeCluster(document: GraphDocument, startNodeId: string) {
@@ -3399,6 +3695,60 @@ function duplicateNodesWithEdges(document: GraphDocument, sourceIds: string[], o
 
 function selectionContains(selection: SelectionState, id: string) {
   return selection.ids.includes(id);
+}
+
+function selectionContainsSubgraph(selection: SelectionState, id: string) {
+  return (
+    (selection.kind === 'subgraph' && selectionContains(selection, id)) ||
+    (selection.kind === 'node' && (selection.subgraphIds ?? []).includes(id))
+  );
+}
+
+function withNodeSelection(nodeIds: string[], subgraphIds: string[] = []): SelectionState {
+  const nextNodeIds = [...new Set(nodeIds)];
+  const nextSubgraphIds = [...new Set(subgraphIds)];
+
+  if (nextNodeIds.length === 0) {
+    return nextSubgraphIds.length > 0
+      ? { kind: 'subgraph', ids: nextSubgraphIds }
+      : { kind: 'none', ids: [] };
+  }
+
+  return nextSubgraphIds.length > 0
+    ? { kind: 'node', ids: nextNodeIds, subgraphIds: nextSubgraphIds }
+    : { kind: 'node', ids: nextNodeIds };
+}
+
+function toggleNodeSelectionWithSubgraphs(
+  current: SelectionState,
+  nodeIds: string[],
+  subgraphIds: string[],
+): SelectionState {
+  const nextNodeSet = new Set(current.kind === 'node' ? current.ids : []);
+  nodeIds.forEach((id) => {
+    if (nextNodeSet.has(id)) {
+      nextNodeSet.delete(id);
+    } else {
+      nextNodeSet.add(id);
+    }
+  });
+
+  const nextSubgraphSet = new Set(
+    current.kind === 'node'
+      ? (current.subgraphIds ?? [])
+      : current.kind === 'subgraph'
+        ? current.ids
+        : [],
+  );
+  subgraphIds.forEach((id) => {
+    if (nextSubgraphSet.has(id)) {
+      nextSubgraphSet.delete(id);
+    } else {
+      nextSubgraphSet.add(id);
+    }
+  });
+
+  return withNodeSelection([...nextNodeSet], [...nextSubgraphSet]);
 }
 
 function toggleSelectionIds(
@@ -4211,6 +4561,717 @@ function buildSubgraphFrames(document: GraphDocument, nodes: GraphNode[]) {
   return frames;
 }
 
+function isSubgraphDescendantOf(
+  candidateId: string,
+  ancestorId: string,
+  lookup: Map<string, GraphSubgraph>,
+) {
+  let current = lookup.get(candidateId)?.parentId ?? null;
+  while (current) {
+    if (current === ancestorId) {
+      return true;
+    }
+    current = lookup.get(current)?.parentId ?? null;
+  }
+
+  return false;
+}
+
+function buildRoundedRectPath(rect: Rect, radius = 24) {
+  const maxRadius = Math.min(rect.width, rect.height) / 2;
+  const resolvedRadius = clamp(radius, 0, maxRadius);
+  const right = rect.x + rect.width;
+  const bottom = rect.y + rect.height;
+
+  return [
+    `M ${rect.x + resolvedRadius} ${rect.y}`,
+    `H ${right - resolvedRadius}`,
+    `Q ${right} ${rect.y} ${right} ${rect.y + resolvedRadius}`,
+    `V ${bottom - resolvedRadius}`,
+    `Q ${right} ${bottom} ${right - resolvedRadius} ${bottom}`,
+    `H ${rect.x + resolvedRadius}`,
+    `Q ${rect.x} ${bottom} ${rect.x} ${bottom - resolvedRadius}`,
+    `V ${rect.y + resolvedRadius}`,
+    `Q ${rect.x} ${rect.y} ${rect.x + resolvedRadius} ${rect.y}`,
+    'Z',
+  ].join(' ');
+}
+
+function pointSortKey(point: Point) {
+  return `${Math.round(point.x * 100) / 100}:${Math.round(point.y * 100) / 100}`;
+}
+
+function buildRectBounds(rects: Rect[]) {
+  if (rects.length === 0) {
+    return null;
+  }
+
+  const minX = Math.min(...rects.map((rect) => rect.x));
+  const minY = Math.min(...rects.map((rect) => rect.y));
+  const maxX = Math.max(...rects.map((rect) => rect.x + rect.width));
+  const maxY = Math.max(...rects.map((rect) => rect.y + rect.height));
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+function distanceBetweenPoints(left: Point, right: Point) {
+  return Math.hypot(left.x - right.x, left.y - right.y);
+}
+
+function distanceToRoundedRectSurface(point: Point, rect: Rect, radius: number) {
+  const resolvedRadius = clamp(radius, 0, Math.min(rect.width, rect.height) / 2);
+  const halfWidth = rect.width / 2;
+  const halfHeight = rect.height / 2;
+  const centerX = rect.x + halfWidth;
+  const centerY = rect.y + halfHeight;
+  const qx = Math.abs(point.x - centerX) - Math.max(halfWidth - resolvedRadius, 0);
+  const qy = Math.abs(point.y - centerY) - Math.max(halfHeight - resolvedRadius, 0);
+  const outside = Math.hypot(Math.max(qx, 0), Math.max(qy, 0));
+  const inside = Math.min(Math.max(qx, qy), 0);
+  return outside + inside - resolvedRadius;
+}
+
+function primitiveBounds(primitive: BlobPrimitive): Rect {
+  if (primitive.kind === 'rounded-rect') {
+    return primitive.rect;
+  }
+
+  const minX = Math.min(primitive.start.x, primitive.end.x) - primitive.radius;
+  const minY = Math.min(primitive.start.y, primitive.end.y) - primitive.radius;
+  const maxX = Math.max(primitive.start.x, primitive.end.x) + primitive.radius;
+  const maxY = Math.max(primitive.start.y, primitive.end.y) + primitive.radius;
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+function buildBlobPrimitiveBounds(primitives: BlobPrimitive[]) {
+  return buildRectBounds(primitives.map((primitive) => primitiveBounds(primitive)));
+}
+
+function primitiveSamplePoints(primitive: BlobPrimitive) {
+  if (primitive.kind === 'rounded-rect') {
+    const rect = primitive.rect;
+    return [
+      { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 },
+      { x: rect.x + rect.width * 0.18, y: rect.y + rect.height / 2 },
+      { x: rect.x + rect.width * 0.82, y: rect.y + rect.height / 2 },
+      { x: rect.x + rect.width / 2, y: rect.y + rect.height * 0.18 },
+      { x: rect.x + rect.width / 2, y: rect.y + rect.height * 0.82 },
+    ];
+  }
+
+  return [
+    primitive.start,
+    primitive.end,
+    {
+      x: (primitive.start.x + primitive.end.x) / 2,
+      y: (primitive.start.y + primitive.end.y) / 2,
+    },
+  ];
+}
+
+function rectSamplePoints(rect: Rect) {
+  return [
+    { x: rect.x, y: rect.y },
+    { x: rect.x + rect.width, y: rect.y },
+    { x: rect.x + rect.width, y: rect.y + rect.height },
+    { x: rect.x, y: rect.y + rect.height },
+    { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 },
+    { x: rect.x + rect.width / 2, y: rect.y },
+    { x: rect.x + rect.width, y: rect.y + rect.height / 2 },
+    { x: rect.x + rect.width / 2, y: rect.y + rect.height },
+    { x: rect.x, y: rect.y + rect.height / 2 },
+  ];
+}
+
+function subgraphShapeContainsPoint(shape: SubgraphBlobShape, point: Point) {
+  if (!pointInRect(point, shape.bounds)) {
+    return false;
+  }
+
+  return measureBlobField(point, shape.primitives) >= shape.fieldThreshold;
+}
+
+function intersectRects(left: Rect, right: Rect): Rect | null {
+  const minX = Math.max(left.x, right.x);
+  const minY = Math.max(left.y, right.y);
+  const maxX = Math.min(left.x + left.width, right.x + right.width);
+  const maxY = Math.min(left.y + left.height, right.y + right.height);
+
+  if (maxX <= minX || maxY <= minY) {
+    return null;
+  }
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+function sampleRectGrid(rect: Rect, step: number) {
+  const resolvedStep = Math.max(step, 8);
+  const columns = Math.max(2, Math.ceil(rect.width / resolvedStep) + 1);
+  const rows = Math.max(2, Math.ceil(rect.height / resolvedStep) + 1);
+  const samples: Point[] = [];
+
+  for (let rowIndex = 0; rowIndex <= rows; rowIndex += 1) {
+    const y = rect.y + (rect.height * rowIndex) / rows;
+    for (let columnIndex = 0; columnIndex <= columns; columnIndex += 1) {
+      const x = rect.x + (rect.width * columnIndex) / columns;
+      samples.push({ x, y });
+    }
+  }
+
+  return samples;
+}
+
+function subgraphShapeIntersectsRect(shape: SubgraphBlobShape, rect: Rect) {
+  const overlap = intersectRects(shape.bounds, rect);
+  if (!overlap) {
+    return false;
+  }
+
+  const samples = [
+    ...rectSamplePoints(overlap),
+    ...sampleRectGrid(overlap, clamp(Math.min(overlap.width, overlap.height) / 3, 12, 26)),
+    ...shape.primitives
+      .flatMap((primitive) => primitiveSamplePoints(primitive))
+      .filter((point) => pointInRect(point, overlap)),
+  ];
+
+  return samples.some((point) => measureBlobField(point, shape.primitives) >= shape.fieldThreshold);
+}
+
+function buildSubgraphBlobPrimitives(
+  frame: SubgraphFrame,
+  memberRects: Rect[],
+  maxDepth: number,
+): BlobPrimitive[] {
+  const layerBoost = Math.max(maxDepth - frame.depth, 0);
+  const nodePadding = clamp(34 + layerBoost * 10, 32, 86);
+  const nodeRadius = clamp(28 + layerBoost * 5, 24, 48);
+  const softness = clamp(92 + layerBoost * 24, 88, 180);
+
+  return memberRects.map((rect) => ({
+    kind: 'rounded-rect',
+    rect: expandRect(rect, nodePadding),
+    radius: nodeRadius,
+    softness,
+    weight: 1,
+  }));
+}
+
+function measureBlobField(point: Point, primitives: BlobPrimitive[]) {
+  return primitives.reduce((field, primitive) => {
+    const signedDistance = primitive.kind === 'rounded-rect'
+      ? distanceToRoundedRectSurface(point, primitive.rect, primitive.radius)
+      : distancePointToSegment(point, primitive.start, primitive.end) - primitive.radius;
+    const softness = Math.max(primitive.softness, 1);
+
+    if (signedDistance <= 0) {
+      return field + primitive.weight * (
+        1 + clamp(-signedDistance / softness, 0, 0.28)
+      );
+    }
+
+    const normalized = 1 - signedDistance / softness;
+    if (normalized <= 0) {
+      return field;
+    }
+
+    return field + primitive.weight * normalized * normalized;
+  }, 0);
+}
+
+function smoothClosedPolygon(points: Point[], passes = 2) {
+  let current = [...points];
+  for (let index = 0; index < passes; index += 1) {
+    if (current.length < 3) {
+      break;
+    }
+
+    const next: Point[] = [];
+    current.forEach((point, pointIndex) => {
+      const target = current[(pointIndex + 1) % current.length];
+      next.push(
+        {
+          x: point.x * 0.75 + target.x * 0.25,
+          y: point.y * 0.75 + target.y * 0.25,
+        },
+        {
+          x: point.x * 0.25 + target.x * 0.75,
+          y: point.y * 0.25 + target.y * 0.75,
+        },
+      );
+    });
+    current = next;
+  }
+
+  return current;
+}
+
+function buildSmoothClosedPath(points: Point[]) {
+  if (points.length === 0) {
+    return '';
+  }
+
+  if (points.length < 3) {
+    const minX = Math.min(...points.map((point) => point.x));
+    const minY = Math.min(...points.map((point) => point.y));
+    const maxX = Math.max(...points.map((point) => point.x));
+    const maxY = Math.max(...points.map((point) => point.y));
+    return buildRoundedRectPath({
+      x: minX,
+      y: minY,
+      width: Math.max(32, maxX - minX),
+      height: Math.max(32, maxY - minY),
+    }, 18);
+  }
+
+  const midpoints = points.map((point, index) => {
+    const next = points[(index + 1) % points.length];
+    return {
+      x: (point.x + next.x) / 2,
+      y: (point.y + next.y) / 2,
+    };
+  });
+
+  const commands = [`M ${midpoints[midpoints.length - 1].x} ${midpoints[midpoints.length - 1].y}`];
+  points.forEach((point, index) => {
+    commands.push(`Q ${point.x} ${point.y} ${midpoints[index].x} ${midpoints[index].y}`);
+  });
+  commands.push('Z');
+  return commands.join(' ');
+}
+
+function interpolateContourPoint(
+  start: Point,
+  end: Point,
+  startValue: number,
+  endValue: number,
+  threshold: number,
+) {
+  const denominator = endValue - startValue;
+  if (Math.abs(denominator) < 0.0001) {
+    return {
+      x: (start.x + end.x) / 2,
+      y: (start.y + end.y) / 2,
+    };
+  }
+
+  const t = clamp((threshold - startValue) / denominator, 0, 1);
+  return {
+    x: start.x + (end.x - start.x) * t,
+    y: start.y + (end.y - start.y) * t,
+  };
+}
+
+function edgeKey(startKey: string, endKey: string) {
+  return startKey < endKey ? `${startKey}::${endKey}` : `${endKey}::${startKey}`;
+}
+
+function polygonArea(points: Point[]) {
+  if (points.length < 3) {
+    return 0;
+  }
+
+  let area = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    area += current.x * next.y - next.x * current.y;
+  }
+
+  return area / 2;
+}
+
+function simplifyClosedPolygon(points: Point[]) {
+  if (points.length <= 3) {
+    return points;
+  }
+
+  return points.filter((point, index) => {
+    const previous = points[(index - 1 + points.length) % points.length];
+    const next = points[(index + 1) % points.length];
+    if (
+      distanceBetweenPoints(previous, point) < 0.8 ||
+      distanceBetweenPoints(point, next) < 0.8
+    ) {
+      return false;
+    }
+
+    const cross =
+      (point.x - previous.x) * (next.y - point.y) -
+      (point.y - previous.y) * (next.x - point.x);
+    return Math.abs(cross) > 0.6;
+  });
+}
+
+function buildContourLoops(segments: ContourSegment[]) {
+  const pointLookup = new Map<string, Point>();
+  const adjacency = new Map<string, string[]>();
+  const unusedEdges = new Set<string>();
+
+  segments.forEach((segment) => {
+    const startKey = pointSortKey(segment.start);
+    const endKey = pointSortKey(segment.end);
+    if (startKey === endKey) {
+      return;
+    }
+
+    pointLookup.set(startKey, segment.start);
+    pointLookup.set(endKey, segment.end);
+    adjacency.set(startKey, [...(adjacency.get(startKey) ?? []), endKey]);
+    adjacency.set(endKey, [...(adjacency.get(endKey) ?? []), startKey]);
+    unusedEdges.add(edgeKey(startKey, endKey));
+  });
+
+  const loops: Point[][] = [];
+  while (unusedEdges.size > 0) {
+    const firstEdge = unusedEdges.values().next().value as string | undefined;
+    if (!firstEdge) {
+      break;
+    }
+
+    const [startKey, nextKey] = firstEdge.split('::');
+    let previousKey: string | null = null;
+    let currentKey = startKey;
+    let candidateKey = nextKey;
+    const loop: Point[] = [];
+
+    while (candidateKey) {
+      loop.push(pointLookup.get(currentKey) ?? { x: 0, y: 0 });
+      unusedEdges.delete(edgeKey(currentKey, candidateKey));
+
+      previousKey = currentKey;
+      currentKey = candidateKey;
+      if (currentKey === startKey) {
+        break;
+      }
+
+      const neighbors = adjacency.get(currentKey) ?? [];
+      const nextCandidate = neighbors.find((neighbor) =>
+        neighbor !== previousKey && unusedEdges.has(edgeKey(currentKey, neighbor)),
+      ) ?? neighbors.find((neighbor) => unusedEdges.has(edgeKey(currentKey, neighbor)));
+
+      if (!nextCandidate) {
+        break;
+      }
+
+      candidateKey = nextCandidate;
+    }
+
+    if (loop.length >= 3) {
+      loops.push(loop);
+    }
+  }
+
+  return loops;
+}
+
+function buildSubgraphBlobContours(
+  frame: SubgraphFrame,
+  memberRects: Rect[],
+  maxDepth: number,
+) {
+  const layerBoost = Math.max(maxDepth - frame.depth, 0);
+  const fieldThreshold = clamp(0.5 - layerBoost * 0.035, 0.34, 0.5);
+  const primitives = buildSubgraphBlobPrimitives(frame, memberRects, maxDepth);
+  const primitiveBounds = buildBlobPrimitiveBounds(primitives);
+  const maxSoftness = Math.max(0, ...primitives.map((primitive) => primitive.softness));
+  const fieldBounds = primitiveBounds
+    ? expandRect(primitiveBounds, Math.max(36, maxSoftness * 0.62))
+    : null;
+  if (!fieldBounds) {
+    return {
+      loops: [] as Point[][],
+      primitives,
+      fieldThreshold,
+    };
+  }
+
+  const cellSize = 10;
+  const threshold = fieldThreshold;
+  const cols = Math.max(6, Math.ceil(fieldBounds.width / cellSize) + 4);
+  const rows = Math.max(6, Math.ceil(fieldBounds.height / cellSize) + 4);
+  const origin = {
+    x: fieldBounds.x - cellSize * 2,
+    y: fieldBounds.y - cellSize * 2,
+  };
+  const values: number[][] = Array.from({ length: rows + 1 }, (_, rowIndex) =>
+    Array.from({ length: cols + 1 }, (_, columnIndex) =>
+      measureBlobField(
+        {
+          x: origin.x + columnIndex * cellSize,
+          y: origin.y + rowIndex * cellSize,
+        },
+        primitives,
+      )),
+  );
+  const segments: ContourSegment[] = [];
+
+  for (let rowIndex = 0; rowIndex < rows; rowIndex += 1) {
+    for (let columnIndex = 0; columnIndex < cols; columnIndex += 1) {
+      const topLeftValue = values[rowIndex][columnIndex];
+      const topRightValue = values[rowIndex][columnIndex + 1];
+      const bottomRightValue = values[rowIndex + 1][columnIndex + 1];
+      const bottomLeftValue = values[rowIndex + 1][columnIndex];
+      const state =
+        (topLeftValue >= threshold ? 8 : 0) |
+        (topRightValue >= threshold ? 4 : 0) |
+        (bottomRightValue >= threshold ? 2 : 0) |
+        (bottomLeftValue >= threshold ? 1 : 0);
+
+      if (state === 0 || state === 15) {
+        continue;
+      }
+
+      const topLeft = {
+        x: origin.x + columnIndex * cellSize,
+        y: origin.y + rowIndex * cellSize,
+      };
+      const topRight = {
+        x: topLeft.x + cellSize,
+        y: topLeft.y,
+      };
+      const bottomLeft = {
+        x: topLeft.x,
+        y: topLeft.y + cellSize,
+      };
+      const bottomRight = {
+        x: topLeft.x + cellSize,
+        y: topLeft.y + cellSize,
+      };
+      const top = interpolateContourPoint(topLeft, topRight, topLeftValue, topRightValue, threshold);
+      const right = interpolateContourPoint(topRight, bottomRight, topRightValue, bottomRightValue, threshold);
+      const bottom = interpolateContourPoint(bottomLeft, bottomRight, bottomLeftValue, bottomRightValue, threshold);
+      const left = interpolateContourPoint(topLeft, bottomLeft, topLeftValue, bottomLeftValue, threshold);
+      const centerValue = state === 5 || state === 10
+        ? measureBlobField(
+            {
+              x: topLeft.x + cellSize / 2,
+              y: topLeft.y + cellSize / 2,
+            },
+            primitives,
+          )
+        : 0;
+      const addSegment = (start: Point, end: Point) => {
+        segments.push({ start, end });
+      };
+
+      switch (state) {
+        case 1:
+          addSegment(left, bottom);
+          break;
+        case 2:
+          addSegment(bottom, right);
+          break;
+        case 3:
+          addSegment(left, right);
+          break;
+        case 4:
+          addSegment(top, right);
+          break;
+        case 5:
+          if (centerValue >= threshold) {
+            addSegment(top, left);
+            addSegment(right, bottom);
+          } else {
+            addSegment(top, right);
+            addSegment(left, bottom);
+          }
+          break;
+        case 6:
+          addSegment(top, bottom);
+          break;
+        case 7:
+          addSegment(top, left);
+          break;
+        case 8:
+          addSegment(top, left);
+          break;
+        case 9:
+          addSegment(top, bottom);
+          break;
+        case 10:
+          if (centerValue >= threshold) {
+            addSegment(top, right);
+            addSegment(left, bottom);
+          } else {
+            addSegment(top, left);
+            addSegment(right, bottom);
+          }
+          break;
+        case 11:
+          addSegment(top, right);
+          break;
+        case 12:
+          addSegment(left, right);
+          break;
+        case 13:
+          addSegment(bottom, right);
+          break;
+        case 14:
+          addSegment(left, bottom);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  const loops = buildContourLoops(segments);
+  return {
+    loops: loops
+    .map((loop) => simplifyClosedPolygon(loop))
+    .filter((loop) => Math.abs(polygonArea(loop)) >= 140)
+    .sort((left, right) => Math.abs(polygonArea(right)) - Math.abs(polygonArea(left))),
+    primitives,
+    fieldThreshold,
+  };
+}
+
+function buildSubgraphBlobShapes(
+  subgraphs: GraphSubgraph[],
+  frames: SubgraphFrame[],
+  visibleNodes: GraphNode[],
+): SubgraphBlobShape[] {
+  const lookup = getVisibleSubgraphIds(subgraphs);
+  const maxDepth = frames.reduce((current, frame) => Math.max(current, frame.depth), 0);
+
+  return frames.map((frame) => {
+    const memberRects: Rect[] = visibleNodes
+      .filter((node) => belongsToSubgraph(node, frame.id, lookup))
+      .map((node) => ({
+        x: node.x,
+        y: node.y,
+        width: node.width,
+        height: node.height,
+      }));
+
+    frames.forEach((candidate) => {
+      if (
+        candidate.id === frame.id ||
+        !candidate.collapsed ||
+        !isSubgraphDescendantOf(candidate.id, frame.id, lookup)
+      ) {
+        return;
+      }
+
+      memberRects.push({
+        x: candidate.x + 12,
+        y: candidate.y + 12,
+        width: Math.max(candidate.width - 24, 32),
+        height: Math.max(candidate.height - 24, 32),
+      });
+    });
+
+    if (frame.collapsed) {
+      const bounds = {
+        x: frame.x + 6,
+        y: frame.y + 6,
+        width: Math.max(frame.width - 12, 24),
+        height: Math.max(frame.height - 12, 24),
+      };
+      return {
+        id: frame.id,
+        bounds,
+        defaultBadgeAnchor: {
+          x: bounds.x + 18,
+          y: bounds.y + 18,
+        },
+        fieldThreshold: 0.5,
+        depth: frame.depth,
+        collapsed: true,
+        primitives: [{
+          kind: 'rounded-rect',
+          rect: bounds,
+          radius: 22,
+          softness: 0,
+          weight: 1,
+        }],
+        regions: [{
+          bounds,
+          path: buildRoundedRectPath(bounds, 22),
+        }],
+      };
+    }
+
+    const { loops, primitives, fieldThreshold } = buildSubgraphBlobContours(frame, memberRects, maxDepth);
+    const fallbackBounds = buildBlobPrimitiveBounds(primitives) ?? (
+      buildRectBounds(memberRects) ?? {
+        x: frame.x + 18,
+        y: frame.y + SUBGRAPH_HEADER_HEIGHT + 12,
+        width: Math.max(frame.width - 36, 84),
+        height: Math.max(frame.height - SUBGRAPH_HEADER_HEIGHT - 24, 72),
+      }
+    );
+    const regions = loops.length > 0
+      ? loops.map((loop) => {
+          const bounds = buildRectBounds(loop.map((point) => ({
+            x: point.x,
+            y: point.y,
+            width: 0,
+            height: 0,
+          }))) ?? fallbackBounds;
+          return {
+            bounds,
+            path: buildSmoothClosedPath(smoothClosedPolygon(loop, 3)),
+          };
+        })
+      : [{
+          bounds: fallbackBounds,
+          path: buildRoundedRectPath(fallbackBounds, 34),
+        }];
+    const bounds = buildRectBounds(regions.map((region) => region.bounds)) ?? fallbackBounds;
+    const largestRegion = regions[0] ?? {
+      bounds,
+      path: buildRoundedRectPath(bounds, 34),
+    };
+
+    return {
+      id: frame.id,
+      bounds,
+      defaultBadgeAnchor: {
+        x: largestRegion.bounds.x + Math.min(48, largestRegion.bounds.width * 0.18),
+        y: largestRegion.bounds.y + 14,
+      },
+      fieldThreshold,
+      depth: frame.depth,
+      collapsed: frame.collapsed,
+      primitives,
+      regions,
+    };
+  });
+}
+
+function resolveSubgraphBadgePoint(
+  shape: SubgraphBlobShape,
+  storedAnchor: SubgraphBadgeAnchor | null | undefined,
+) {
+  const basePoint = storedAnchor
+    ? {
+        x: shape.bounds.x + storedAnchor.offsetX,
+        y: shape.bounds.y + storedAnchor.offsetY,
+      }
+    : shape.defaultBadgeAnchor;
+
+  return {
+    x: clamp(basePoint.x, shape.bounds.x + 16, shape.bounds.x + shape.bounds.width - 16),
+    y: clamp(basePoint.y, shape.bounds.y + 16, shape.bounds.y + shape.bounds.height - 16),
+  };
+}
+
 function applyDragPreview(nodes: GraphNode[], dragState: DragState | null) {
   if (!dragState) {
     return nodes;
@@ -4234,28 +5295,21 @@ function applyDragPreview(nodes: GraphNode[], dragState: DragState | null) {
 }
 
 function findSubgraphDropTarget(
-  frames: SubgraphFrame[],
+  shapes: SubgraphBlobShape[],
   point: Point,
   excludedIds: string[] = [],
 ) {
   const excluded = new Set(excludedIds);
 
-  return [...frames]
-    .filter((frame) => !excluded.has(frame.id))
-    .filter((frame) =>
-      pointInRect(point, {
-        x: frame.x + 10,
-        y: frame.y + frame.headerHeight - 2,
-        width: frame.width - 20,
-        height: Math.max(frame.height - frame.headerHeight + 4, 24),
-      }),
-    )
+  return [...shapes]
+    .filter((shape) => !excluded.has(shape.id))
+    .filter((shape) => subgraphShapeContainsPoint(shape, point))
     .sort((left, right) => {
       if (left.depth !== right.depth) {
         return right.depth - left.depth;
       }
 
-      return left.width * left.height - right.width * right.height;
+      return left.bounds.width * left.bounds.height - right.bounds.width * right.bounds.height;
     })[0]?.id ?? null;
 }
 
@@ -4531,12 +5585,22 @@ function buildCollisionObstacles(
   excludedSubgraphIds: Set<string>,
   contentRect?: Rect | null,
 ) {
+  const subgraphLookup = getVisibleSubgraphIds(document.subgraphs);
   const nodeRects = nodes
     .filter((node) => !ignoredNodeIds.has(node.id))
     .map((node) => expandRect({ x: node.x, y: node.y, width: node.width, height: node.height }, 20));
-  const subgraphRects = buildSubgraphFrames(document, nodes)
-    .filter((frame) => !excludedSubgraphIds.has(frame.id))
-    .map((frame) => expandRect({ x: frame.x, y: frame.y, width: frame.width, height: frame.height }, 10));
+  const visibleNodes = nodes.filter((node) => !isInsideCollapsedSubgraph(node, subgraphLookup));
+  const subgraphRects = buildSubgraphBlobShapes(
+    document.subgraphs,
+    buildSubgraphFrames(document, nodes),
+    visibleNodes,
+  )
+    .filter((shape) => !excludedSubgraphIds.has(shape.id))
+    .flatMap((shape) => (
+      shape.collapsed
+        ? [expandRect(shape.bounds, 10)]
+        : shape.regions.map((region) => expandRect(region.bounds, 8))
+    ));
   const contentRects = contentRect ? [expandRect(contentRect, 18)] : [];
 
   return [...nodeRects, ...subgraphRects, ...contentRects];
@@ -5657,6 +6721,7 @@ export default function App() {
   const [canvasSearchQuery, setCanvasSearchQuery] = useState('');
   const [canvasSearchFocusIndex, setCanvasSearchFocusIndex] = useState(0);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  const [subgraphBadgeAnchors, setSubgraphBadgeAnchors] = useState<Record<string, SubgraphBadgeAnchor>>({});
   const [activeLocalExplorerItemId, setActiveLocalExplorerItemId] = useState<string | null>(null);
   const [hasLocalProjectAccess, setHasLocalProjectAccess] = useState(false);
   const [nodeInspectorDraft, setNodeInspectorDraft] = useState<NodeInspectorDraft>({
@@ -5781,11 +6846,13 @@ export default function App() {
   const [panelResizeState, setPanelResizeState] = useState<PanelResizeState | null>(null);
   const [contentCardResizeState, setContentCardResizeState] = useState<ContentCardResizeState | null>(null);
   const [spacePressed, setSpacePressed] = useState(false);
+  const [pendingSourceSelection, setPendingSourceSelection] = useState<{ start: number; end: number } | null>(null);
   const workspaceRef = useRef<HTMLElement>(null);
   const workspaceMainRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const canvasBoardRef = useRef<HTMLDivElement>(null);
   const canvasSearchInputRef = useRef<HTMLInputElement>(null);
+  const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const nodeTitleEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const nodeDescriptionEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const nodeEditorShellRef = useRef<HTMLDivElement | null>(null);
@@ -5828,13 +6895,13 @@ export default function App() {
     () => applyDragPreview(documentState.nodes, dragState),
     [documentState.nodes, dragState],
   );
-  const framePreviewNodes = useMemo(
+  const subgraphPreviewNodes = useMemo(
     () => (dragReparentMode ? documentState.nodes : previewNodes),
     [documentState.nodes, dragReparentMode, previewNodes],
   );
   const subgraphFrames = useMemo(
-    () => buildSubgraphFrames(documentState, framePreviewNodes),
-    [documentState, framePreviewNodes],
+    () => buildSubgraphFrames(documentState, subgraphPreviewNodes),
+    [documentState, subgraphPreviewNodes],
   );
   const contentMarkdown = useMemo(
     () => documentState.contentMarkdown ?? extractContentMarkdown(documentState.suffixMarkdown),
@@ -5890,15 +6957,18 @@ export default function App() {
     contentCardSize.width,
   ]);
   const contentCardStyle = useMemo(() => {
+    const minTop = isVsCodeHost ? 72 : 12;
     return {
-      left: isVsCodeHost ? 12 : 16,
-      top: isVsCodeHost ? 12 : 48,
+      left: Math.max(12, contentCardLayout.x),
+      top: Math.max(minTop, contentCardLayout.y),
       width: contentCardBounds.width,
       height: contentCardBounds.height,
     };
   }, [
     contentCardBounds.height,
     contentCardBounds.width,
+    contentCardLayout.x,
+    contentCardLayout.y,
     isVsCodeHost,
   ]);
   const contentCardRect: Rect | null = null;
@@ -5932,7 +7002,7 @@ export default function App() {
             rect: { x: frame.x, y: frame.y, width: frame.width, height: frame.height },
             fill: withAlpha(style.fill, 0.22),
             stroke: style.stroke,
-            selected: selection.kind === 'subgraph' && selectionContains(selection, frame.id),
+            selected: selectionContainsSubgraph(selection, frame.id),
           };
         }),
       ],
@@ -5947,6 +7017,17 @@ export default function App() {
   ]);
   const visibleNodes = previewNodes.filter(
     (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
+  );
+  const visibleSubgraphNodes = subgraphPreviewNodes.filter(
+    (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
+  );
+  const subgraphBlobShapes = useMemo(
+    () => buildSubgraphBlobShapes(documentState.subgraphs, subgraphFrames, visibleSubgraphNodes),
+    [documentState.subgraphs, subgraphFrames, visibleSubgraphNodes],
+  );
+  const subgraphBlobShapeMap = useMemo(
+    () => new Map(subgraphBlobShapes.map((shape) => [shape.id, shape])),
+    [subgraphBlobShapes],
   );
   const nodeTitleValidationMap = useMemo(
     () => buildNodeTitleValidationMap(documentState.nodes, editingNodeId, editingLabel),
@@ -6129,12 +7210,20 @@ export default function App() {
     [liveEdgeMarkerEntries],
   );
   const allSubgraphFrames = useMemo(
-    () => buildSubgraphFrames(documentState, framePreviewNodes),
-    [documentState, framePreviewNodes],
+    () => buildSubgraphFrames(documentState, subgraphPreviewNodes),
+    [documentState, subgraphPreviewNodes],
   );
   const allSubgraphFrameMap = useMemo(
     () => new Map(allSubgraphFrames.map((frame) => [frame.id, frame])),
     [allSubgraphFrames],
+  );
+  const allSubgraphBlobShapes = useMemo(
+    () => buildSubgraphBlobShapes(documentState.subgraphs, allSubgraphFrames, visibleSubgraphNodes),
+    [allSubgraphFrames, documentState.subgraphs, visibleSubgraphNodes],
+  );
+  const allSubgraphBlobShapeMap = useMemo(
+    () => new Map(allSubgraphBlobShapes.map((shape) => [shape.id, shape])),
+    [allSubgraphBlobShapes],
   );
   const canvasSearchResults = useMemo<CanvasSearchResult[]>(() => {
     const query = canvasSearchQuery.trim().toLowerCase();
@@ -6312,17 +7401,27 @@ export default function App() {
     title: string,
     detail: string,
     previousDocument: GraphDocument = documentRef.current,
+    options?: {
+      recordUndo?: boolean;
+      recordHistory?: boolean;
+    },
   ) => {
+    const recordUndo = options?.recordUndo ?? true;
+    const recordHistory = options?.recordHistory ?? true;
     const nextRevision = documentRevisionRef.current + 1;
     documentRevisionRef.current = nextRevision;
     documentRef.current = nextDocument;
     setDocumentRevision(nextRevision);
-    setUndoStack((current) => [...current.slice(-39), structuredClone(previousDocument)]);
+    if (recordUndo) {
+      setUndoStack((current) => [...current.slice(-39), structuredClone(previousDocument)]);
+    }
     setRedoStack([]);
     setSaveStatus('saving');
     setDocumentState(nextDocument);
     setSourceDraft(nextDocument.markdown ?? nextDocument.source);
-    setHistory((current) => [createHistoryEntry(title, detail), ...current].slice(0, 40));
+    if (recordHistory) {
+      setHistory((current) => [createHistoryEntry(title, detail), ...current].slice(0, 40));
+    }
   }, []);
 
   const restoreDocumentSnapshot = useCallback((
@@ -6412,6 +7511,34 @@ export default function App() {
     setSelection((current) => (toggle ? toggleSelectionIds(current, kind, [id]) : { kind, ids: [id] }));
   }, []);
 
+  const rememberSubgraphBadgeAnchor = useCallback((subgraphId: string, point: Point) => {
+    const shape = allSubgraphBlobShapeMap.get(subgraphId) ?? subgraphBlobShapeMap.get(subgraphId);
+    if (!shape) {
+      return;
+    }
+
+    setSubgraphBadgeAnchors((current) => ({
+      ...current,
+      [subgraphId]: {
+        offsetX: clamp(point.x - shape.bounds.x, 12, Math.max(shape.bounds.width - 12, 12)),
+        offsetY: clamp(point.y - shape.bounds.y, 12, Math.max(shape.bounds.height - 12, 12)),
+      },
+    }));
+  }, [allSubgraphBlobShapeMap, subgraphBlobShapeMap]);
+
+  const selectSubgraphAtPoint = useCallback((
+    subgraphId: string,
+    point: Point,
+    toggle = false,
+  ) => {
+    rememberSubgraphBadgeAnchor(subgraphId, point);
+    setSelection((current) => (
+      toggle
+        ? toggleSelectionIds(current, 'subgraph', [subgraphId])
+        : { kind: 'subgraph', ids: [subgraphId] }
+    ));
+  }, [rememberSubgraphBadgeAnchor]);
+
   const selectConnectedNodeComponent = useCallback((nodeId: string) => {
     const connectedIds = getConnectedNodeCluster(documentState, nodeId);
     setSelection({
@@ -6450,11 +7577,17 @@ export default function App() {
       closeEditor?: boolean;
       historyTitle?: string;
       historyDetail?: string;
+      preserveIdentity?: boolean;
+      recordUndo?: boolean;
+      recordHistory?: boolean;
     },
   ) => {
     const closeEditor = options?.closeEditor ?? false;
     const historyTitle = options?.historyTitle ?? '已暂存节点';
     const historyDetail = options?.historyDetail ?? '已暂存当前节点编辑草稿。';
+    const preserveIdentity = options?.preserveIdentity ?? !closeEditor;
+    const recordUndo = options?.recordUndo ?? closeEditor;
+    const recordHistory = options?.recordHistory ?? closeEditor;
     const currentDocument = structuredClone(documentRef.current);
     const currentNode = currentDocument.nodes.find((node) => node.id === nodeId);
     if (!currentNode) {
@@ -6469,36 +7602,49 @@ export default function App() {
 
     const { title, description } = splitEntityText(editingLabelRef.current);
     const nextLabel = composeEntityText(title, description);
-    const nextId = nextNodeId(currentDocument.nodes, title || '未命名内容', nodeId);
+    const nextId = preserveIdentity
+      ? currentNode.id
+      : nextNodeId(currentDocument.nodes, title || '未命名内容', nodeId);
     const changed = currentNode.label !== nextLabel || currentNode.id !== nextId;
 
     if (changed) {
-      const nextDocument = materializeDocument({
-        ...currentDocument,
-        nodes: currentDocument.nodes.map((node) =>
-          node.id === nodeId
-            ? {
-                ...resizeNodeToContent(node, title, description),
-                id: nextId,
-              }
-            : node,
-        ),
-        edges: currentDocument.edges.map((edge) => ({
-          ...edge,
-          from: edge.from === nodeId ? nextId : edge.from,
-          to: edge.to === nodeId ? nextId : edge.to,
-        })),
+      const nextDocument = materializeDocument(
+        {
+          ...currentDocument,
+          nodes: currentDocument.nodes.map((node) =>
+            node.id === nodeId
+              ? {
+                  ...resizeNodeToContent(node, title, description),
+                  id: nextId,
+                }
+              : node,
+          ),
+          edges: currentDocument.edges.map((edge) => ({
+            ...edge,
+            from: edge.from === nodeId ? nextId : edge.from,
+            to: edge.to === nodeId ? nextId : edge.to,
+          })),
+        },
+        preserveIdentity ? { preserveNodeIds: [nodeId] } : undefined,
+      );
+      applyCommittedDocument(nextDocument, historyTitle, historyDetail, currentDocument, {
+        recordUndo,
+        recordHistory,
       });
-      applyCommittedDocument(nextDocument, historyTitle, historyDetail, currentDocument);
-      setSelection((current) => (
-        current.kind === 'node'
-          ? {
-              kind: 'node',
-              ids: current.ids.map((id) => (id === nodeId ? nextId : id)),
-            }
-          : current
-      ));
-      if (!closeEditor) {
+      if (!preserveIdentity) {
+        setSelection((current) => (
+          current.kind === 'node'
+            ? {
+                kind: 'node',
+                ids: current.ids.map((id) => (id === nodeId ? nextId : id)),
+                ...(current.subgraphIds?.length
+                  ? { subgraphIds: [...current.subgraphIds] }
+                  : {}),
+              }
+            : current
+        ));
+      }
+      if (!closeEditor && !preserveIdentity) {
         setEditingNodeId(nextId);
         setEditingLabel(nextLabel);
       }
@@ -6685,7 +7831,7 @@ export default function App() {
       updateViewport((viewport) => {
         const pointerX = clientX - bounds.left;
         const pointerY = clientY - bounds.top;
-        const nextZoom = clamp(viewport.zoom * zoomFactor, 0.35, 2.8);
+        const nextZoom = clamp(viewport.zoom * zoomFactor, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM);
         const worldX = (pointerX - viewport.x) / viewport.zoom;
         const worldY = (pointerY - viewport.y) / viewport.zoom;
 
@@ -7031,13 +8177,16 @@ export default function App() {
     toggleInspector();
   }, [focusSelectionInViewport, inspectorOpen, mode, toggleInspector]);
 
-  const applyNodeInspectorDraft = useCallback((draft: NodeInspectorDraft = nodeInspectorDraft) => {
-    if (selection.kind !== 'node' || selection.ids.length === 0) {
+  const applyNodeInspectorDraft = useCallback((
+    draft: NodeInspectorDraft = nodeInspectorDraft,
+    targetIds: string[] = selection.kind === 'node' ? selection.ids : [],
+  ) => {
+    if (targetIds.length === 0) {
       return;
     }
 
-    const ids = new Set(selection.ids);
-    const applyTextContent = selection.ids.length === 1;
+    const ids = new Set(targetIds);
+    const applyTextContent = targetIds.length === 1;
     commitDocument(
       (current) => ({
         ...current,
@@ -7058,7 +8207,7 @@ export default function App() {
         ),
       }),
       '已更新节点',
-      `已更新 ${selection.ids.length} 个节点属性。`,
+      `已更新 ${targetIds.length} 个节点属性。`,
     );
   }, [commitDocument, nodeInspectorDraft, selection.ids, selection.kind]);
 
@@ -7087,13 +8236,16 @@ export default function App() {
     );
   }
 
-  const applyEdgeInspectorDraft = useCallback((draft: EdgeInspectorDraft = edgeInspectorDraft) => {
-    if (selection.kind !== 'edge' || selection.ids.length === 0) {
+  const applyEdgeInspectorDraft = useCallback((
+    draft: EdgeInspectorDraft = edgeInspectorDraft,
+    targetIds: string[] = selection.kind === 'edge' ? selection.ids : [],
+  ) => {
+    if (targetIds.length === 0) {
       return;
     }
 
     const strokeWidth = Number.parseFloat(draft.strokeWidthInput);
-    const ids = new Set(selection.ids);
+    const ids = new Set(targetIds);
     commitDocument(
       (current) => ({
         ...current,
@@ -7110,16 +8262,19 @@ export default function App() {
         ),
       }),
       '已更新连线',
-      `已更新 ${selection.ids.length} 条连线属性。`,
+      `已更新 ${targetIds.length} 条连线属性。`,
     );
   }, [commitDocument, edgeInspectorDraft, selection.ids, selection.kind]);
 
-  const applySubgraphInspectorDraft = useCallback((draft: SubgraphInspectorDraft = subgraphInspectorDraft) => {
-    if (selection.kind !== 'subgraph' || selection.ids.length === 0) {
+  const applySubgraphInspectorDraft = useCallback((
+    draft: SubgraphInspectorDraft = subgraphInspectorDraft,
+    targetIds: string[] = selection.kind === 'subgraph' ? selection.ids : [],
+  ) => {
+    if (targetIds.length === 0) {
       return;
     }
 
-    const ids = new Set(selection.ids);
+    const ids = new Set(targetIds);
     commitDocument(
       (current) => ({
         ...current,
@@ -7137,7 +8292,7 @@ export default function App() {
         ),
       }),
       '已更新分组',
-      `已更新 ${selection.ids.length} 个分组设置。`,
+      `已更新 ${targetIds.length} 个分组设置。`,
     );
   }, [commitDocument, selection.ids, selection.kind, subgraphInspectorDraft]);
 
@@ -7295,8 +8450,8 @@ export default function App() {
   }, [commitDocument]);
 
   const resolveSubgraphAtPoint = useCallback((point: Point) => (
-    findSubgraphDropTarget(allSubgraphFrames, point)
-  ), [allSubgraphFrames]);
+    findSubgraphDropTarget(allSubgraphBlobShapes, point)
+  ), [allSubgraphBlobShapes]);
 
   const compactLayout = useCallback(() => {
     commitDocument(
@@ -8131,15 +9286,21 @@ export default function App() {
   );
 
   const goToMode = useCallback((nextMode: EditorMode) => {
-    if (isVsCodeHost) {
-      if (nextMode === 'source') {
+    if (nextMode === 'source') {
+      const sourceSelection = buildHostSourceSelectionPayload(documentRef.current, selection);
+      if (isVsCodeHost) {
         vscodeApiRef.current?.postMessage({
           type: 'lmd/openSource',
-          selection: buildHostSourceSelectionPayload(documentRef.current, selection),
+          selection: sourceSelection,
         });
         return;
       }
 
+      const sourceText = sourceDraft || documentRef.current.markdown || documentRef.current.source;
+      setPendingSourceSelection(resolveLocalSourceSelectionRange(sourceText, sourceSelection));
+    }
+
+    if (isVsCodeHost) {
       if (nextMode === 'history') {
         return;
       }
@@ -8150,7 +9311,7 @@ export default function App() {
     }
 
     setMode(nextMode);
-  }, [isVsCodeHost, mode, selection, sourceParseError]);
+  }, [isVsCodeHost, mode, selection, sourceDraft, sourceParseError]);
 
   const openLocalProjectFile = useCallback(async (item: ExplorerItem) => {
     const localEntry = localHandleEntriesRef.current[item.id];
@@ -8777,6 +9938,25 @@ export default function App() {
   }, [documentState.markdown, isVsCodeHost, selection]);
 
   useEffect(() => {
+    if (mode !== 'source' || !pendingSourceSelection || !sourceEditorRef.current) {
+      return;
+    }
+
+    const editor = sourceEditorRef.current;
+    const selectionStart = clamp(pendingSourceSelection.start, 0, sourceDraft.length);
+    const selectionEnd = clamp(pendingSourceSelection.end, selectionStart, sourceDraft.length);
+
+    const frameId = window.requestAnimationFrame(() => {
+      focusControlWithoutScroll(editor);
+      editor.selectionStart = selectionStart;
+      editor.selectionEnd = selectionEnd;
+    });
+
+    setPendingSourceSelection(null);
+    return () => window.cancelAnimationFrame(frameId);
+  }, [mode, pendingSourceSelection, sourceDraft]);
+
+  useEffect(() => {
     if (mode !== 'canvas') {
       setSidebarOpen(!isMobileViewport);
       setInspectorOpen(!isMobileViewport);
@@ -8944,8 +10124,10 @@ export default function App() {
       if (hasModifier && canvasHasFocus) {
         if (lowerKey === 'a') {
           event.preventDefault();
-          const ids = visibleNodes.map((node) => node.id);
-          setSelection(ids.length > 0 ? { kind: 'node', ids } : { kind: 'none', ids: [] });
+          setSelection(withNodeSelection(
+            visibleNodes.map((node) => node.id),
+            subgraphFrames.map((frame) => frame.id),
+          ));
           return;
         }
 
@@ -8999,6 +10181,18 @@ export default function App() {
       }
 
       if ((event.metaKey || event.ctrlKey) && event.key === '2') {
+        event.preventDefault();
+        goToMode('source');
+        return;
+      }
+
+      if (
+        event.shiftKey &&
+        !hasModifier &&
+        lowerKey === 'e' &&
+        (selection.kind === 'node' || selection.kind === 'subgraph') &&
+        selection.ids.length > 0
+      ) {
         event.preventDefault();
         goToMode('source');
         return;
@@ -9145,6 +10339,7 @@ export default function App() {
     startContentInlineEdit,
     startInlineEdit,
     startSubgraphTitleEdit,
+    subgraphFrames,
     updateViewport,
     undoDocument,
     visibleNodes,
@@ -9184,7 +10379,7 @@ export default function App() {
         nextNodeTargetId || nextEdgeTargetId
           ? null
           : findSubgraphDropTarget(
-            allSubgraphFrames,
+            allSubgraphBlobShapes,
             pointer,
             excludedSubgraphIds,
           );
@@ -9301,7 +10496,7 @@ export default function App() {
         const resolvedTargetEdgeId = liveTargets?.edgeId ?? null;
         const ambientSubgraphId = shouldReparent
           ? findSubgraphDropTarget(
-            allSubgraphFrames,
+            allSubgraphBlobShapes,
             dragState.current,
             dragState.kind === 'subgraph' && dragState.entityId ? [dragState.entityId] : [],
           )
@@ -9571,15 +10766,17 @@ export default function App() {
       if (boxState) {
         const rect = rectFromPoints(boxState.origin, boxState.current);
         const nextNodeIds = visibleNodes.filter((node) => intersects(rect, node)).map((node) => node.id);
+        const nextSubgraphIds = subgraphBlobShapes
+          .filter((shape) => subgraphShapeIntersectsRect(shape, rect))
+          .map((shape) => shape.id);
+
         if (nextNodeIds.length > 0) {
           setSelection((current) =>
-            boxState.toggle ? toggleSelectionIds(current, 'node', nextNodeIds) : { kind: 'node', ids: nextNodeIds },
+            boxState.toggle
+              ? toggleNodeSelectionWithSubgraphs(current, nextNodeIds, nextSubgraphIds)
+              : withNodeSelection(nextNodeIds, nextSubgraphIds),
           );
         } else {
-          const nextSubgraphIds = subgraphFrames
-            .filter((frame) => intersects(rect, frame))
-            .map((frame) => frame.id);
-
           if (nextSubgraphIds.length > 0) {
             setSelection((current) =>
               boxState.toggle
@@ -9732,12 +10929,14 @@ export default function App() {
     edgeEndpointMap,
     edgeLaneMap,
     edgeEndpointOffsetMap,
+    allSubgraphBlobShapes,
     allSubgraphFrames,
     subgraphFrames,
     fullSubgraphLookup,
     panState,
     pointFromClient,
     resolveSubgraphAtPoint,
+    subgraphBlobShapes,
     visibleEdges,
     visibleNodes,
   ]);
@@ -9751,7 +10950,7 @@ export default function App() {
 
     const deltaScale = event.deltaMode === 1 ? 16 : 1;
 
-    if (event.ctrlKey) {
+    if (event.ctrlKey || event.metaKey) {
       zoomViewportAtPoint(
         event.clientX,
         event.clientY,
@@ -9935,15 +11134,15 @@ export default function App() {
   }
 
   function startSubgraphDrag(
-    event: ReactPointerEvent<HTMLDivElement>,
+    event: ReactPointerEvent<Element>,
     subgraphId: string,
   ) {
     if (editingSubgraphId) {
       return;
     }
 
-    const target = event.target as HTMLElement;
-    if (target.closest('button, input')) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('button, input, textarea')) {
       return;
     }
 
@@ -10076,10 +11275,14 @@ export default function App() {
       preset.textColor === nodeStyleSelectionSource.textColor,
     )?.id ?? null
     : null;
+  const selectedCompanionSubgraphCount =
+    selection.kind === 'node' ? (selection.subgraphIds ?? []).length : 0;
   const selectionLabel =
     selection.kind === 'none'
       ? '未选中任何内容'
-      : `已选中 ${selection.ids.length} 个${selectionKindLabel(selection.kind)}`;
+      : selection.kind === 'node' && selectedCompanionSubgraphCount > 0
+        ? `已选中 ${selection.ids.length} 个节点 / ${selectedCompanionSubgraphCount} 个分组`
+        : `已选中 ${selection.ids.length} 个${selectionKindLabel(selection.kind)}`;
   const activeModeLabel =
     mode === 'canvas' ? '画布模式' : mode === 'source' ? '源码模式' : '历史模式';
   const canGroupSelection = selection.kind === 'node' && selection.ids.length >= 2;
@@ -12127,8 +13330,7 @@ export default function App() {
                   {graphTreeItems.map((item) => {
                     const isSelected =
                       (item.kind === 'subgraph' &&
-                        selection.kind === 'subgraph' &&
-                        selectionContains(selection, item.id)) ||
+                        selectionContainsSubgraph(selection, item.id)) ||
                       (item.kind === 'node' &&
                         selection.kind === 'node' &&
                         selectionContains(selection, item.id));
@@ -12328,6 +13530,112 @@ export default function App() {
                     transform: `translate(${documentState.layout.viewport.x + canvasBoardBounds.x * documentState.layout.viewport.zoom}px, ${documentState.layout.viewport.y + canvasBoardBounds.y * documentState.layout.viewport.zoom}px) scale(${documentState.layout.viewport.zoom})`,
                   }}
                 >
+                  <svg className="subgraph-blob-layer" aria-hidden="true">
+                    <g transform={`translate(${-canvasBoardBounds.x} ${-canvasBoardBounds.y})`}>
+                      {[...subgraphBlobShapes].sort((left, right) => left.depth - right.depth).map((shape) => {
+                        const subgraph = documentState.subgraphs.find((entry) => entry.id === shape.id);
+                        if (!subgraph) {
+                          return null;
+                        }
+
+                        const style = getSubgraphStyle(subgraph);
+                        const isSelected = selectionContainsSubgraph(selection, shape.id);
+                        const isDropTarget = dragTargetSubgraphId === shape.id;
+                        const isSearchMatch = canvasSearchSubgraphIds.has(shape.id);
+                        const fillOpacity = shape.collapsed
+                          ? 0.2
+                          : clamp(0.16 - shape.depth * 0.018, 0.08, 0.16);
+                        const outlineStroke = isDropTarget
+                          ? '#7dd3fc'
+                          : isSelected
+                            ? mixColors(style.stroke, '#ffffff', 0.14)
+                            : style.stroke;
+                        const outlineOpacity = isDropTarget
+                          ? 0.96
+                          : isSelected
+                            ? 0.82
+                            : isSearchMatch
+                              ? 0.68
+                              : shape.collapsed
+                                ? 0.66
+                                : 0.38;
+                        const outlineWidth = isSelected || isDropTarget ? 2.8 : shape.collapsed ? 2.3 : 1.9;
+                        const glowOpacity = isDropTarget
+                          ? 0.24
+                          : isSelected
+                            ? 0.16
+                            : isSearchMatch
+                              ? 0.1
+                              : 0.05;
+
+                        return (
+                          <g className="subgraph-blob" key={`subgraph-blob-${shape.id}`}>
+                            {shape.regions.map((region, regionIndex) => (
+                              <g key={`${shape.id}-region-${regionIndex}`}>
+                                <path
+                                  className="subgraph-blob__glow"
+                                  d={region.path}
+                                  stroke={withAlpha(outlineStroke, glowOpacity)}
+                                  strokeWidth={outlineWidth + 16}
+                                />
+                                <path
+                                  className="subgraph-blob__fill"
+                                  d={region.path}
+                                  fill={withAlpha(style.fill, fillOpacity)}
+                                />
+                                <path
+                                  className="subgraph-blob__outline"
+                                  d={region.path}
+                                  stroke={withAlpha(outlineStroke, outlineOpacity)}
+                                  strokeWidth={outlineWidth}
+                                />
+                                {!shape.collapsed ? (
+                                  <path
+                                    className="subgraph-blob__hit"
+                                    d={region.path}
+                                    fill="transparent"
+                                    onDoubleClick={(event) => {
+                                      if (isMobileViewport) {
+                                        return;
+                                      }
+
+                                      const point = pointFromClient(event.clientX, event.clientY);
+                                      if (!point) {
+                                        return;
+                                      }
+
+                                      event.stopPropagation();
+                                      rememberSubgraphBadgeAnchor(shape.id, point);
+                                      createNodeAt(point, undefined, 'solid', shape.id);
+                                    }}
+                                    onPointerDown={(event) => {
+                                      const point = pointFromClient(event.clientX, event.clientY);
+                                      if (!point) {
+                                        return;
+                                      }
+
+                                      if (event.button === 1) {
+                                        return;
+                                      }
+
+                                      if (event.button === 2) {
+                                        startSubgraphDrag(event, shape.id);
+                                        return;
+                                      }
+
+                                      event.stopPropagation();
+                                      selectSubgraphAtPoint(shape.id, point, event.shiftKey);
+                                    }}
+                                  />
+                                ) : null}
+                              </g>
+                            ))}
+                          </g>
+                        );
+                      })}
+                    </g>
+                  </svg>
+
                   {[...subgraphFrames].sort((left, right) => left.depth - right.depth).map((frame) => {
                     const subgraph = documentState.subgraphs.find((entry) => entry.id === frame.id);
                     if (!subgraph) {
@@ -12335,36 +13643,175 @@ export default function App() {
                     }
                     const subgraphStyle = getSubgraphStyle(subgraph);
                     const subgraphParts = splitEntityText(subgraph.title);
+                    const shape = subgraphBlobShapeMap.get(frame.id) ?? allSubgraphBlobShapeMap.get(frame.id) ?? null;
+                    const isExplicitSelection =
+                      selection.kind === 'subgraph' && selectionContains(selection, frame.id);
+                    const isDropTarget = dragTargetSubgraphId === frame.id;
+                    const isSearchMatch = canvasSearchSubgraphIds.has(frame.id);
+                    const badgePoint = shape
+                      ? resolveSubgraphBadgePoint(
+                          shape,
+                          subgraphBadgeAnchors[frame.id],
+                        )
+                      : {
+                          x: frame.x + 18,
+                          y: frame.y + 18,
+                        };
+                    const header = (
+                      <div
+                        className="subgraph-frame__header"
+                        data-edge-endpoint-id={frame.id}
+                        onPointerDown={(event) => {
+                          const point = pointFromClient(event.clientX, event.clientY);
+                          if (point) {
+                            rememberSubgraphBadgeAnchor(frame.id, point);
+                          }
+                          startSubgraphDrag(event, frame.id);
+                        }}
+                      >
+                        <div className="subgraph-frame__header-copy">
+                          {editingSubgraphId === frame.id ? (
+                            <textarea
+                              className="subgraph-frame__title-input"
+                              ref={subgraphEditorRef}
+                              onBlur={() => commitSubgraphTitleEdit(frame.id)}
+                              onChange={(event) => setEditingSubgraphTitle(event.target.value)}
+                              onKeyDown={(event) => {
+                                if (handleNativeSelectAllShortcut(event)) {
+                                  return;
+                                }
+
+                                if (isCompositionConfirming(event)) {
+                                  return;
+                                }
+
+                                if (event.key === 'Enter') {
+                                  event.preventDefault();
+                                  commitSubgraphTitleEdit(frame.id);
+                                  return;
+                                }
+
+                                if (event.key === 'Tab') {
+                                  event.preventDefault();
+                                  setEditingSubgraphField((current) => (current === 'title' ? 'description' : 'title'));
+                                  return;
+                                }
+
+                                if (event.key === 'Escape') {
+                                  event.preventDefault();
+                                  setEditingSubgraphId(null);
+                                  setEditingSubgraphField('title');
+                                  setEditingSubgraphTitle('');
+                                }
+                              }}
+                              onPointerDown={(event) => event.stopPropagation()}
+                              rows={Math.max(2, editingSubgraphTitle.split(/\r?\n/).length)}
+                              value={editingSubgraphTitle}
+                            />
+                          ) : (
+                            <span
+                              className="subgraph-frame__title-button"
+                              onDoubleClick={(event) => {
+                                event.stopPropagation();
+                                const target = event.target as HTMLElement;
+                                startSubgraphTitleEdit(
+                                  subgraph,
+                                  target.closest('.subgraph-frame__description') ? 'description' : 'title',
+                                );
+                              }}
+                            >
+                              <strong>{subgraphParts.title}</strong>
+                              {subgraphParts.description ? (
+                                <small className="subgraph-frame__description">{subgraphParts.description}</small>
+                              ) : null}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="subgraph-frame__actions">
+                          <button
+                            aria-label="从分组左侧拖出连线"
+                            className="subgraph-frame__connector subgraph-frame__connector--start"
+                            onPointerDown={(event) => beginConnection(event, frame, 'left')}
+                            type="button"
+                          >
+                            <WorkbenchIcon name="link-start" />
+                          </button>
+                          <button
+                            aria-label="从分组右侧拖出连线"
+                            className="subgraph-frame__connector subgraph-frame__connector--end"
+                            onPointerDown={(event) => beginConnection(event, frame, 'right')}
+                            type="button"
+                          >
+                            <WorkbenchIcon name="link-end" />
+                          </button>
+                          <button
+                            aria-label={subgraph.collapsed ? '展开分组' : '折叠分组'}
+                            className="subgraph-frame__action"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              toggleSubgraphCollapsed(frame.id);
+                            }}
+                            type="button"
+                          >
+                            <WorkbenchIcon name={subgraph.collapsed ? 'plus' : 'minus'} />
+                          </button>
+                          <button
+                            aria-label="删除分组"
+                            className="subgraph-frame__action is-danger"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              deleteSubgraphById(frame.id);
+                            }}
+                            type="button"
+                          >
+                            <WorkbenchIcon name="trash" />
+                          </button>
+                        </div>
+                      </div>
+                    );
+
+                    if (!subgraph.collapsed) {
+                      const showFloatingBadge =
+                        editingSubgraphId === frame.id ||
+                        isExplicitSelection ||
+                        isDropTarget ||
+                        isSearchMatch;
+
+                      if (!showFloatingBadge) {
+                        return null;
+                      }
+
+                      return (
+                        <div
+                          key={frame.id}
+                          className={`subgraph-badge${isExplicitSelection ? ' is-selected' : ''}${isDropTarget ? ' is-drop-target' : ''}${isSearchMatch ? ' is-search-match' : ''}`}
+                          style={{
+                            left: badgePoint.x - canvasBoardBounds.x,
+                            top: badgePoint.y - canvasBoardBounds.y,
+                            '--subgraph-fill': subgraphStyle.fill,
+                            '--subgraph-stroke': subgraphStyle.stroke,
+                            '--subgraph-text': subgraphStyle.textColor,
+                          } as CSSProperties}
+                        >
+                          {header}
+                        </div>
+                      );
+                    }
 
                     return (
                       <div
                         key={frame.id}
-                        className={`subgraph-frame${selection.kind === 'subgraph' && selectionContains(selection, frame.id) ? ' is-selected' : ''}${dragTargetSubgraphId === frame.id ? ' is-drop-target' : ''}${subgraph.collapsed ? ' is-collapsed' : ''}${canvasSearchSubgraphIds.has(frame.id) ? ' is-search-match' : ''}`}
+                        className={`subgraph-frame${selectionContainsSubgraph(selection, frame.id) ? ' is-selected' : ''}${isDropTarget ? ' is-drop-target' : ''} is-collapsed${isSearchMatch ? ' is-search-match' : ''}`}
                         data-edge-endpoint-id={frame.id}
-                        onDoubleClick={(event) => {
-                          if (isMobileViewport) {
-                            return;
-                          }
-                          const target = event.target as HTMLElement;
-                          if (target.closest('.subgraph-frame__header, .subgraph-frame__action, .subgraph-frame__connector, .subgraph-frame__title-input, .subgraph-frame__title-button')) {
-                            return;
-                          }
-
-                          if (subgraph.collapsed) {
-                            return;
-                          }
-
-                          event.stopPropagation();
+                        onPointerDown={(event) => {
                           const point = pointFromClient(event.clientX, event.clientY);
                           if (!point) {
                             return;
                           }
 
-                          createNodeAt(point, undefined, 'solid', frame.id);
-                        }}
-                        onPointerDown={(event) => {
-                          const target = event.target as HTMLElement;
-                          if (target.closest('.subgraph-frame__header, .subgraph-frame__action, .subgraph-frame__connector, .subgraph-frame__title-input')) {
+                          if (event.button === 1) {
+                            startSubgraphDrag(event, frame.id);
                             return;
                           }
 
@@ -12374,7 +13821,7 @@ export default function App() {
                           }
 
                           event.stopPropagation();
-                          selectSingle('subgraph', frame.id, event.shiftKey);
+                          selectSubgraphAtPoint(frame.id, point, event.shiftKey);
                         }}
                         style={{
                           left: frame.x - canvasBoardBounds.x,
@@ -12389,129 +13836,24 @@ export default function App() {
                           '--subgraph-text': subgraphStyle.textColor,
                         } as CSSProperties}
                       >
-                        <div
-                          className="subgraph-frame__header"
-                          onPointerDown={(event) => startSubgraphDrag(event, frame.id)}
-                        >
-                          <div className="subgraph-frame__header-copy">
-                            {editingSubgraphId === frame.id ? (
-                              <textarea
-                                className="subgraph-frame__title-input"
-                                ref={subgraphEditorRef}
-                                onBlur={() => commitSubgraphTitleEdit(frame.id)}
-                                onChange={(event) => setEditingSubgraphTitle(event.target.value)}
-                                onKeyDown={(event) => {
-                                  if (handleNativeSelectAllShortcut(event)) {
-                                    return;
-                                  }
+                        {header}
 
-                                  if (isCompositionConfirming(event)) {
-                                    return;
-                                  }
-
-                                  if (event.key === 'Enter') {
-                                    event.preventDefault();
-                                    commitSubgraphTitleEdit(frame.id);
-                                    return;
-                                  }
-
-                                  if (event.key === 'Tab') {
-                                    event.preventDefault();
-                                    setEditingSubgraphField((current) => (current === 'title' ? 'description' : 'title'));
-                                    return;
-                                  }
-
-                                  if (event.key === 'Escape') {
-                                    event.preventDefault();
-                                    setEditingSubgraphId(null);
-                                    setEditingSubgraphField('title');
-                                    setEditingSubgraphTitle('');
-                                  }
-                                }}
-                                onPointerDown={(event) => event.stopPropagation()}
-                                rows={Math.max(2, editingSubgraphTitle.split(/\r?\n/).length)}
-                                value={editingSubgraphTitle}
-                              />
-                            ) : (
-                              <span
-                                className="subgraph-frame__title-button"
-                                onDoubleClick={(event) => {
-                                  event.stopPropagation();
-                                  const target = event.target as HTMLElement;
-                                  startSubgraphTitleEdit(
-                                    subgraph,
-                                    target.closest('.subgraph-frame__description') ? 'description' : 'title',
-                                  );
-                                }}
-                              >
-                                <strong>{subgraphParts.title}</strong>
-                                {subgraphParts.description ? (
-                                  <small className="subgraph-frame__description">{subgraphParts.description}</small>
-                                ) : null}
-                              </span>
-                            )}
+                        <div className="subgraph-frame__summary">
+                          <div className="subgraph-frame__summary-meta">
+                            <span>{frame.memberCount} 项</span>
                           </div>
-
-                          <div className="subgraph-frame__actions">
-                            <button
-                              aria-label="从分组左侧拖出连线"
-                              className="subgraph-frame__connector subgraph-frame__connector--start"
-                              onPointerDown={(event) => beginConnection(event, frame, 'left')}
-                              type="button"
-                            >
-                              <WorkbenchIcon name="link-start" />
-                            </button>
-                            <button
-                              aria-label="从分组右侧拖出连线"
-                              className="subgraph-frame__connector subgraph-frame__connector--end"
-                              onPointerDown={(event) => beginConnection(event, frame, 'right')}
-                              type="button"
-                            >
-                              <WorkbenchIcon name="link-end" />
-                            </button>
-                            <button
-                              aria-label={subgraph.collapsed ? '展开分组' : '折叠分组'}
-                              className="subgraph-frame__action"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                toggleSubgraphCollapsed(frame.id);
-                              }}
-                              type="button"
-                            >
-                              <WorkbenchIcon name={subgraph.collapsed ? 'plus' : 'minus'} />
-                            </button>
-                            <button
-                              aria-label="删除分组"
-                              className="subgraph-frame__action is-danger"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                deleteSubgraphById(frame.id);
-                              }}
-                              type="button"
-                            >
-                              <WorkbenchIcon name="trash" />
-                            </button>
-                          </div>
-                        </div>
-
-                        {subgraph.collapsed ? (
-                          <div className="subgraph-frame__summary">
-                            <div className="subgraph-frame__summary-meta">
-                              <span>{frame.memberCount} 项</span>
+                          {frame.summaryLabels.length > 0 ? (
+                            <div className="subgraph-frame__summary-chips">
+                              {frame.summaryLabels.map((label, index) => (
+                                <span className="subgraph-frame__summary-chip" key={`${frame.id}-summary-${index}`}>
+                                  {label.split(/\r?\n/)[0]}
+                                </span>
+                              ))}
                             </div>
-                            {frame.summaryLabels.length > 0 ? (
-                              <div className="subgraph-frame__summary-chips">
-                                {frame.summaryLabels.map((label, index) => (
-                                  <span className="subgraph-frame__summary-chip" key={`${frame.id}-summary-${index}`}>
-                                    {label.split(/\r?\n/)[0]}
-                                  </span>
-                                ))}
-                              </div>
-                            ) : (
-                              <div className="subgraph-frame__summary-empty">暂无节点</div>
-                            )}
-                          </div>
-                        ) : null}
+                          ) : (
+                            <div className="subgraph-frame__summary-empty">暂无节点</div>
+                          )}
+                        </div>
                       </div>
                     );
                   })}
@@ -13226,7 +14568,7 @@ export default function App() {
                     onClick={() =>
                       updateViewport((viewport) => ({
                         ...viewport,
-                        zoom: clamp(viewport.zoom - 0.1, 0.35, 2.8),
+                        zoom: clamp(viewport.zoom - 0.1, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM),
                       }))
                     }
                     type="button"
@@ -13241,7 +14583,7 @@ export default function App() {
                     onClick={() =>
                       updateViewport((viewport) => ({
                         ...viewport,
-                        zoom: clamp(viewport.zoom + 0.1, 0.35, 2.8),
+                        zoom: clamp(viewport.zoom + 0.1, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM),
                       }))
                     }
                     type="button"
@@ -13283,6 +14625,7 @@ export default function App() {
 
                 <textarea
                   className="source-editor"
+                  ref={sourceEditorRef}
                   onChange={(event) => {
                     setSaveStatus('saving');
                     setSourceDraft(event.target.value);
@@ -13387,7 +14730,7 @@ export default function App() {
                   <label className="field">
                     <span>ID / 标题</span>
                     <input
-                      onBlur={() => applyNodeInspectorDraft()}
+                      onBlur={() => applyNodeInspectorDraft(nodeInspectorDraft, selectedNodes.map((node) => node.id))}
                       onChange={(event) =>
                         setNodeInspectorDraft((current) => ({ ...current, label: event.target.value }))
                       }
@@ -13398,7 +14741,7 @@ export default function App() {
 
                         if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
                           event.preventDefault();
-                          applyNodeInspectorDraft();
+                          applyNodeInspectorDraft(nodeInspectorDraft, selectedNodes.map((node) => node.id));
                           event.currentTarget.blur();
                         }
                       }}
@@ -13409,7 +14752,7 @@ export default function App() {
                   <label className="field">
                     <span>描述</span>
                     <textarea
-                      onBlur={() => applyNodeInspectorDraft()}
+                      onBlur={() => applyNodeInspectorDraft(nodeInspectorDraft, selectedNodes.map((node) => node.id))}
                       onChange={(event) =>
                         setNodeInspectorDraft((current) => ({ ...current, description: event.target.value }))
                       }
@@ -13420,7 +14763,7 @@ export default function App() {
 
                         if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
                           event.preventDefault();
-                          applyNodeInspectorDraft();
+                          applyNodeInspectorDraft(nodeInspectorDraft, selectedNodes.map((node) => node.id));
                           event.currentTarget.blur();
                         }
                       }}
@@ -13527,7 +14870,7 @@ export default function App() {
               <label className="field">
                 <span>标签</span>
                 <textarea
-                  onBlur={() => applyEdgeInspectorDraft()}
+                  onBlur={() => applyEdgeInspectorDraft(edgeInspectorDraft, selectedEdge ? [selectedEdge.id] : [])}
                   onChange={(event) =>
                     setEdgeInspectorDraft((current) => ({ ...current, label: event.target.value }))
                   }
@@ -13538,7 +14881,7 @@ export default function App() {
 
                     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
                       event.preventDefault();
-                      applyEdgeInspectorDraft();
+                      applyEdgeInspectorDraft(edgeInspectorDraft, selectedEdge ? [selectedEdge.id] : []);
                       event.currentTarget.blur();
                     }
                   }}
@@ -13580,7 +14923,7 @@ export default function App() {
                   <input
                     max={12}
                     min={1}
-                    onBlur={() => applyEdgeInspectorDraft()}
+                    onBlur={() => applyEdgeInspectorDraft(edgeInspectorDraft, selectedEdge ? [selectedEdge.id] : [])}
                     onChange={(event) =>
                       setEdgeInspectorDraft((current) => ({
                         ...current,
@@ -13594,7 +14937,7 @@ export default function App() {
 
                     if (event.key === 'Enter') {
                       event.preventDefault();
-                      applyEdgeInspectorDraft();
+                      applyEdgeInspectorDraft(edgeInspectorDraft, selectedEdge ? [selectedEdge.id] : []);
                       event.currentTarget.blur();
                       }
                     }}
@@ -13616,7 +14959,7 @@ export default function App() {
               <label className="field">
                 <span>ID / 标题</span>
                 <input
-                  onBlur={() => applySubgraphInspectorDraft()}
+                  onBlur={() => applySubgraphInspectorDraft(subgraphInspectorDraft, selectedSubgraph ? [selectedSubgraph.id] : [])}
                   onChange={(event) =>
                     setSubgraphInspectorDraft((current) => ({ ...current, title: event.target.value }))
                   }
@@ -13627,7 +14970,7 @@ export default function App() {
 
                     if (event.key === 'Enter') {
                       event.preventDefault();
-                      applySubgraphInspectorDraft();
+                      applySubgraphInspectorDraft(subgraphInspectorDraft, selectedSubgraph ? [selectedSubgraph.id] : []);
                       event.currentTarget.blur();
                     }
                   }}
@@ -13637,7 +14980,7 @@ export default function App() {
               <label className="field">
                 <span>描述</span>
                 <textarea
-                  onBlur={() => applySubgraphInspectorDraft()}
+                  onBlur={() => applySubgraphInspectorDraft(subgraphInspectorDraft, selectedSubgraph ? [selectedSubgraph.id] : [])}
                   onChange={(event) =>
                     setSubgraphInspectorDraft((current) => ({ ...current, description: event.target.value }))
                   }
@@ -13648,7 +14991,7 @@ export default function App() {
 
                     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
                       event.preventDefault();
-                      applySubgraphInspectorDraft();
+                      applySubgraphInspectorDraft(subgraphInspectorDraft, selectedSubgraph ? [selectedSubgraph.id] : []);
                       event.currentTarget.blur();
                     }
                   }}

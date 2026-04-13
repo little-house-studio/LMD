@@ -59,6 +59,7 @@ export interface LayoutSidecar {
 
 export interface ProjectCompatExtras {
   contentBox?: [number, number] | [number, number, 1];
+  contentBoxSize?: [number, number];
   [key: string]: unknown;
 }
 
@@ -129,6 +130,7 @@ export interface GraphSemanticSnapshot {
   selection: {
     kind: 'none' | 'node' | 'edge' | 'subgraph' | 'content';
     ids: string[];
+    subgraphIds?: string[];
   };
 }
 
@@ -208,6 +210,7 @@ export interface HistoryEntry {
 export interface SelectionState {
   kind: 'none' | 'node' | 'edge' | 'subgraph' | 'content';
   ids: string[];
+  subgraphIds?: string[];
 }
 
 export interface ParsedDocument {

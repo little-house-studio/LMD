@@ -55,6 +55,32 @@ function mergeRanges(ranges) {
     }
     return ranges.reduce((accumulator, range) => new vscode.Range(accumulator.start.isBefore(range.start) ? accumulator.start : range.start, accumulator.end.isAfter(range.end) ? accumulator.end : range.end));
 }
+function normalizeRanges(ranges) {
+    const deduped = new Map();
+    ranges.forEach((range) => {
+        const key = [
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+        ].join(':');
+        if (!deduped.has(key)) {
+            deduped.set(key, range);
+        }
+    });
+    return [...deduped.values()].sort((left, right) => {
+        if (left.start.line !== right.start.line) {
+            return left.start.line - right.start.line;
+        }
+        if (left.start.character !== right.start.character) {
+            return left.start.character - right.start.character;
+        }
+        if (left.end.line !== right.end.line) {
+            return left.end.line - right.end.line;
+        }
+        return left.end.character - right.end.character;
+    });
+}
 function findSectionRange(document, title) {
     const lines = document.getText().split(/\r?\n/);
     const headingPattern = new RegExp(`^##\\s+${escapeRegExp(title)}\\s*$`);
@@ -149,25 +175,26 @@ function findEdgeRanges(document, edges) {
         return [];
     });
 }
-function resolveSelectionRange(document, selection) {
+function resolveSelectionRanges(document, selection) {
     if (!selection || typeof selection !== 'object' || !('kind' in selection)) {
-        return null;
+        return [];
     }
     const record = selection;
     if (record.kind === 'none') {
-        return null;
+        return [];
     }
     if (record.kind === 'content') {
-        return findSectionRange(document, 'Content');
+        const range = findSectionRange(document, 'Content');
+        return range ? [range] : [];
     }
     if (record.kind === 'node' && Array.isArray(record.nodeIds)) {
-        return mergeRanges(findNodeRanges(document, record.nodeIds.filter((item) => typeof item === 'string')));
+        return normalizeRanges(findNodeRanges(document, record.nodeIds.filter((item) => typeof item === 'string')));
     }
     if (record.kind === 'subgraph' && Array.isArray(record.subgraphIds)) {
-        return mergeRanges(findSubgraphRanges(document, record.subgraphIds.filter((item) => typeof item === 'string')));
+        return normalizeRanges(findSubgraphRanges(document, record.subgraphIds.filter((item) => typeof item === 'string')));
     }
     if (record.kind === 'edge' && Array.isArray(record.edges)) {
-        return mergeRanges(findEdgeRanges(document, record.edges.flatMap((edge) => {
+        return normalizeRanges(findEdgeRanges(document, record.edges.flatMap((edge) => {
             if (!edge || typeof edge !== 'object') {
                 return [];
             }
@@ -182,15 +209,27 @@ function resolveSelectionRange(document, selection) {
                 }];
         })));
     }
-    return null;
+    return [];
 }
-async function revealRangeInVisibleTextEditor(document, range) {
+function applySelectionsToEditor(editor, ranges) {
+    if (ranges.length === 0) {
+        return;
+    }
+    editor.selections = ranges.map((range) => new vscode.Selection(range.start, range.end));
+    const mergedRange = mergeRanges(ranges);
+    if (mergedRange) {
+        editor.revealRange(mergedRange, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    }
+}
+async function revealRangesInVisibleTextEditor(document, ranges) {
+    if (ranges.length === 0) {
+        return;
+    }
     const editor = vscode.window.visibleTextEditors.find((entry) => entry.document.uri.toString() === document.uri.toString());
     if (!editor) {
         return;
     }
-    editor.selection = new vscode.Selection(range.start, range.end);
-    editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    applySelectionsToEditor(editor, ranges);
 }
 class LmdEditorProvider {
     context;
@@ -198,7 +237,7 @@ class LmdEditorProvider {
         this.context = context;
     }
     async resolveCustomTextEditor(document, webviewPanel) {
-        let lastSelectionRange = null;
+        let lastSelectionRanges = [];
         webviewPanel.webview.options = {
             enableScripts: true,
             localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'dist')],
@@ -242,19 +281,18 @@ class LmdEditorProvider {
             }
             if (message.type === 'lmd/openSource') {
                 if ('selection' in message) {
-                    lastSelectionRange = resolveSelectionRange(document, message.selection);
+                    lastSelectionRanges = resolveSelectionRanges(document, message.selection);
                 }
-                await vscode.window.showTextDocument(document, {
+                const editor = await vscode.window.showTextDocument(document, {
                     preview: false,
-                    selection: lastSelectionRange ?? undefined,
+                    selection: lastSelectionRanges[0],
                 });
+                applySelectionsToEditor(editor, lastSelectionRanges);
                 return;
             }
             if (message.type === 'lmd/revealSelection' && 'selection' in message) {
-                lastSelectionRange = resolveSelectionRange(document, message.selection);
-                if (lastSelectionRange) {
-                    await revealRangeInVisibleTextEditor(document, lastSelectionRange);
-                }
+                lastSelectionRanges = resolveSelectionRanges(document, message.selection);
+                await revealRangesInVisibleTextEditor(document, lastSelectionRanges);
             }
         });
     }
