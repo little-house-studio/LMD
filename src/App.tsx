@@ -33,7 +33,11 @@ import {
   buildEntityIdFromTitle,
   normalizeEntityIdBase,
 } from './lib/entityId';
-import { sampleProjectMarkdown } from './lib/sample';
+import {
+  createStressTestProjectMarkdown,
+  defaultStressTestProjectLabel,
+  sampleProjectMarkdown,
+} from './lib/sample';
 import { storageKeys } from './lib/storage';
 import type {
   Direction,
@@ -159,6 +163,7 @@ interface BlobCapsulePrimitive {
 }
 
 type BlobPrimitive = BlobRoundedRectPrimitive | BlobCapsulePrimitive;
+type BlobContourDetail = 'full' | 'interactive';
 
 interface SubgraphBadgeAnchor {
   offsetX: number;
@@ -248,6 +253,17 @@ const SUBGRAPH_BOTTOM_PADDING = 24;
 const CONTENT_CARD_ID = '__content__';
 const MINIMAP_WIDTH = 208;
 const MINIMAP_HEIGHT = 128;
+const PERF_DEBUG_QUERY_KEY = 'lmdPerf';
+const PERF_DEBUG_SUMMARY_INTERVAL_MS = 1200;
+const PERF_DEBUG_SLOW_SAMPLE_MS = 8;
+const PERF_DEBUG_LOG_THRESHOLD_MS = 12;
+const HYBRID_SCENE_NODE_THRESHOLD = 220;
+const HYBRID_SCENE_EDGE_THRESHOLD = 320;
+const HYBRID_SCENE_VIEWPORT_MARGIN_PX = 260;
+const HYBRID_SCENE_TITLE_ZOOM_THRESHOLD = 0.38;
+const HYBRID_SCENE_DESCRIPTION_ZOOM_THRESHOLD = 0.72;
+const HYBRID_SCENE_SIMPLIFIED_ZOOM_THRESHOLD = 0.22;
+const HYBRID_SCENE_ARROW_ZOOM_THRESHOLD = 0.28;
 
 interface ExplorerItem {
   id: string;
@@ -372,6 +388,7 @@ interface AppHostConfig {
   platform?: 'web' | 'vscode';
   initialMarkdown?: string;
   fileName?: string;
+  perfDebug?: boolean;
 }
 
 interface VsCodeWebviewApi {
@@ -392,7 +409,47 @@ interface CanvasSearchResult {
   rect: Rect;
   score: number;
 }
+interface SceneRenderableEdge {
+  edge: GraphEdge;
+  fromEndpoint: EdgeEndpointBox;
+  toEndpoint: EdgeEndpointBox;
+  geometry: ReturnType<typeof buildEdgeGeometry>;
+}
 type InspectorView = 'properties' | 'ai';
+
+interface PerfMetricAccumulator {
+  count: number;
+  totalMs: number;
+  maxMs: number;
+  lastMs: number;
+  slowCount: number;
+}
+
+interface PerfMetricEntry extends PerfMetricAccumulator {
+  label: string;
+  avgMs: number;
+}
+
+interface PerfDebugSnapshot {
+  visibleNodeCount: number;
+  visibleEdgeCount: number;
+  subgraphFrameCount: number;
+  blobRegionCount: number;
+  blobPrimitiveCount: number;
+}
+
+interface PerfDebugSummary {
+  windowMs: number;
+  renderCount: number;
+  pointerMoves: number;
+  dragPointerMoves: number;
+  boxPointerMoves: number;
+  panPointerMoves: number;
+  connectPointerMoves: number;
+  hotLabel: string | null;
+  snapshot: PerfDebugSnapshot;
+  entries: PerfMetricEntry[];
+}
 
 type IconName =
   | 'menu'
@@ -947,6 +1004,7 @@ function readAppHostConfig(): AppHostConfig {
     platform: config.platform === 'vscode' ? 'vscode' : 'web',
     initialMarkdown: typeof config.initialMarkdown === 'string' ? config.initialMarkdown : undefined,
     fileName: typeof config.fileName === 'string' ? config.fileName : undefined,
+    perfDebug: typeof config.perfDebug === 'boolean' ? config.perfDebug : undefined,
   };
 }
 
@@ -1013,6 +1071,75 @@ function readStoredNumber(key: string, fallback: number) {
   } catch {
     return fallback;
   }
+}
+
+function readStoredBoolean(key: string, fallback: boolean) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) {
+      return fallback;
+    }
+
+    return raw === '1' || raw === 'true';
+  } catch {
+    return fallback;
+  }
+}
+
+function readPerfDebugEnabled(hostConfig: AppHostConfig) {
+  if (typeof hostConfig.perfDebug === 'boolean') {
+    return hostConfig.perfDebug;
+  }
+
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const queryValue = params.get(PERF_DEBUG_QUERY_KEY) ?? params.get('perf');
+    if (queryValue === '1' || queryValue === 'true') {
+      return true;
+    }
+    if (queryValue === '0' || queryValue === 'false') {
+      return false;
+    }
+  } catch {
+    // Ignore malformed URLs and fall back to persisted state.
+  }
+
+  return readStoredBoolean(storageKeys.perfDebug, false);
+}
+
+function createPerfCounterSnapshot() {
+  return {
+    pointerMoves: 0,
+    dragPointerMoves: 0,
+    boxPointerMoves: 0,
+    panPointerMoves: 0,
+    connectPointerMoves: 0,
+  };
+}
+
+function createPerfDebugSnapshot(): PerfDebugSnapshot {
+  return {
+    visibleNodeCount: 0,
+    visibleEdgeCount: 0,
+    subgraphFrameCount: 0,
+    blobRegionCount: 0,
+    blobPrimitiveCount: 0,
+  };
+}
+
+function createEmptyPerfDebugSummary(): PerfDebugSummary {
+  return {
+    windowMs: 0,
+    renderCount: 0,
+    pointerMoves: 0,
+    dragPointerMoves: 0,
+    boxPointerMoves: 0,
+    panPointerMoves: 0,
+    connectPointerMoves: 0,
+    hotLabel: null,
+    snapshot: createPerfDebugSnapshot(),
+    entries: [],
+  };
 }
 
 function WorkbenchIcon({ name, className }: { name: IconName; className?: string }) {
@@ -3622,6 +3749,278 @@ function edgeIntersectsRect(
   return samples.some((point) => pointInRect(point, rect, 10));
 }
 
+function buildEdgeApproxBounds(
+  fromEndpoint: Pick<EdgeEndpointBox, 'x' | 'y' | 'width' | 'height'>,
+  toEndpoint: Pick<EdgeEndpointBox, 'x' | 'y' | 'width' | 'height'>,
+  padding = 128,
+): Rect {
+  const minX = Math.min(fromEndpoint.x, toEndpoint.x) - padding;
+  const minY = Math.min(fromEndpoint.y, toEndpoint.y) - padding;
+  const maxX = Math.max(
+    fromEndpoint.x + fromEndpoint.width,
+    toEndpoint.x + toEndpoint.width,
+  ) + padding;
+  const maxY = Math.max(
+    fromEndpoint.y + fromEndpoint.height,
+    toEndpoint.y + toEndpoint.height,
+  ) + padding;
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+function appendRoundedRectPath(path: Path2D, rect: Rect, radius: number) {
+  const safeRadius = Math.min(radius, rect.width / 2, rect.height / 2);
+  path.moveTo(rect.x + safeRadius, rect.y);
+  path.lineTo(rect.x + rect.width - safeRadius, rect.y);
+  path.arcTo(rect.x + rect.width, rect.y, rect.x + rect.width, rect.y + safeRadius, safeRadius);
+  path.lineTo(rect.x + rect.width, rect.y + rect.height - safeRadius);
+  path.arcTo(
+    rect.x + rect.width,
+    rect.y + rect.height,
+    rect.x + rect.width - safeRadius,
+    rect.y + rect.height,
+    safeRadius,
+  );
+  path.lineTo(rect.x + safeRadius, rect.y + rect.height);
+  path.arcTo(rect.x, rect.y + rect.height, rect.x, rect.y + rect.height - safeRadius, safeRadius);
+  path.lineTo(rect.x, rect.y + safeRadius);
+  path.arcTo(rect.x, rect.y, rect.x + safeRadius, rect.y, safeRadius);
+  path.closePath();
+}
+
+function buildCanvasNodePath(
+  shape: NodeShape,
+  rect: Rect,
+) {
+  const path = new Path2D();
+
+  switch (shape) {
+    case 'diamond':
+      path.moveTo(rect.x + rect.width * 0.12, rect.y + rect.height * 0.5);
+      path.lineTo(rect.x + rect.width * 0.5, rect.y + rect.height * 0.06);
+      path.lineTo(rect.x + rect.width * 0.88, rect.y + rect.height * 0.5);
+      path.lineTo(rect.x + rect.width * 0.5, rect.y + rect.height * 0.94);
+      path.closePath();
+      return path;
+    case 'hexagon':
+      path.moveTo(rect.x + rect.width * 0.15, rect.y);
+      path.lineTo(rect.x + rect.width * 0.85, rect.y);
+      path.lineTo(rect.x + rect.width, rect.y + rect.height * 0.5);
+      path.lineTo(rect.x + rect.width * 0.85, rect.y + rect.height);
+      path.lineTo(rect.x + rect.width * 0.15, rect.y + rect.height);
+      path.lineTo(rect.x, rect.y + rect.height * 0.5);
+      path.closePath();
+      return path;
+    case 'circle':
+      path.ellipse(
+        rect.x + rect.width / 2,
+        rect.y + rect.height / 2,
+        rect.width / 2,
+        rect.height / 2,
+        0,
+        0,
+        Math.PI * 2,
+      );
+      path.closePath();
+      return path;
+    case 'round':
+      appendRoundedRectPath(path, rect, Math.min(rect.height / 2, 999));
+      return path;
+    case 'database':
+    case 'subroutine':
+    case 'rect':
+    default:
+      appendRoundedRectPath(path, rect, 18);
+      return path;
+  }
+}
+
+function drawCanvasTextBlock(
+  context: CanvasRenderingContext2D,
+  lines: string[],
+  centerX: number,
+  centerY: number,
+  lineHeight: number,
+  fontSize: number,
+  fontWeight: number,
+  fill: string,
+) {
+  if (lines.length === 0) {
+    return;
+  }
+
+  const startY = centerY - ((lines.length - 1) * lineHeight) / 2;
+  context.save();
+  context.fillStyle = fill;
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.font = `${fontWeight} ${fontSize}px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+  lines.forEach((line, index) => {
+    context.fillText(line || ' ', centerX, startY + index * lineHeight);
+  });
+  context.restore();
+}
+
+function drawCanvasEdgeArrow(
+  context: CanvasRenderingContext2D,
+  geometry: ReturnType<typeof buildEdgeGeometry>,
+  color: string,
+  scale: number,
+) {
+  const deltaX = geometry.end.x - geometry.controlB.x;
+  const deltaY = geometry.end.y - geometry.controlB.y;
+  const length = Math.hypot(deltaX, deltaY) || 1;
+  const dirX = deltaX / length;
+  const dirY = deltaY / length;
+  const normalX = -dirY;
+  const normalY = dirX;
+  const arrowLength = 12 * scale;
+  const arrowWidth = 6 * scale;
+  const tipX = geometry.end.x;
+  const tipY = geometry.end.y;
+  const baseX = tipX - dirX * arrowLength;
+  const baseY = tipY - dirY * arrowLength;
+
+  context.save();
+  context.fillStyle = color;
+  context.beginPath();
+  context.moveTo(tipX, tipY);
+  context.lineTo(baseX + normalX * arrowWidth, baseY + normalY * arrowWidth);
+  context.lineTo(baseX - normalX * arrowWidth, baseY - normalY * arrowWidth);
+  context.closePath();
+  context.fill();
+  context.restore();
+}
+
+function drawCanvasNode(
+  context: CanvasRenderingContext2D,
+  node: GraphNode,
+  zoom: number,
+) {
+  const path = buildCanvasNodePath(node.shape, node);
+  const simplified = zoom <= HYBRID_SCENE_SIMPLIFIED_ZOOM_THRESHOLD;
+  const titleFill = mixColors(node.stroke, node.fill, 0.84);
+  const bodyFill = mixColors(node.fill, '#ffffff', 0.04);
+
+  context.save();
+  context.fillStyle = bodyFill;
+  context.strokeStyle = node.stroke;
+  context.lineWidth = simplified ? 1.4 : 2.4;
+  context.fill(path);
+  context.stroke(path);
+
+  if (simplified) {
+    context.restore();
+    return;
+  }
+
+  const parts = splitEntityText(node.label);
+  const titleLines = wrapSvgTextLines(parts.title, Math.max(8, Math.floor((node.width - 34) / 11)));
+  const descriptionLines = wrapSvgTextLines(
+    parts.description || '（空）',
+    Math.max(8, Math.floor((node.width - 30) / 8.5)),
+  );
+  const titleHeight = Math.min(
+    node.height - 22,
+    Math.max(parts.description ? 54 : 66, 24 + titleLines.length * 24 + (parts.description ? 6 : 14)),
+  );
+  const descriptionHeight = Math.max(22, node.height - titleHeight);
+
+  context.save();
+  context.clip(path);
+  context.fillStyle = titleFill;
+  context.fillRect(node.x, node.y, node.width, titleHeight);
+  context.fillStyle = bodyFill;
+  context.fillRect(node.x, node.y + titleHeight, node.width, descriptionHeight);
+  context.strokeStyle = withAlpha(node.stroke, 0.22);
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(node.x, node.y + titleHeight);
+  context.lineTo(node.x + node.width, node.y + titleHeight);
+  context.stroke();
+  context.restore();
+
+  if (zoom >= HYBRID_SCENE_TITLE_ZOOM_THRESHOLD) {
+    drawCanvasTextBlock(
+      context,
+      titleLines,
+      node.x + node.width / 2,
+      node.y + titleHeight / 2,
+      22,
+      17,
+      800,
+      node.textColor,
+    );
+  }
+
+  if (zoom >= HYBRID_SCENE_DESCRIPTION_ZOOM_THRESHOLD) {
+    drawCanvasTextBlock(
+      context,
+      descriptionLines,
+      node.x + node.width / 2,
+      node.y + titleHeight + descriptionHeight / 2,
+      18,
+      parts.description ? 14 : 12,
+      560,
+      parts.description ? node.textColor : withAlpha(node.textColor, 0.44),
+    );
+  }
+
+  context.restore();
+}
+
+function drawCanvasEdge(
+  context: CanvasRenderingContext2D,
+  edgeInfo: SceneRenderableEdge,
+  zoom: number,
+) {
+  const normalizedEdge = normalizeEdgeStyle(edgeInfo.edge);
+  const isGroupEdge = edgeInfo.fromEndpoint.kind === 'subgraph' || edgeInfo.toEndpoint.kind === 'subgraph';
+  const inheritsSourceColor = shouldInheritSourceEdgeColor(normalizedEdge.strokeColor);
+  const edgeBaseColor = inheritsSourceColor
+    ? getEndpointAccentColor(edgeInfo.fromEndpoint)
+    : normalizedEdge.strokeColor;
+  const baseStrokeWidth = isGroupEdge ? normalizedEdge.strokeWidth * 2 : normalizedEdge.strokeWidth;
+  const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 4.2 : 3.2);
+  const outlineStroke = mixColors(edgeBaseColor, '#0f172a', isGroupEdge ? 0.56 : 0.5);
+  const outlineWidth = visualStrokeWidth + (isGroupEdge ? 0.34 : 0.26);
+  const path = new Path2D(edgeInfo.geometry.path);
+  const simplified = zoom <= HYBRID_SCENE_SIMPLIFIED_ZOOM_THRESHOLD;
+
+  context.save();
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+
+  if (!simplified) {
+    context.strokeStyle = outlineStroke;
+    context.globalAlpha = isGroupEdge ? 0.42 : 0.34;
+    context.lineWidth = outlineWidth;
+    context.stroke(path);
+    context.globalAlpha = 1;
+  }
+
+  context.strokeStyle = withAlpha(edgeBaseColor, 1);
+  context.lineWidth = simplified ? Math.max(1.4, visualStrokeWidth * 0.72) : visualStrokeWidth;
+  if (normalizedEdge.type === 'dotted') {
+    context.setLineDash([6, 10]);
+  } else if (normalizedEdge.type === 'thick') {
+    context.lineWidth = Math.max(context.lineWidth, 4.8);
+  }
+  context.stroke(path);
+  context.setLineDash([]);
+
+  if (normalizedEdge.type !== 'line' && zoom >= HYBRID_SCENE_ARROW_ZOOM_THRESHOLD) {
+    drawCanvasEdgeArrow(context, edgeInfo.geometry, edgeBaseColor, isGroupEdge ? 1.08 : 1);
+  }
+
+  context.restore();
+}
+
 function buildPreviewEdgePath(
   fromNode: Pick<EdgeEndpointBox, 'x' | 'y' | 'width' | 'height'>,
   currentPoint: Point,
@@ -4312,13 +4711,11 @@ function estimateCollapsedSummaryLayout(labels: string[]) {
   };
 }
 
-function resolveVisibleEndpointId(
+function resolveVisibleEndpointIdFromMaps(
   endpointId: string,
-  nodes: GraphNode[],
-  subgraphs: GraphSubgraph[],
+  nodeMap: Map<string, GraphNode>,
+  subgraphLookup: Map<string, GraphSubgraph>,
 ) {
-  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
-  const subgraphLookup = new Map(subgraphs.map((subgraph) => [subgraph.id, subgraph]));
   const node = nodeMap.get(endpointId);
   if (node) {
     return getTopVisibleCollapsedAncestorId(node.subgraphId, subgraphLookup) ?? node.id;
@@ -4656,6 +5053,14 @@ function buildBlobPrimitiveBounds(primitives: BlobPrimitive[]) {
   return buildRectBounds(primitives.map((primitive) => primitiveBounds(primitive)));
 }
 
+function primitiveCenter(primitive: BlobPrimitive) {
+  const bounds = primitiveBounds(primitive);
+  return {
+    x: bounds.x + bounds.width / 2,
+    y: bounds.y + bounds.height / 2,
+  };
+}
+
 function primitiveSamplePoints(primitive: BlobPrimitive) {
   if (primitive.kind === 'rounded-rect') {
     const rect = primitive.rect;
@@ -4769,6 +5174,236 @@ function buildSubgraphBlobPrimitives(
     softness,
     weight: 1,
   }));
+}
+
+function buildBlobPrimitiveClusters(
+  primitives: BlobPrimitive[],
+  fieldThreshold: number,
+) {
+  if (primitives.length <= 1) {
+    return primitives.length === 0 ? [] : [primitives];
+  }
+
+  const bounds = primitives.map((primitive) => primitiveBounds(primitive));
+  const centers = primitives.map((primitive) => primitiveCenter(primitive));
+  const influenceBounds = primitives.map((primitive, index) => expandRect(
+    bounds[index],
+    Math.max(20, primitive.softness * (1 - fieldThreshold * 0.42)),
+  ));
+  const visited = new Set<number>();
+  const clusters: BlobPrimitive[][] = [];
+
+  const shouldConnect = (leftIndex: number, rightIndex: number) => {
+    if (rectsIntersect(bounds[leftIndex], bounds[rightIndex])) {
+      return true;
+    }
+
+    if (!rectsIntersect(influenceBounds[leftIndex], influenceBounds[rightIndex])) {
+      return false;
+    }
+
+    const midpoint = {
+      x: (centers[leftIndex].x + centers[rightIndex].x) / 2,
+      y: (centers[leftIndex].y + centers[rightIndex].y) / 2,
+    };
+    return measureBlobField(
+      midpoint,
+      [primitives[leftIndex], primitives[rightIndex]],
+    ) >= fieldThreshold * 0.94;
+  };
+
+  for (let index = 0; index < primitives.length; index += 1) {
+    if (visited.has(index)) {
+      continue;
+    }
+
+    const stack = [index];
+    const clusterIndices: number[] = [];
+    visited.add(index);
+
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current === undefined) {
+        continue;
+      }
+
+      clusterIndices.push(current);
+      for (let candidate = 0; candidate < primitives.length; candidate += 1) {
+        if (visited.has(candidate) || candidate === current) {
+          continue;
+        }
+
+        if (!shouldConnect(current, candidate)) {
+          continue;
+        }
+
+        visited.add(candidate);
+        stack.push(candidate);
+      }
+    }
+
+    clusters.push(clusterIndices.map((clusterIndex) => primitives[clusterIndex]));
+  }
+
+  return clusters;
+}
+
+function buildBlobContourLoopsForPrimitives(
+  primitives: BlobPrimitive[],
+  fieldThreshold: number,
+  detail: BlobContourDetail,
+) {
+  const primitiveBounds = buildBlobPrimitiveBounds(primitives);
+  const maxSoftness = Math.max(0, ...primitives.map((primitive) => primitive.softness));
+  const fieldBounds = primitiveBounds
+    ? expandRect(
+      primitiveBounds,
+      detail === 'interactive'
+        ? Math.max(20, maxSoftness * 0.38)
+        : Math.max(30, maxSoftness * 0.54),
+    )
+    : null;
+  if (!fieldBounds) {
+    return [] as Point[][];
+  }
+
+  const maxDimension = Math.max(fieldBounds.width, fieldBounds.height);
+  const cellSize = detail === 'interactive'
+    ? clamp(maxDimension / 16, 18, 30)
+    : clamp(maxDimension / 30, 10, 16);
+  const threshold = fieldThreshold;
+  const cols = Math.max(4, Math.ceil(fieldBounds.width / cellSize) + 3);
+  const rows = Math.max(4, Math.ceil(fieldBounds.height / cellSize) + 3);
+  const origin = {
+    x: fieldBounds.x - cellSize * 1.5,
+    y: fieldBounds.y - cellSize * 1.5,
+  };
+  const values: number[][] = Array.from({ length: rows + 1 }, (_, rowIndex) =>
+    Array.from({ length: cols + 1 }, (_, columnIndex) =>
+      measureBlobField(
+        {
+          x: origin.x + columnIndex * cellSize,
+          y: origin.y + rowIndex * cellSize,
+        },
+        primitives,
+      )),
+  );
+  const segments: ContourSegment[] = [];
+
+  for (let rowIndex = 0; rowIndex < rows; rowIndex += 1) {
+    for (let columnIndex = 0; columnIndex < cols; columnIndex += 1) {
+      const topLeftValue = values[rowIndex][columnIndex];
+      const topRightValue = values[rowIndex][columnIndex + 1];
+      const bottomRightValue = values[rowIndex + 1][columnIndex + 1];
+      const bottomLeftValue = values[rowIndex + 1][columnIndex];
+      const state =
+        (topLeftValue >= threshold ? 8 : 0) |
+        (topRightValue >= threshold ? 4 : 0) |
+        (bottomRightValue >= threshold ? 2 : 0) |
+        (bottomLeftValue >= threshold ? 1 : 0);
+
+      if (state === 0 || state === 15) {
+        continue;
+      }
+
+      const topLeft = {
+        x: origin.x + columnIndex * cellSize,
+        y: origin.y + rowIndex * cellSize,
+      };
+      const topRight = {
+        x: topLeft.x + cellSize,
+        y: topLeft.y,
+      };
+      const bottomLeft = {
+        x: topLeft.x,
+        y: topLeft.y + cellSize,
+      };
+      const bottomRight = {
+        x: topLeft.x + cellSize,
+        y: topLeft.y + cellSize,
+      };
+      const top = interpolateContourPoint(topLeft, topRight, topLeftValue, topRightValue, threshold);
+      const right = interpolateContourPoint(topRight, bottomRight, topRightValue, bottomRightValue, threshold);
+      const bottom = interpolateContourPoint(bottomLeft, bottomRight, bottomLeftValue, bottomRightValue, threshold);
+      const left = interpolateContourPoint(topLeft, bottomLeft, topLeftValue, bottomLeftValue, threshold);
+      const centerValue = state === 5 || state === 10
+        ? measureBlobField(
+          {
+            x: topLeft.x + cellSize / 2,
+            y: topLeft.y + cellSize / 2,
+          },
+          primitives,
+        )
+        : 0;
+      const addSegment = (start: Point, end: Point) => {
+        segments.push({ start, end });
+      };
+
+      switch (state) {
+        case 1:
+          addSegment(left, bottom);
+          break;
+        case 2:
+          addSegment(bottom, right);
+          break;
+        case 3:
+          addSegment(left, right);
+          break;
+        case 4:
+          addSegment(top, right);
+          break;
+        case 5:
+          if (centerValue >= threshold) {
+            addSegment(top, left);
+            addSegment(right, bottom);
+          } else {
+            addSegment(top, right);
+            addSegment(left, bottom);
+          }
+          break;
+        case 6:
+          addSegment(top, bottom);
+          break;
+        case 7:
+          addSegment(top, left);
+          break;
+        case 8:
+          addSegment(top, left);
+          break;
+        case 9:
+          addSegment(top, bottom);
+          break;
+        case 10:
+          if (centerValue >= threshold) {
+            addSegment(top, right);
+            addSegment(left, bottom);
+          } else {
+            addSegment(top, left);
+            addSegment(right, bottom);
+          }
+          break;
+        case 11:
+          addSegment(top, right);
+          break;
+        case 12:
+          addSegment(left, right);
+          break;
+        case 13:
+          addSegment(bottom, right);
+          break;
+        case 14:
+          addSegment(left, bottom);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  return buildContourLoops(segments)
+    .map((loop) => simplifyClosedPolygon(loop))
+    .filter((loop) => Math.abs(polygonArea(loop)) >= (detail === 'interactive' ? 220 : 140))
+    .sort((left, right) => Math.abs(polygonArea(right)) - Math.abs(polygonArea(left)));
 }
 
 function measureBlobField(point: Point, primitives: BlobPrimitive[]) {
@@ -4983,159 +5618,15 @@ function buildSubgraphBlobContours(
   frame: SubgraphFrame,
   memberRects: Rect[],
   maxDepth: number,
+  detail: BlobContourDetail = 'full',
 ) {
   const layerBoost = Math.max(maxDepth - frame.depth, 0);
   const fieldThreshold = clamp(0.5 - layerBoost * 0.035, 0.34, 0.5);
   const primitives = buildSubgraphBlobPrimitives(frame, memberRects, maxDepth);
-  const primitiveBounds = buildBlobPrimitiveBounds(primitives);
-  const maxSoftness = Math.max(0, ...primitives.map((primitive) => primitive.softness));
-  const fieldBounds = primitiveBounds
-    ? expandRect(primitiveBounds, Math.max(36, maxSoftness * 0.62))
-    : null;
-  if (!fieldBounds) {
-    return {
-      loops: [] as Point[][],
-      primitives,
-      fieldThreshold,
-    };
-  }
-
-  const cellSize = 10;
-  const threshold = fieldThreshold;
-  const cols = Math.max(6, Math.ceil(fieldBounds.width / cellSize) + 4);
-  const rows = Math.max(6, Math.ceil(fieldBounds.height / cellSize) + 4);
-  const origin = {
-    x: fieldBounds.x - cellSize * 2,
-    y: fieldBounds.y - cellSize * 2,
-  };
-  const values: number[][] = Array.from({ length: rows + 1 }, (_, rowIndex) =>
-    Array.from({ length: cols + 1 }, (_, columnIndex) =>
-      measureBlobField(
-        {
-          x: origin.x + columnIndex * cellSize,
-          y: origin.y + rowIndex * cellSize,
-        },
-        primitives,
-      )),
-  );
-  const segments: ContourSegment[] = [];
-
-  for (let rowIndex = 0; rowIndex < rows; rowIndex += 1) {
-    for (let columnIndex = 0; columnIndex < cols; columnIndex += 1) {
-      const topLeftValue = values[rowIndex][columnIndex];
-      const topRightValue = values[rowIndex][columnIndex + 1];
-      const bottomRightValue = values[rowIndex + 1][columnIndex + 1];
-      const bottomLeftValue = values[rowIndex + 1][columnIndex];
-      const state =
-        (topLeftValue >= threshold ? 8 : 0) |
-        (topRightValue >= threshold ? 4 : 0) |
-        (bottomRightValue >= threshold ? 2 : 0) |
-        (bottomLeftValue >= threshold ? 1 : 0);
-
-      if (state === 0 || state === 15) {
-        continue;
-      }
-
-      const topLeft = {
-        x: origin.x + columnIndex * cellSize,
-        y: origin.y + rowIndex * cellSize,
-      };
-      const topRight = {
-        x: topLeft.x + cellSize,
-        y: topLeft.y,
-      };
-      const bottomLeft = {
-        x: topLeft.x,
-        y: topLeft.y + cellSize,
-      };
-      const bottomRight = {
-        x: topLeft.x + cellSize,
-        y: topLeft.y + cellSize,
-      };
-      const top = interpolateContourPoint(topLeft, topRight, topLeftValue, topRightValue, threshold);
-      const right = interpolateContourPoint(topRight, bottomRight, topRightValue, bottomRightValue, threshold);
-      const bottom = interpolateContourPoint(bottomLeft, bottomRight, bottomLeftValue, bottomRightValue, threshold);
-      const left = interpolateContourPoint(topLeft, bottomLeft, topLeftValue, bottomLeftValue, threshold);
-      const centerValue = state === 5 || state === 10
-        ? measureBlobField(
-            {
-              x: topLeft.x + cellSize / 2,
-              y: topLeft.y + cellSize / 2,
-            },
-            primitives,
-          )
-        : 0;
-      const addSegment = (start: Point, end: Point) => {
-        segments.push({ start, end });
-      };
-
-      switch (state) {
-        case 1:
-          addSegment(left, bottom);
-          break;
-        case 2:
-          addSegment(bottom, right);
-          break;
-        case 3:
-          addSegment(left, right);
-          break;
-        case 4:
-          addSegment(top, right);
-          break;
-        case 5:
-          if (centerValue >= threshold) {
-            addSegment(top, left);
-            addSegment(right, bottom);
-          } else {
-            addSegment(top, right);
-            addSegment(left, bottom);
-          }
-          break;
-        case 6:
-          addSegment(top, bottom);
-          break;
-        case 7:
-          addSegment(top, left);
-          break;
-        case 8:
-          addSegment(top, left);
-          break;
-        case 9:
-          addSegment(top, bottom);
-          break;
-        case 10:
-          if (centerValue >= threshold) {
-            addSegment(top, right);
-            addSegment(left, bottom);
-          } else {
-            addSegment(top, left);
-            addSegment(right, bottom);
-          }
-          break;
-        case 11:
-          addSegment(top, right);
-          break;
-        case 12:
-          addSegment(left, right);
-          break;
-        case 13:
-          addSegment(bottom, right);
-          break;
-        case 14:
-          addSegment(left, bottom);
-          break;
-        default:
-          break;
-      }
-    }
-  }
-
-  const loops = buildContourLoops(segments);
+  const loops = buildBlobPrimitiveClusters(primitives, fieldThreshold)
+    .flatMap((cluster) => buildBlobContourLoopsForPrimitives(cluster, fieldThreshold, detail));
   return {
-    loops: loops
-    .map((loop) => simplifyClosedPolygon(loop))
-    .filter((loop) => Math.abs(polygonArea(loop)) >= 140)
-    .sort((left, right) => Math.abs(polygonArea(right)) - Math.abs(polygonArea(left))),
+    loops,
     primitives,
     fieldThreshold,
   };
@@ -5145,6 +5636,7 @@ function buildSubgraphBlobShapes(
   subgraphs: GraphSubgraph[],
   frames: SubgraphFrame[],
   visibleNodes: GraphNode[],
+  detail: BlobContourDetail = 'full',
 ): SubgraphBlobShape[] {
   const lookup = getVisibleSubgraphIds(subgraphs);
   const maxDepth = frames.reduce((current, frame) => Math.max(current, frame.depth), 0);
@@ -5207,7 +5699,7 @@ function buildSubgraphBlobShapes(
       };
     }
 
-    const { loops, primitives, fieldThreshold } = buildSubgraphBlobContours(frame, memberRects, maxDepth);
+    const { loops, primitives, fieldThreshold } = buildSubgraphBlobContours(frame, memberRects, maxDepth, detail);
     const fallbackBounds = buildBlobPrimitiveBounds(primitives) ?? (
       buildRectBounds(memberRects) ?? {
         x: frame.x + 18,
@@ -5226,7 +5718,7 @@ function buildSubgraphBlobShapes(
           }))) ?? fallbackBounds;
           return {
             bounds,
-            path: buildSmoothClosedPath(smoothClosedPolygon(loop, 3)),
+            path: buildSmoothClosedPath(smoothClosedPolygon(loop, detail === 'interactive' ? 1 : 3)),
           };
         })
       : [{
@@ -6655,6 +7147,8 @@ export default function App() {
   const [isMobileViewport, setIsMobileViewport] = useState(() => window.innerWidth <= 820);
   const [isConstrainedDevice, setIsConstrainedDevice] = useState(false);
   const [mode, setMode] = useState<EditorMode>('canvas');
+  const [perfDebugEnabled, setPerfDebugEnabled] = useState(() => readPerfDebugEnabled(hostConfig));
+  const [perfDebugSummary, setPerfDebugSummary] = useState<PerfDebugSummary>(() => createEmptyPerfDebugSummary());
   const [leftPanel, setLeftPanel] = useState<LeftPanel>(isVsCodeHost ? 'graph' : 'files');
   const [activeFileTab, setActiveFileTab] = useState<WorkspaceTabId>('diagram');
   const [activeWorkspaceSource, setActiveWorkspaceSource] = useState<'cloud' | 'local'>(
@@ -6850,6 +7344,7 @@ export default function App() {
   const workspaceRef = useRef<HTMLElement>(null);
   const workspaceMainRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const sceneCanvasRef = useRef<HTMLCanvasElement>(null);
   const canvasBoardRef = useRef<HTMLDivElement>(null);
   const canvasSearchInputRef = useRef<HTMLInputElement>(null);
   const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
@@ -6869,39 +7364,94 @@ export default function App() {
   const previousModeRef = useRef(mode);
   const editingSubgraphTitleRef = useRef(editingSubgraphTitle);
   const gestureStateRef = useRef<GestureState | null>(null);
+  const perfMetricsRef = useRef<Map<string, PerfMetricAccumulator>>(new Map());
+  const perfCountersRef = useRef(createPerfCounterSnapshot());
+  const perfWindowStartedAtRef = useRef(performance.now());
+  const perfRenderCountRef = useRef(0);
+  const perfRenderBaselineRef = useRef(0);
+  const perfSnapshotRef = useRef<PerfDebugSnapshot>(createPerfDebugSnapshot());
+  const pointerMoveFrameRef = useRef<number | null>(null);
+  const pendingPointerMoveRef = useRef<{
+    clientX: number;
+    clientY: number;
+    ctrlKey: boolean;
+    metaKey: boolean;
+    shiftKey: boolean;
+  } | null>(null);
   const backgroundHoldRef = useRef<number | null>(null);
   const pendingBackgroundRef = useRef<{
     clientX: number;
     clientY: number;
     point: Point;
   } | null>(null);
+  perfRenderCountRef.current += 1;
+
+  const recordPerfMetric = useCallback((label: string, durationMs: number) => {
+    if (!perfDebugEnabled) {
+      return;
+    }
+
+    const bucket = perfMetricsRef.current.get(label) ?? {
+      count: 0,
+      totalMs: 0,
+      maxMs: 0,
+      lastMs: 0,
+      slowCount: 0,
+    };
+    bucket.count += 1;
+    bucket.totalMs += durationMs;
+    bucket.maxMs = Math.max(bucket.maxMs, durationMs);
+    bucket.lastMs = durationMs;
+    if (durationMs >= PERF_DEBUG_SLOW_SAMPLE_MS) {
+      bucket.slowCount += 1;
+    }
+    perfMetricsRef.current.set(label, bucket);
+  }, [perfDebugEnabled]);
+
+  const measurePerf = useCallback(function measurePerf<T>(label: string, compute: () => T): T {
+    if (!perfDebugEnabled) {
+      return compute();
+    }
+
+    const startedAt = performance.now();
+    const result = compute();
+    recordPerfMetric(label, performance.now() - startedAt);
+    return result;
+  }, [perfDebugEnabled, recordPerfMetric]);
+
   const deferredSource = useDeferredValue(sourceDraft);
   const sourceParseError = useMemo(() => {
-    try {
-      parseProjectMarkdown(
-        deferredSource,
-        documentState.projectName ?? 'Untitled Project',
-        documentState.layout,
-      );
-      return null;
-    } catch (error) {
-      return error instanceof Error ? error.message : '无法解析工程 Markdown。';
-    }
-  }, [deferredSource, documentState.layout, documentState.projectName]);
+    return measurePerf('parseProjectMarkdown:deferredSource', () => {
+      try {
+        parseProjectMarkdown(
+          deferredSource,
+          documentState.projectName ?? 'Untitled Project',
+          documentState.layout,
+        );
+        return null;
+      } catch (error) {
+        return error instanceof Error ? error.message : '无法解析工程 Markdown。';
+      }
+    });
+  }, [deferredSource, documentState.layout, documentState.projectName, measurePerf]);
 
   const subgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
-  const fullSubgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
+  const fullSubgraphLookup = subgraphLookup;
   const previewNodes = useMemo(
-    () => applyDragPreview(documentState.nodes, dragState),
-    [documentState.nodes, dragState],
+    () => measurePerf('applyDragPreview', () => applyDragPreview(documentState.nodes, dragState)),
+    [documentState.nodes, dragState, measurePerf],
+  );
+  const previewNodeMap = useMemo(
+    () => new Map(previewNodes.map((node) => [node.id, node])),
+    [previewNodes],
   );
   const subgraphPreviewNodes = useMemo(
     () => (dragReparentMode ? documentState.nodes : previewNodes),
     [documentState.nodes, dragReparentMode, previewNodes],
   );
   const subgraphFrames = useMemo(
-    () => buildSubgraphFrames(documentState, subgraphPreviewNodes),
-    [documentState, subgraphPreviewNodes],
+    () => measurePerf('buildSubgraphFrames', () => buildSubgraphFrames(documentState, subgraphPreviewNodes)),
+    [documentState, measurePerf, subgraphPreviewNodes],
   );
   const contentMarkdown = useMemo(
     () => documentState.contentMarkdown ?? extractContentMarkdown(documentState.suffixMarkdown),
@@ -6972,45 +7522,70 @@ export default function App() {
     isVsCodeHost,
   ]);
   const contentCardRect: Rect | null = null;
-  const miniMapModel = useMemo(() => {
+  const sceneViewportRect = useMemo(() => {
     const canvasBounds = canvasRef.current?.getBoundingClientRect();
     const viewport = documentState.layout.viewport;
-    const viewportRect = canvasBounds
-      ? {
-          x: -viewport.x / viewport.zoom,
-          y: -viewport.y / viewport.zoom,
-          width: canvasBounds.width / viewport.zoom,
-          height: canvasBounds.height / viewport.zoom,
-        }
-      : null;
+    if (!canvasBounds) {
+      return null;
+    }
 
-    return buildMiniMapModel(
-      [
-        ...previewNodes.map((node) => ({
-          id: node.id,
-          kind: 'node' as const,
-          rect: { x: node.x, y: node.y, width: node.width, height: node.height },
-          fill: node.fill,
-          stroke: node.stroke,
-          selected: selection.kind === 'node' && selectionContains(selection, node.id),
-        })),
-        ...subgraphFrames.map((frame) => {
-          const style = getSubgraphStyle(documentState.subgraphs.find((entry) => entry.id === frame.id));
-          return {
-            id: frame.id,
-            kind: 'subgraph' as const,
-            rect: { x: frame.x, y: frame.y, width: frame.width, height: frame.height },
-            fill: withAlpha(style.fill, 0.22),
-            stroke: style.stroke,
-            selected: selectionContainsSubgraph(selection, frame.id),
-          };
-        }),
-      ],
-      viewportRect,
-    );
+    return {
+      x: -viewport.x / viewport.zoom,
+      y: -viewport.y / viewport.zoom,
+      width: canvasBounds.width / viewport.zoom,
+      height: canvasBounds.height / viewport.zoom,
+    };
+  }, [documentState.layout.viewport]);
+  const sceneRenderRect = useMemo(() => {
+    if (!sceneViewportRect) {
+      return null;
+    }
+
+    const worldMargin = HYBRID_SCENE_VIEWPORT_MARGIN_PX / Math.max(documentState.layout.viewport.zoom, 0.08);
+    return expandRect(sceneViewportRect, worldMargin);
+  }, [documentState.layout.viewport.zoom, sceneViewportRect]);
+  const miniMapModel = useMemo(() => {
+    return measurePerf('buildMiniMapModel', () => {
+      const canvasBounds = canvasRef.current?.getBoundingClientRect();
+      const viewport = documentState.layout.viewport;
+      const viewportRect = canvasBounds
+        ? {
+            x: -viewport.x / viewport.zoom,
+            y: -viewport.y / viewport.zoom,
+            width: canvasBounds.width / viewport.zoom,
+            height: canvasBounds.height / viewport.zoom,
+          }
+        : null;
+
+      return buildMiniMapModel(
+        [
+          ...previewNodes.map((node) => ({
+            id: node.id,
+            kind: 'node' as const,
+            rect: { x: node.x, y: node.y, width: node.width, height: node.height },
+            fill: node.fill,
+            stroke: node.stroke,
+            selected: selection.kind === 'node' && selectionContains(selection, node.id),
+          })),
+          ...subgraphFrames.map((frame) => {
+            const style = getSubgraphStyle(documentState.subgraphs.find((entry) => entry.id === frame.id));
+            return {
+              id: frame.id,
+              kind: 'subgraph' as const,
+              rect: { x: frame.x, y: frame.y, width: frame.width, height: frame.height },
+              fill: withAlpha(style.fill, 0.22),
+              stroke: style.stroke,
+              selected: selectionContainsSubgraph(selection, frame.id),
+            };
+          }),
+        ],
+        viewportRect,
+      );
+    });
   }, [
     documentState.subgraphs,
     documentState.layout.viewport,
+    measurePerf,
     previewNodes,
     selection,
     subgraphFrames,
@@ -7021,9 +7596,55 @@ export default function App() {
   const visibleSubgraphNodes = subgraphPreviewNodes.filter(
     (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
   );
+  const hybridSceneDensityHint = mode === 'canvas' && (
+    visibleSubgraphNodes.length >= HYBRID_SCENE_NODE_THRESHOLD ||
+    documentState.edges.length >= HYBRID_SCENE_EDGE_THRESHOLD
+  );
+  const blobVisibleSubgraphIds = useMemo(() => {
+    if (!hybridSceneDensityHint || !sceneRenderRect) {
+      return new Set(documentState.subgraphs.map((subgraph) => subgraph.id));
+    }
+
+    return new Set(
+      subgraphFrames
+        .filter((frame) => intersects(sceneRenderRect, frame))
+        .map((frame) => frame.id),
+    );
+  }, [documentState.subgraphs, hybridSceneDensityHint, sceneRenderRect, subgraphFrames]);
+  const blobRenderableSubgraphs = useMemo(
+    () => (
+      hybridSceneDensityHint
+        ? documentState.subgraphs.filter((subgraph) => blobVisibleSubgraphIds.has(subgraph.id))
+        : documentState.subgraphs
+    ),
+    [blobVisibleSubgraphIds, documentState.subgraphs, hybridSceneDensityHint],
+  );
+  const blobRenderableFrames = useMemo(
+    () => (
+      hybridSceneDensityHint
+        ? subgraphFrames.filter((frame) => blobVisibleSubgraphIds.has(frame.id))
+        : subgraphFrames
+    ),
+    [blobVisibleSubgraphIds, hybridSceneDensityHint, subgraphFrames],
+  );
+  const blobRenderableNodes = useMemo(
+    () => (
+      hybridSceneDensityHint
+        ? visibleSubgraphNodes.filter((node) =>
+          !node.subgraphId ||
+          blobVisibleSubgraphIds.has(node.subgraphId) ||
+          (sceneRenderRect ? intersects(sceneRenderRect, node) : true))
+        : visibleSubgraphNodes
+    ),
+    [blobVisibleSubgraphIds, hybridSceneDensityHint, sceneRenderRect, visibleSubgraphNodes],
+  );
+  const subgraphBlobDetail: BlobContourDetail = dragState ? 'interactive' : 'full';
   const subgraphBlobShapes = useMemo(
-    () => buildSubgraphBlobShapes(documentState.subgraphs, subgraphFrames, visibleSubgraphNodes),
-    [documentState.subgraphs, subgraphFrames, visibleSubgraphNodes],
+    () => measurePerf(
+      `buildSubgraphBlobShapes:${subgraphBlobDetail}`,
+      () => buildSubgraphBlobShapes(blobRenderableSubgraphs, blobRenderableFrames, blobRenderableNodes, subgraphBlobDetail),
+    ),
+    [blobRenderableFrames, blobRenderableNodes, blobRenderableSubgraphs, measurePerf, subgraphBlobDetail],
   );
   const subgraphBlobShapeMap = useMemo(
     () => new Map(subgraphBlobShapes.map((shape) => [shape.id, shape])),
@@ -7034,7 +7655,7 @@ export default function App() {
     [documentState.nodes, editingLabel, editingNodeId],
   );
   const edgeEndpoints = useMemo<EdgeEndpointBox[]>(
-    () => [
+    () => measurePerf('buildEdgeEndpoints', () => [
       ...visibleNodes.map((node) => ({
         id: node.id,
         kind: 'node' as const,
@@ -7060,8 +7681,8 @@ export default function App() {
           textColor: style.textColor,
         };
       }),
-    ],
-    [documentState.subgraphs, subgraphFrames, visibleNodes],
+    ]),
+    [documentState.subgraphs, measurePerf, subgraphFrames, visibleNodes],
   );
   const edgeEndpointMap = useMemo(
     () => new Map(edgeEndpoints.map((endpoint) => [endpoint.id, endpoint])),
@@ -7072,9 +7693,9 @@ export default function App() {
     [edgeEndpoints],
   );
   const visibleEdges = useMemo(
-    () => documentState.edges.flatMap((edge) => {
-      const displayFrom = resolveVisibleEndpointId(edge.from, previewNodes, documentState.subgraphs);
-      const displayTo = resolveVisibleEndpointId(edge.to, previewNodes, documentState.subgraphs);
+    () => measurePerf('resolveVisibleEdges', () => documentState.edges.flatMap((edge) => {
+      const displayFrom = resolveVisibleEndpointIdFromMaps(edge.from, previewNodeMap, subgraphLookup);
+      const displayTo = resolveVisibleEndpointIdFromMaps(edge.to, previewNodeMap, subgraphLookup);
       if (
         !visibleEdgeEndpointIds.has(displayFrom) ||
         !visibleEdgeEndpointIds.has(displayTo) ||
@@ -7088,13 +7709,19 @@ export default function App() {
         from: displayFrom,
         to: displayTo,
       }];
-    }),
-    [documentState.edges, documentState.subgraphs, previewNodes, visibleEdgeEndpointIds],
+    })),
+    [documentState.edges, measurePerf, previewNodeMap, subgraphLookup, visibleEdgeEndpointIds],
   );
-  const edgeLaneMap = useMemo(() => buildEdgeLaneMap(visibleEdges), [visibleEdges]);
+  const edgeLaneMap = useMemo(
+    () => measurePerf('buildEdgeLaneMap', () => buildEdgeLaneMap(visibleEdges)),
+    [measurePerf, visibleEdges],
+  );
   const edgeEndpointOffsetMap = useMemo(
-    () => buildEdgeEndpointOffsetMap(visibleEdges, edgeEndpoints),
-    [edgeEndpoints, visibleEdges],
+    () => measurePerf(
+      'buildEdgeEndpointOffsetMap',
+      () => buildEdgeEndpointOffsetMap(visibleEdges, edgeEndpoints),
+    ),
+    [edgeEndpoints, measurePerf, visibleEdges],
   );
   const dragEntityEndpointId =
     dragState?.kind === 'subgraph'
@@ -7126,7 +7753,7 @@ export default function App() {
     };
   }, [dragEntityEndpointId, dragState, dragTargetEdgeId, edgeEndpointMap, visibleEdges]);
   const canvasExportBounds = useMemo(
-    () => buildCanvasExportBounds({
+    () => measurePerf('buildCanvasExportBounds', () => buildCanvasExportBounds({
       nodes: visibleNodes,
       subgraphs: subgraphFrames,
       contentRect: null,
@@ -7134,11 +7761,12 @@ export default function App() {
       endpointMap: edgeEndpointMap,
       laneMap: edgeLaneMap,
       endpointOffsets: edgeEndpointOffsetMap,
-    }),
+    })),
     [
       edgeEndpointMap,
       edgeEndpointOffsetMap,
       edgeLaneMap,
+      measurePerf,
       subgraphFrames,
       visibleEdges,
       visibleNodes,
@@ -7209,22 +7837,23 @@ export default function App() {
     () => new Map(liveEdgeMarkerEntries.map((entry) => [entry.color, entry.id])),
     [liveEdgeMarkerEntries],
   );
-  const allSubgraphFrames = useMemo(
-    () => buildSubgraphFrames(documentState, subgraphPreviewNodes),
-    [documentState, subgraphPreviewNodes],
-  );
+  const allSubgraphFrames = subgraphFrames;
   const allSubgraphFrameMap = useMemo(
     () => new Map(allSubgraphFrames.map((frame) => [frame.id, frame])),
     [allSubgraphFrames],
   );
-  const allSubgraphBlobShapes = useMemo(
-    () => buildSubgraphBlobShapes(documentState.subgraphs, allSubgraphFrames, visibleSubgraphNodes),
-    [allSubgraphFrames, documentState.subgraphs, visibleSubgraphNodes],
-  );
+  const allSubgraphBlobShapes = subgraphBlobShapes;
   const allSubgraphBlobShapeMap = useMemo(
     () => new Map(allSubgraphBlobShapes.map((shape) => [shape.id, shape])),
     [allSubgraphBlobShapes],
   );
+  perfSnapshotRef.current = {
+    visibleNodeCount: visibleNodes.length,
+    visibleEdgeCount: visibleEdges.length,
+    subgraphFrameCount: subgraphFrames.length,
+    blobRegionCount: subgraphBlobShapes.reduce((total, shape) => total + shape.regions.length, 0),
+    blobPrimitiveCount: subgraphBlobShapes.reduce((total, shape) => total + shape.primitives.length, 0),
+  };
   const canvasSearchResults = useMemo<CanvasSearchResult[]>(() => {
     const query = canvasSearchQuery.trim().toLowerCase();
     if (!query) {
@@ -7297,6 +7926,177 @@ export default function App() {
     () => new Set(canvasSearchResults.filter((item) => item.kind === 'subgraph').map((item) => item.id)),
     [canvasSearchResults],
   );
+  const hybridSceneActive = hybridSceneDensityHint;
+  const sceneRenderableNodes = useMemo(
+    () => (
+      sceneRenderRect
+        ? visibleNodes.filter((node) => intersects(sceneRenderRect, node))
+        : visibleNodes
+    ),
+    [sceneRenderRect, visibleNodes],
+  );
+  const sceneRenderableEdges = useMemo<SceneRenderableEdge[]>(
+    () => visibleEdges.flatMap((edge) => {
+      const fromEndpoint = edgeEndpointMap.get(edge.from);
+      const toEndpoint = edgeEndpointMap.get(edge.to);
+      if (!fromEndpoint || !toEndpoint) {
+        return [];
+      }
+
+      const approximateBounds = buildEdgeApproxBounds(fromEndpoint, toEndpoint);
+      if (sceneRenderRect && !intersects(sceneRenderRect, approximateBounds)) {
+        return [];
+      }
+
+      return [{
+        edge,
+        fromEndpoint,
+        toEndpoint,
+        geometry: buildEdgeGeometry(
+          fromEndpoint,
+          toEndpoint,
+          edgeLaneMap.get(edge.id) ?? 0,
+          edgeEndpointOffsetMap.get(edge.id),
+        ),
+      }];
+    }),
+    [edgeEndpointMap, edgeEndpointOffsetMap, edgeLaneMap, sceneRenderRect, visibleEdges],
+  );
+  const sceneInteractiveNodeIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (selection.kind === 'node') {
+      selection.ids.forEach((id) => ids.add(id));
+    }
+    if (editingNodeId) {
+      ids.add(editingNodeId);
+    }
+    if (hoveredNodeId) {
+      ids.add(hoveredNodeId);
+    }
+    if (dragTargetNodeId) {
+      ids.add(dragTargetNodeId);
+    }
+    if (dragState?.kind === 'node') {
+      dragState.ids.forEach((id) => ids.add(id));
+    }
+    if (connectingState) {
+      connectingState.fromIds.forEach((id) => ids.add(id));
+      ids.add(connectingState.fromId);
+    }
+    canvasSearchNodeIds.forEach((id) => ids.add(id));
+    return ids;
+  }, [
+    canvasSearchNodeIds,
+    connectingState,
+    dragState,
+    dragTargetNodeId,
+    editingNodeId,
+    hoveredNodeId,
+    selection,
+  ]);
+  const sceneInteractiveEdgeIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (selection.kind === 'edge') {
+      selection.ids.forEach((id) => ids.add(id));
+    }
+    if (editingEdgeId) {
+      ids.add(editingEdgeId);
+    }
+    if (dragTargetEdgeId) {
+      ids.add(dragTargetEdgeId);
+    }
+    return ids;
+  }, [dragTargetEdgeId, editingEdgeId, selection]);
+  const sceneCanvasNodes = useMemo(
+    () => (
+      hybridSceneActive
+        ? sceneRenderableNodes.filter((node) => !sceneInteractiveNodeIds.has(node.id))
+        : []
+    ),
+    [hybridSceneActive, sceneInteractiveNodeIds, sceneRenderableNodes],
+  );
+  const sceneOverlayNodes = useMemo(
+    () => (
+      hybridSceneActive
+        ? sceneRenderableNodes.filter((node) => sceneInteractiveNodeIds.has(node.id))
+        : sceneRenderableNodes
+    ),
+    [hybridSceneActive, sceneInteractiveNodeIds, sceneRenderableNodes],
+  );
+  const sceneCanvasEdges = useMemo(
+    () => (
+      hybridSceneActive
+        ? sceneRenderableEdges.filter((entry) => !sceneInteractiveEdgeIds.has(entry.edge.id))
+        : []
+    ),
+    [hybridSceneActive, sceneInteractiveEdgeIds, sceneRenderableEdges],
+  );
+  const sceneOverlayEdges = useMemo(
+    () => (
+      hybridSceneActive
+        ? sceneRenderableEdges.filter((entry) => sceneInteractiveEdgeIds.has(entry.edge.id)).map((entry) => entry.edge)
+        : sceneRenderableEdges.map((entry) => entry.edge)
+    ),
+    [hybridSceneActive, sceneInteractiveEdgeIds, sceneRenderableEdges],
+  );
+
+  useEffect(() => {
+    const canvas = sceneCanvasRef.current;
+    const surface = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    const context = canvas.getContext('2d');
+    if (!context) {
+      return;
+    }
+
+    if (!surface || mode !== 'canvas' || !hybridSceneActive) {
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+
+    const surfaceBounds = surface.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const targetWidth = Math.max(1, Math.floor(surfaceBounds.width * dpr));
+    const targetHeight = Math.max(1, Math.floor(surfaceBounds.height * dpr));
+
+    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+    }
+
+    measurePerf('renderSceneCanvas', () => {
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+      context.imageSmoothingEnabled = true;
+      context.translate(documentState.layout.viewport.x, documentState.layout.viewport.y);
+      context.scale(documentState.layout.viewport.zoom, documentState.layout.viewport.zoom);
+
+      sceneCanvasEdges.forEach((entry) => {
+        drawCanvasEdge(
+          context,
+          entry,
+          documentState.layout.viewport.zoom,
+        );
+      });
+
+      sceneCanvasNodes.forEach((node) => {
+        drawCanvasNode(context, node, documentState.layout.viewport.zoom);
+      });
+    });
+  }, [
+    documentState.layout.viewport,
+    hybridSceneActive,
+    measurePerf,
+    mode,
+    sceneCanvasEdges,
+    sceneCanvasNodes,
+  ]);
+
   const graphTreeItems = useMemo(
     () =>
       buildGraphTreeItems(
@@ -7502,6 +8302,37 @@ export default function App() {
       setSaveStatus('error');
     }
   }, [activeLocalItem, applyCommittedDocument, sourceDraft]);
+
+  const loadStressTestProject = useCallback(() => {
+    const confirmed = window.confirm(`加载压力测试工程（${defaultStressTestProjectLabel}）？这会替换当前工作区内容。`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      const currentDocument = structuredClone(documentRef.current);
+      const markdown = createStressTestProjectMarkdown();
+      const nextDocument = materializeDocument(
+        parseProjectMarkdown(markdown, 'LMD Stress Test Workspace', createDefaultLayout()),
+      );
+
+      applyCommittedDocument(
+        nextDocument,
+        '已加载压力测试工程',
+        `已生成并载入 ${defaultStressTestProjectLabel} 的压力测试图。`,
+        currentDocument,
+      );
+
+      setSelection({ kind: 'none', ids: [] });
+      setSearchQuery('');
+      setEditingNodeId(null);
+      setEditingNodeField('title');
+      setEditingLabel('');
+      setMode('canvas');
+    } catch {
+      setSaveStatus('error');
+    }
+  }, [applyCommittedDocument]);
 
   const selectSingle = useCallback((
     kind: Exclude<SelectionState['kind'], 'none'>,
@@ -9783,7 +10614,7 @@ export default function App() {
     if (mode !== 'canvas') {
       setMode('canvas');
     }
-  }, [inspectorView, isVsCodeHost, leftPanel, mode]);
+  }, [isVsCodeHost]);
 
   useEffect(() => {
     if (previousModeRef.current === 'source' && mode !== 'source') {
@@ -9957,6 +10788,93 @@ export default function App() {
   }, [mode, pendingSourceSelection, sourceDraft]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(storageKeys.perfDebug, perfDebugEnabled ? '1' : '0');
+    } catch {
+      // Ignore localStorage failures in sandboxed contexts.
+    }
+  }, [perfDebugEnabled]);
+
+  useEffect(() => {
+    if (!perfDebugEnabled) {
+      perfMetricsRef.current.clear();
+      perfCountersRef.current = createPerfCounterSnapshot();
+      perfWindowStartedAtRef.current = performance.now();
+      perfRenderBaselineRef.current = perfRenderCountRef.current;
+      setPerfDebugSummary(createEmptyPerfDebugSummary());
+      return undefined;
+    }
+
+    const flushPerfSummary = () => {
+      const now = performance.now();
+      const elapsedMs = Math.max(1, now - perfWindowStartedAtRef.current);
+      const entries = [...perfMetricsRef.current.entries()]
+        .map(([label, stats]) => ({
+          label,
+          ...stats,
+          avgMs: stats.totalMs / Math.max(stats.count, 1),
+        }))
+        .sort((left, right) => {
+          if (right.totalMs !== left.totalMs) {
+            return right.totalMs - left.totalMs;
+          }
+          if (right.maxMs !== left.maxMs) {
+            return right.maxMs - left.maxMs;
+          }
+          return right.avgMs - left.avgMs;
+        })
+        .slice(0, 8);
+      const counters = perfCountersRef.current;
+      const renderCount = perfRenderCountRef.current - perfRenderBaselineRef.current;
+      const nextSummary: PerfDebugSummary = {
+        windowMs: elapsedMs,
+        renderCount,
+        pointerMoves: counters.pointerMoves,
+        dragPointerMoves: counters.dragPointerMoves,
+        boxPointerMoves: counters.boxPointerMoves,
+        panPointerMoves: counters.panPointerMoves,
+        connectPointerMoves: counters.connectPointerMoves,
+        hotLabel: entries[0]?.label ?? null,
+        snapshot: perfSnapshotRef.current,
+        entries,
+      };
+
+      if (
+        nextSummary.pointerMoves > 0 ||
+        nextSummary.renderCount > 0 ||
+        nextSummary.entries.length > 0
+      ) {
+        const logger = entries[0] && (
+          entries[0].avgMs >= PERF_DEBUG_LOG_THRESHOLD_MS ||
+          entries[0].maxMs >= PERF_DEBUG_LOG_THRESHOLD_MS * 1.5
+        )
+          ? console.warn
+          : console.debug;
+        logger('[LMD perf]', {
+          hot: nextSummary.hotLabel,
+          windowMs: Math.round(nextSummary.windowMs),
+          renders: nextSummary.renderCount,
+          pointerMoves: nextSummary.pointerMoves,
+          snapshot: nextSummary.snapshot,
+          entries: nextSummary.entries,
+        });
+      }
+
+      perfMetricsRef.current.clear();
+      perfCountersRef.current = createPerfCounterSnapshot();
+      perfWindowStartedAtRef.current = now;
+      perfRenderBaselineRef.current = perfRenderCountRef.current;
+      setPerfDebugSummary(nextSummary);
+    };
+
+    flushPerfSummary();
+    const timer = window.setInterval(flushPerfSummary, PERF_DEBUG_SUMMARY_INTERVAL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [perfDebugEnabled]);
+
+  useEffect(() => {
     if (mode !== 'canvas') {
       setSidebarOpen(!isMobileViewport);
       setInspectorOpen(!isMobileViewport);
@@ -9965,9 +10883,9 @@ export default function App() {
 
     if (!isMobileViewport && selection.kind !== 'none') {
       setInspectorOpen(true);
-      setInspectorView((current) => (current === 'ai' && inspectorOpen ? 'ai' : 'properties'));
+      setInspectorView((current) => (current === 'ai' && !isMobileViewport ? 'ai' : 'properties'));
     }
-  }, [inspectorOpen, isMobileViewport, mode, selection.kind]);
+  }, [isMobileViewport, mode, selection.kind]);
 
   useEffect(() => () => {
     clearPendingBackgroundInteraction();
@@ -10035,6 +10953,12 @@ export default function App() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      if (event.shiftKey && event.altKey && !event.metaKey && !event.ctrlKey && event.key.toLowerCase() === 'd') {
+        event.preventDefault();
+        setPerfDebugEnabled((current) => !current);
+        return;
+      }
+
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
         event.preventDefault();
         if (!canvasSearchOpen) {
@@ -10354,44 +11278,54 @@ export default function App() {
       return;
     }
 
-    const resolveHierarchyTargets = (pointer: Point, activeDragState: DragState) => {
-      const excludedNodeIds = activeDragState.ids;
-      const excludedSubgraphIds = activeDragState.kind === 'subgraph' && activeDragState.entityId
-        ? [activeDragState.entityId]
-        : [];
-      const nextNodeTargetId = findNodeDropTarget(visibleNodes, pointer, excludedNodeIds);
-      const insertableEndpointId = activeDragState.kind === 'subgraph'
-        ? activeDragState.entityId ?? null
-        : activeDragState.ids.length === 1
-          ? activeDragState.ids[0]
-          : null;
-      const nextEdgeTargetId = nextNodeTargetId || !insertableEndpointId
-        ? null
-        : findEdgeDropTarget(
-          pointer,
-          visibleEdges,
-          edgeEndpointMap,
-          edgeLaneMap,
-          edgeEndpointOffsetMap,
-          [insertableEndpointId],
-        );
-      const nextSubgraphTargetId =
-        nextNodeTargetId || nextEdgeTargetId
+    const resolveHierarchyTargets = (pointer: Point, activeDragState: DragState) => measurePerf(
+      'drag.resolveHierarchyTargets',
+      () => {
+        const excludedNodeIds = activeDragState.ids;
+        const excludedSubgraphIds = activeDragState.kind === 'subgraph' && activeDragState.entityId
+          ? [activeDragState.entityId]
+          : [];
+        const nextNodeTargetId = findNodeDropTarget(visibleNodes, pointer, excludedNodeIds);
+        const insertableEndpointId = activeDragState.kind === 'subgraph'
+          ? activeDragState.entityId ?? null
+          : activeDragState.ids.length === 1
+            ? activeDragState.ids[0]
+            : null;
+        const nextEdgeTargetId = nextNodeTargetId || !insertableEndpointId
           ? null
-          : findSubgraphDropTarget(
-            allSubgraphBlobShapes,
+          : findEdgeDropTarget(
             pointer,
-            excludedSubgraphIds,
+            visibleEdges,
+            edgeEndpointMap,
+            edgeLaneMap,
+            edgeEndpointOffsetMap,
+            [insertableEndpointId],
           );
+        const nextSubgraphTargetId =
+          nextNodeTargetId || nextEdgeTargetId
+            ? null
+            : findSubgraphDropTarget(
+              allSubgraphBlobShapes,
+              pointer,
+              excludedSubgraphIds,
+            );
 
-      return {
-        nodeId: nextNodeTargetId,
-        edgeId: nextEdgeTargetId,
-        subgraphId: nextSubgraphTargetId,
-      };
-    };
+        return {
+          nodeId: nextNodeTargetId,
+          edgeId: nextEdgeTargetId,
+          subgraphId: nextSubgraphTargetId,
+        };
+      },
+    );
 
-    function onPointerMove(event: PointerEvent) {
+    const applyPointerMove = (
+      clientX: number,
+      clientY: number,
+      ctrlKey: boolean,
+      metaKey: boolean,
+      shiftKey: boolean,
+    ) => {
+      const startedAt = perfDebugEnabled ? performance.now() : 0;
       const canvas = canvasRef.current;
       if (!canvas) {
         return;
@@ -10400,13 +11334,13 @@ export default function App() {
       const pendingBackground = pendingBackgroundRef.current;
       if (pendingBackground) {
         const delta = Math.hypot(
-          event.clientX - pendingBackground.clientX,
-          event.clientY - pendingBackground.clientY,
+          clientX - pendingBackground.clientX,
+          clientY - pendingBackground.clientY,
         );
         if (delta > 8) {
           clearPendingBackgroundInteraction();
           setPanState({
-            origin: { x: event.clientX, y: event.clientY },
+            origin: { x: clientX, y: clientY },
             initialViewport: { ...documentState.layout.viewport },
           });
         }
@@ -10414,11 +11348,18 @@ export default function App() {
 
       const bounds = canvas.getBoundingClientRect();
       const viewport = documentState.layout.viewport;
-      const x = (event.clientX - bounds.left - viewport.x) / viewport.zoom;
-      const y = (event.clientY - bounds.top - viewport.y) / viewport.zoom;
+      const x = (clientX - bounds.left - viewport.x) / viewport.zoom;
+      const y = (clientY - bounds.top - viewport.y) / viewport.zoom;
+
+      if (perfDebugEnabled) {
+        perfCountersRef.current.pointerMoves += 1;
+      }
 
       if (dragState) {
-        if (dragState.kind !== 'content' && (event.ctrlKey || event.metaKey)) {
+        if (perfDebugEnabled) {
+          perfCountersRef.current.dragPointerMoves += 1;
+        }
+        if (dragState.kind !== 'content' && (ctrlKey || metaKey)) {
           setDragReparentMode(true);
           const targets = resolveHierarchyTargets({ x, y }, dragState);
           setDragTargetNodeId(targets.nodeId);
@@ -10442,22 +11383,28 @@ export default function App() {
       }
 
       if (boxState) {
+        if (perfDebugEnabled) {
+          perfCountersRef.current.boxPointerMoves += 1;
+        }
         setBoxState((current) =>
           current
             ? {
                 ...current,
                 current: { x, y },
-                toggle: event.shiftKey,
+                toggle: shiftKey,
               }
             : null,
         );
       }
 
       if (panState) {
+        if (perfDebugEnabled) {
+          perfCountersRef.current.panPointerMoves += 1;
+        }
         const nextViewport = {
           ...panState.initialViewport,
-          x: panState.initialViewport.x + (event.clientX - panState.origin.x),
-          y: panState.initialViewport.y + (event.clientY - panState.origin.y),
+          x: panState.initialViewport.x + (clientX - panState.origin.x),
+          y: panState.initialViewport.y + (clientY - panState.origin.y),
         };
         setDocumentState((current) => ({
           ...current,
@@ -10469,19 +11416,89 @@ export default function App() {
       }
 
       if (connectingState) {
+        if (perfDebugEnabled) {
+          perfCountersRef.current.connectPointerMoves += 1;
+        }
         setConnectingState((current) =>
           current
             ? {
                 ...current,
                 current: { x, y },
-                edgeType: event.ctrlKey || event.metaKey ? 'line' : 'solid',
+                edgeType: ctrlKey || metaKey ? 'line' : 'solid',
               }
             : null,
         );
       }
+
+      if (perfDebugEnabled) {
+        recordPerfMetric('pointermove.handler', performance.now() - startedAt);
+      }
+    };
+
+    const flushPendingPointerMove = (fallbackEvent?: PointerEvent) => {
+      if (pointerMoveFrameRef.current !== null) {
+        window.cancelAnimationFrame(pointerMoveFrameRef.current);
+        pointerMoveFrameRef.current = null;
+      }
+
+      const pendingMove = pendingPointerMoveRef.current;
+      pendingPointerMoveRef.current = null;
+
+      if (pendingMove) {
+        applyPointerMove(
+          pendingMove.clientX,
+          pendingMove.clientY,
+          pendingMove.ctrlKey,
+          pendingMove.metaKey,
+          pendingMove.shiftKey,
+        );
+        return;
+      }
+
+      if (fallbackEvent) {
+        applyPointerMove(
+          fallbackEvent.clientX,
+          fallbackEvent.clientY,
+          fallbackEvent.ctrlKey,
+          fallbackEvent.metaKey,
+          fallbackEvent.shiftKey,
+        );
+      }
+    };
+
+    function onPointerMove(event: PointerEvent) {
+      pendingPointerMoveRef.current = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        shiftKey: event.shiftKey,
+      };
+
+      if (pointerMoveFrameRef.current !== null) {
+        return;
+      }
+
+      pointerMoveFrameRef.current = window.requestAnimationFrame(() => {
+        pointerMoveFrameRef.current = null;
+        const pendingMove = pendingPointerMoveRef.current;
+        pendingPointerMoveRef.current = null;
+        if (!pendingMove) {
+          return;
+        }
+
+        applyPointerMove(
+          pendingMove.clientX,
+          pendingMove.clientY,
+          pendingMove.ctrlKey,
+          pendingMove.metaKey,
+          pendingMove.shiftKey,
+        );
+      });
     }
 
     function onPointerUp(event: PointerEvent) {
+      flushPendingPointerMove(event);
       clearPendingBackgroundInteraction();
 
       if (dragState) {
@@ -10888,6 +11905,7 @@ export default function App() {
     }
 
     function onPointerCancel() {
+      flushPendingPointerMove();
       clearPendingBackgroundInteraction();
       setDragState(null);
       setDragTargetNodeId(null);
@@ -10904,6 +11922,11 @@ export default function App() {
     window.addEventListener('pointercancel', onPointerCancel);
 
     return () => {
+      if (pointerMoveFrameRef.current !== null) {
+        window.cancelAnimationFrame(pointerMoveFrameRef.current);
+        pointerMoveFrameRef.current = null;
+      }
+      pendingPointerMoveRef.current = null;
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('pointercancel', onPointerCancel);
@@ -10931,6 +11954,9 @@ export default function App() {
     edgeEndpointOffsetMap,
     allSubgraphBlobShapes,
     allSubgraphFrames,
+    measurePerf,
+    perfDebugEnabled,
+    recordPerfMetric,
     subgraphFrames,
     fullSubgraphLookup,
     panState,
@@ -10969,6 +11995,132 @@ export default function App() {
     }));
   }
 
+  const handleNodePointerInteraction = useCallback((
+    pointer: {
+      clientX: number;
+      clientY: number;
+      button: number;
+      altKey: boolean;
+      ctrlKey: boolean;
+      metaKey: boolean;
+      shiftKey: boolean;
+    },
+    node: GraphNode,
+  ) => {
+    if (editingNodeId) {
+      return true;
+    }
+
+    if (pointer.button === 1) {
+      setPanState({
+        origin: { x: pointer.clientX, y: pointer.clientY },
+        initialViewport: { ...documentState.layout.viewport },
+      });
+      return true;
+    }
+
+    const point = pointFromClient(pointer.clientX, pointer.clientY);
+    if (!point) {
+      return true;
+    }
+
+    const activeIds = selection.kind === 'node' && selectionContains(selection, node.id)
+      ? selection.ids
+      : [node.id];
+
+    if (pointer.button === 2) {
+      setSelection({ kind: 'node', ids: activeIds });
+      setConnectingState({
+        fromId: activeIds[0],
+        fromIds: activeIds,
+        origin: point,
+        current: point,
+        edgeType: pointer.ctrlKey || pointer.metaKey ? 'line' : 'solid',
+        handleSide: pointer.clientX < node.x + node.width / 2 ? 'left' : 'right',
+      });
+      return true;
+    }
+
+    if (pointer.button !== 0) {
+      return false;
+    }
+
+    if (pointer.altKey) {
+      const currentDocument = structuredClone(documentRef.current);
+      const duplicateSourceIds = activeIds;
+      const { duplicatedNodes, duplicatedEdges } = duplicateNodesWithEdges(currentDocument, duplicateSourceIds, { x: 0, y: 0 });
+      const nextDocument = materializeDocument({
+        ...currentDocument,
+        nodes: [...currentDocument.nodes, ...duplicatedNodes],
+        edges: [...currentDocument.edges, ...duplicatedEdges],
+      });
+
+      applyCommittedDocument(
+        nextDocument,
+        '已复制选中节点',
+        `已复制 ${duplicatedNodes.length} 个节点。`,
+        currentDocument,
+      );
+
+      const duplicatedIds = duplicatedNodes.map((entry) => entry.id);
+      setSelection({ kind: 'node', ids: duplicatedIds });
+      setDragState({
+        kind: 'node',
+        origin: point,
+        current: point,
+        ids: duplicatedIds,
+        initialPositions: Object.fromEntries(
+          duplicatedNodes.map((entry) => [entry.id, { x: entry.x, y: entry.y }]),
+        ),
+      });
+      return true;
+    }
+
+    if (pointer.shiftKey) {
+      const nextSelection = toggleSelectionIds(selection, 'node', [node.id]);
+      setSelection(nextSelection);
+      return true;
+    }
+
+    setSelection({ kind: 'node', ids: activeIds });
+
+    const initialPositions = Object.fromEntries(
+      documentState.nodes
+        .filter((entry) => activeIds.includes(entry.id))
+        .map((entry) => [entry.id, { x: entry.x, y: entry.y }]),
+    );
+
+    setDragState({
+      kind: 'node',
+      origin: point,
+      current: point,
+      ids: activeIds,
+      initialPositions,
+      entityId: activeIds.length === 1 ? activeIds[0] : null,
+    });
+    return true;
+  }, [applyCommittedDocument, documentState.layout.viewport, documentState.nodes, editingNodeId, pointFromClient, selection]);
+
+  const findSceneHitAtPoint = useCallback((point: Point) => {
+    const nodeId = findNodeDropTarget(sceneRenderableNodes, point);
+    if (nodeId) {
+      return { kind: 'node' as const, id: nodeId };
+    }
+
+    const edgeId = findEdgeDropTarget(
+      point,
+      sceneRenderableEdges.map((entry) => entry.edge),
+      edgeEndpointMap,
+      edgeLaneMap,
+      edgeEndpointOffsetMap,
+    );
+    if (edgeId) {
+      return { kind: 'edge' as const, id: edgeId };
+    }
+
+    return null;
+  }, [edgeEndpointMap, edgeEndpointOffsetMap, edgeLaneMap, sceneRenderableEdges, sceneRenderableNodes]);
+
   function startBackgroundInteraction(event: ReactPointerEvent<HTMLDivElement>) {
     if (canvasSearchOpen) {
       setCanvasSearchOpen(false);
@@ -10983,7 +12135,7 @@ export default function App() {
       return;
     }
 
-    if (event.button !== 0) {
+    if (event.button !== 0 && !(hybridSceneActive && event.button === 2)) {
       return;
     }
 
@@ -10996,6 +12148,36 @@ export default function App() {
     const point = pointFromClient(event.clientX, event.clientY, viewport);
     if (!point) {
       return;
+    }
+
+    if (hybridSceneActive) {
+      const sceneHit = findSceneHitAtPoint(point);
+      if (sceneHit?.kind === 'node') {
+        const node = documentState.nodes.find((entry) => entry.id === sceneHit.id);
+        if (node) {
+          event.preventDefault();
+          handleNodePointerInteraction({
+            clientX: event.clientX,
+            clientY: event.clientY,
+            button: event.button,
+            altKey: event.altKey,
+            ctrlKey: event.ctrlKey,
+            metaKey: event.metaKey,
+            shiftKey: event.shiftKey,
+          }, node);
+          return;
+        }
+      }
+
+      if (sceneHit?.kind === 'edge') {
+        event.preventDefault();
+        if (event.shiftKey) {
+          setSelection((current) => toggleSelectionIds(current, 'edge', [sceneHit.id]));
+        } else {
+          setSelection({ kind: 'edge', ids: [sceneHit.id] });
+        }
+        return;
+      }
     }
 
     if (spacePressed) {
@@ -11035,102 +12217,19 @@ export default function App() {
   }
 
   function startNodeDrag(event: ReactPointerEvent<HTMLDivElement>, node: GraphNode) {
-    if (editingNodeId) {
-      return;
-    }
-
-    if (event.button === 1) {
-      event.preventDefault();
-      event.stopPropagation();
-      setPanState({
-        origin: { x: event.clientX, y: event.clientY },
-        initialViewport: { ...documentState.layout.viewport },
-      });
-      return;
-    }
-
     event.stopPropagation();
-
-    const point = pointFromClient(event.clientX, event.clientY);
-    if (!point) {
-      return;
-    }
-
-    const activeIds = selection.kind === 'node' && selectionContains(selection, node.id)
-      ? selection.ids
-      : [node.id];
-
-    if (event.button === 2) {
+    if (event.button === 1 || event.button === 2) {
       event.preventDefault();
-      setSelection({ kind: 'node', ids: activeIds });
-      setConnectingState({
-        fromId: activeIds[0],
-        fromIds: activeIds,
-        origin: point,
-        current: point,
-        edgeType: event.ctrlKey || event.metaKey ? 'line' : 'solid',
-        handleSide: event.clientX < node.x + node.width / 2 ? 'left' : 'right',
-      });
-      return;
     }
-
-    if (event.button !== 0) {
-      return;
-    }
-
-    if (event.altKey) {
-      const currentDocument = structuredClone(documentRef.current);
-      const duplicateSourceIds = activeIds;
-      const { duplicatedNodes, duplicatedEdges } = duplicateNodesWithEdges(currentDocument, duplicateSourceIds, { x: 0, y: 0 });
-      const nextDocument = materializeDocument({
-        ...currentDocument,
-        nodes: [...currentDocument.nodes, ...duplicatedNodes],
-        edges: [...currentDocument.edges, ...duplicatedEdges],
-      });
-
-      applyCommittedDocument(
-        nextDocument,
-        '已复制选中节点',
-        `已复制 ${duplicatedNodes.length} 个节点。`,
-        currentDocument,
-      );
-
-      const duplicatedIds = duplicatedNodes.map((entry) => entry.id);
-      setSelection({ kind: 'node', ids: duplicatedIds });
-      setDragState({
-        kind: 'node',
-        origin: point,
-        current: point,
-        ids: duplicatedIds,
-        initialPositions: Object.fromEntries(
-          duplicatedNodes.map((entry) => [entry.id, { x: entry.x, y: entry.y }]),
-        ),
-      });
-      return;
-    }
-
-    if (event.shiftKey) {
-      const nextSelection = toggleSelectionIds(selection, 'node', [node.id]);
-      setSelection(nextSelection);
-      return;
-    }
-
-    setSelection({ kind: 'node', ids: activeIds });
-
-    const initialPositions = Object.fromEntries(
-      documentState.nodes
-        .filter((entry) => activeIds.includes(entry.id))
-        .map((entry) => [entry.id, { x: entry.x, y: entry.y }]),
-    );
-
-    setDragState({
-      kind: 'node',
-      origin: point,
-      current: point,
-      ids: activeIds,
-      initialPositions,
-      entityId: activeIds.length === 1 ? activeIds[0] : null,
-    });
+    handleNodePointerInteraction({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      button: event.button,
+      altKey: event.altKey,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+    }, node);
   }
 
   function startSubgraphDrag(
@@ -12724,6 +13823,15 @@ export default function App() {
                 >
                   <WorkbenchIcon name="preview" />
                 </button>
+                <button
+                  aria-label={`加载 ${defaultStressTestProjectLabel} 压力测试图`}
+                  className="desktop-command-button has-tooltip"
+                  data-tooltip={`压力测试 · ${defaultStressTestProjectLabel}`}
+                  onClick={loadStressTestProject}
+                  type="button"
+                >
+                  压力测试
+                </button>
               </div>
             </div>
           ) : isMobileViewport ? (
@@ -12794,6 +13902,15 @@ export default function App() {
                   type="button"
                 >
                   <WorkbenchIcon name="preview" />
+                </button>
+                <button
+                  aria-label={`加载 ${defaultStressTestProjectLabel} 压力测试图`}
+                  className="desktop-command-button has-tooltip"
+                  data-tooltip={`压力测试 · ${defaultStressTestProjectLabel}`}
+                  onClick={loadStressTestProject}
+                  type="button"
+                >
+                  压力测试
                 </button>
               </div>
 
@@ -13467,6 +14584,50 @@ export default function App() {
                 ) : null}
               </div>
 
+              {perfDebugEnabled ? (
+                <aside className="perf-debug-panel" aria-live="polite">
+                  <div className="perf-debug-panel__header">
+                    <strong>Perf Debug</strong>
+                    <button
+                      className="perf-debug-panel__close"
+                      onClick={() => setPerfDebugEnabled(false)}
+                      type="button"
+                    >
+                      关闭
+                    </button>
+                  </div>
+                  <p className="perf-debug-panel__summary">
+                    热点: {perfDebugSummary.hotLabel ?? '采样中'}
+                  </p>
+                  <p className="perf-debug-panel__summary">
+                    {Math.round(perfDebugSummary.windowMs)}ms 窗口 / {perfDebugSummary.renderCount} 次渲染 / {perfDebugSummary.pointerMoves} 次移动
+                  </p>
+                  <p className="perf-debug-panel__summary">
+                    节点 {perfDebugSummary.snapshot.visibleNodeCount} / 连线 {perfDebugSummary.snapshot.visibleEdgeCount} / 组 {perfDebugSummary.snapshot.subgraphFrameCount}
+                  </p>
+                  <p className="perf-debug-panel__summary">
+                    blob 区域 {perfDebugSummary.snapshot.blobRegionCount} / 原语 {perfDebugSummary.snapshot.blobPrimitiveCount}
+                  </p>
+                  <p className="perf-debug-panel__summary perf-debug-panel__hint">
+                    Shift + Alt + D 切换
+                  </p>
+                  <div className="perf-debug-panel__list">
+                    {perfDebugSummary.entries.length > 0 ? perfDebugSummary.entries.map((entry) => (
+                      <div className="perf-debug-panel__entry" key={entry.label}>
+                        <span className="perf-debug-panel__label">{entry.label}</span>
+                        <span className="perf-debug-panel__value">
+                          avg {entry.avgMs.toFixed(1)}ms / max {entry.maxMs.toFixed(1)} / x{entry.count}
+                        </span>
+                      </div>
+                    )) : (
+                      <div className="perf-debug-panel__entry">
+                        <span className="perf-debug-panel__label">等待交互采样…</span>
+                      </div>
+                    )}
+                  </div>
+                </aside>
+              ) : null}
+
               {aiChangeBubbles.length > 0 ? (
                 <aside className="ai-change-bubbles" aria-label="AI 修改提示">
                   {aiChangeBubbles.map((bubble) => (
@@ -13515,12 +14676,44 @@ export default function App() {
                     return;
                   }
 
+                  if (hybridSceneActive) {
+                    const sceneHit = findSceneHitAtPoint(point);
+                    if (sceneHit?.kind === 'node') {
+                      const node = documentState.nodes.find((entry) => entry.id === sceneHit.id);
+                      if (!node) {
+                        return;
+                      }
+
+                      event.stopPropagation();
+                      if (event.metaKey || event.ctrlKey) {
+                        selectConnectedNodeComponent(node.id);
+                        return;
+                      }
+                      startInlineEdit(node, 'title');
+                      return;
+                    }
+
+                    if (sceneHit?.kind === 'edge') {
+                      const edge = visibleEdges.find((entry) => entry.id === sceneHit.id);
+                      if (edge) {
+                        event.stopPropagation();
+                        startEdgeInlineEdit(edge);
+                        return;
+                      }
+                    }
+                  }
+
                   createNodeAt(point, undefined, 'solid', resolveSubgraphAtPoint(point));
                 }}
                 onPointerDown={startBackgroundInteraction}
                 onWheel={handleCanvasWheel}
                 ref={canvasRef}
               >
+                <canvas
+                  aria-hidden="true"
+                  className={`scene-render-canvas${hybridSceneActive ? ' is-active' : ''}`}
+                  ref={sceneCanvasRef}
+                />
                 <div
                   className="canvas-board"
                   ref={canvasBoardRef}
@@ -13881,7 +15074,7 @@ export default function App() {
                       ))}
                     </defs>
                     <g transform={`translate(${-canvasBoardBounds.x} ${-canvasBoardBounds.y})`}>
-                      {visibleEdges.map((edge) => {
+                      {sceneOverlayEdges.map((edge) => {
                         const normalizedEdge = normalizeEdgeStyle(edge);
                         const fromNode = edgeEndpointMap.get(edge.from);
                         const toNode = edgeEndpointMap.get(edge.to);
@@ -14146,7 +15339,7 @@ export default function App() {
                     </g>
                   </svg>
 
-                  {visibleNodes.map((node) => {
+                  {sceneOverlayNodes.map((node) => {
                     const selected = selection.kind === 'node' && selectionContains(selection, node.id);
                     const isEditing = editingNodeId === node.id;
                     const liveContent = isEditing ? editingLabel || ' ' : node.label;

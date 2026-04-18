@@ -51,3 +51,84 @@ ${sampleMermaidSource}
 v1
 \`\`\`
 `;
+
+export const defaultStressTestProjectOptions = {
+  groupCount: 100,
+  nodesPerGroup: 10,
+} as const;
+
+export const defaultStressTestProjectLabel = `${defaultStressTestProjectOptions.groupCount * defaultStressTestProjectOptions.nodesPerGroup} 节点 / ${defaultStressTestProjectOptions.groupCount} 组`;
+
+function clampPositiveInteger(value: number | undefined, fallback: number) {
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.max(1, Math.floor(value ?? fallback));
+}
+
+function buildStressTestMermaidSource(groupCount: number, nodesPerGroup: number) {
+  const lines = ['flowchart LR'];
+  const groupIds: string[][] = [];
+
+  for (let groupIndex = 0; groupIndex < groupCount; groupIndex += 1) {
+    const mermaidGroupId = `Stress_Group_${String(groupIndex + 1).padStart(3, '0')}`;
+    const groupNodeIds: string[] = [];
+    lines.push(`  subgraph ${mermaidGroupId}["压力组 ${String(groupIndex + 1).padStart(3, '0')}"]`);
+
+    for (let nodeIndex = 0; nodeIndex < nodesPerGroup; nodeIndex += 1) {
+      const nodeId = `stress_${String(groupIndex + 1).padStart(3, '0')}_${String(nodeIndex + 1).padStart(2, '0')}`;
+      groupNodeIds.push(nodeId);
+      lines.push(`    ${nodeId}["节点 ${String(groupIndex + 1).padStart(3, '0')}-${String(nodeIndex + 1).padStart(2, '0')}"]`);
+    }
+
+    lines.push('  end');
+    groupIds.push(groupNodeIds);
+  }
+
+  lines.push('');
+
+  groupIds.forEach((groupNodeIds, groupIndex) => {
+    for (let nodeIndex = 0; nodeIndex < groupNodeIds.length - 1; nodeIndex += 1) {
+      lines.push(`  ${groupNodeIds[nodeIndex]} --> ${groupNodeIds[nodeIndex + 1]}`);
+    }
+
+    const nextGroupNodeIds = groupIds[groupIndex + 1];
+    if (nextGroupNodeIds) {
+      lines.push(`  ${groupNodeIds[groupNodeIds.length - 1]} --> ${nextGroupNodeIds[0]}`);
+    }
+  });
+
+  return lines.join('\n');
+}
+
+export function createStressTestProjectMarkdown(options?: {
+  groupCount?: number;
+  nodesPerGroup?: number;
+}) {
+  const groupCount = clampPositiveInteger(options?.groupCount, defaultStressTestProjectOptions.groupCount);
+  const nodesPerGroup = clampPositiveInteger(options?.nodesPerGroup, defaultStressTestProjectOptions.nodesPerGroup);
+  const totalNodes = groupCount * nodesPerGroup;
+  const mermaidSource = buildStressTestMermaidSource(groupCount, nodesPerGroup);
+
+  return `# LMD Stress Test Workspace
+
+## Summary
+
+Synthetic performance workspace with ${totalNodes} nodes and ${groupCount} groups.
+
+## Diagram
+\`\`\`mermaid
+${mermaidSource}
+\`\`\`
+
+## Content
+
+- Generated for canvas performance testing.
+- Replace this workspace freely after profiling.
+
+\`\`\`lths-compat
+v1
+\`\`\`
+`;
+}
