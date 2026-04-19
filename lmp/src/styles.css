@@ -275,7 +275,7 @@ textarea {
   top: var(--topbar-height);
   right: 0;
   bottom: 0;
-  width: min(240px, 22vw);
+  width: min(360px, 30vw);
   z-index: 4;
   display: flex;
   flex-direction: column;
@@ -299,25 +299,25 @@ textarea {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 8px;
-  padding: 10px 10px 8px;
+  gap: 12px;
+  padding: 15px 15px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .lmp-inspector-label {
   display: block;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
   color: var(--accent);
   font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace;
-  font-size: 6px;
-  letter-spacing: 0.08em;
+  font-size: 9px;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
 .lmp-inspector-header h2 {
   margin: 0;
   font-family: 'Avenir Next Condensed', 'Arial Narrow', sans-serif;
-  font-size: 14px;
+  font-size: 21px;
   line-height: 0.94;
   letter-spacing: -0.04em;
   text-transform: uppercase;
@@ -332,11 +332,11 @@ textarea {
 }
 
 .lmp-close-button {
-  min-height: 22px;
-  padding: 4px 8px;
+  min-height: 33px;
+  padding: 6px 12px;
   font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace;
-  font-size: 6px;
-  letter-spacing: 0.06em;
+  font-size: 9px;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 
@@ -350,15 +350,15 @@ textarea {
 .lmp-inspector-body {
   flex: 1;
   overflow: auto;
-  padding: 8px 10px 10px;
+  padding: 12px 15px 15px;
   display: grid;
-  gap: 7px;
+  gap: 11px;
 }
 
 .lmp-section {
   display: grid;
-  gap: 6px;
-  padding: 7px;
+  gap: 9px;
+  padding: 11px;
   background: rgba(10, 13, 15, 0.82);
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
@@ -367,13 +367,13 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
+  gap: 9px;
 }
 
 .lmp-section-heading span {
   font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace;
-  font-size: 6px;
-  letter-spacing: 0.08em;
+  font-size: 9px;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--accent);
 }
@@ -381,8 +381,8 @@ textarea {
 .lmp-section-heading small {
   color: var(--muted);
   font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace;
-  font-size: 6px;
-  letter-spacing: 0.03em;
+  font-size: 9px;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 
@@ -392,36 +392,36 @@ textarea {
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(4, 6, 7, 0.96);
   color: var(--text);
-  padding: 7px 8px;
+  padding: 10px 12px;
   outline: none;
   font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace;
-  font-size: 7px;
+  font-size: 10px;
   user-select: text;
   -webkit-user-select: text;
 }
 
 .lmp-textarea {
-  min-height: 54px;
+  min-height: 82px;
 }
 
 .lmp-source {
-  min-height: 110px;
+  min-height: 165px;
   line-height: 1.6;
 }
 
 .lmp-button-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 5px;
+  gap: 8px;
 }
 
 .lmp-panel-button,
 .lmp-color-reset {
-  min-height: 22px;
-  padding: 5px 6px;
+  min-height: 33px;
+  padding: 8px 9px;
   font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace;
-  font-size: 6px;
-  letter-spacing: 0.06em;
+  font-size: 9px;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 
@@ -444,19 +444,19 @@ textarea {
 .lmp-inline-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 5px;
+  gap: 8px;
 }
 
 .lmp-palette-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 5px;
+  gap: 8px;
 }
 
 .lmp-palette-swatch {
-  width: 16px;
-  height: 16px;
-  padding: 2px;
+  width: 24px;
+  height: 24px;
+  padding: 3px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(4, 6, 7, 0.98);
 }
@@ -495,15 +495,15 @@ textarea {
 
 .lmp-shortcuts {
   display: grid;
-  gap: 4px;
+  gap: 6px;
 }
 
 .lmp-shortcut {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 5px;
-  padding: 5px 6px;
+  gap: 8px;
+  padding: 8px 9px;
   background: rgba(4, 6, 7, 0.98);
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
@@ -511,7 +511,7 @@ textarea {
 .lmp-shortcut span,
 .lmp-shortcut code {
   font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace;
-  font-size: 6px;
+  font-size: 9px;
   letter-spacing: 0.03em;
   text-transform: uppercase;
 }
@@ -526,18 +526,18 @@ textarea {
 
 .lmp-drawer-toggle {
   position: absolute;
-  top: calc(50% + 12px);
+  top: calc(50% + 18px);
   right: 0;
   z-index: 4;
   pointer-events: auto;
-  width: 23px;
-  height: 66px;
+  width: 34px;
+  height: 99px;
   border: none;
   background: var(--accent);
   color: #050505;
   font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace;
-  font-size: 6px;
-  letter-spacing: 0.08em;
+  font-size: 9px;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   writing-mode: vertical-rl;
   text-orientation: mixed;
@@ -566,7 +566,7 @@ textarea {
   }
 
   .lmp-inspector-drawer {
-    width: min(220px, 34vw);
+    width: min(330px, 42vw);
   }
 
   .lmp-floating-palette {

@@ -266,7 +266,7 @@ function worldToScreen(node: NodeBox, size: CanvasState, viewport: ViewportState
 }
 
 function getInspectorWidth(size: CanvasState, inspectorOpen: boolean) {
-  return inspectorOpen ? Math.min(240, size.width * 0.22) : 0;
+  return inspectorOpen ? Math.min(360, size.width * 0.3) : 0;
 }
 
 function keepNodeInView(
