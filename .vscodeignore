@@ -5,7 +5,12 @@ deploy/**
 docs/**
 extension-src/**
 node_modules/**
+**/node_modules/**
 src/**
+lmp/**
+.codex-temp/**
+*.vsix
+tmp-*.mjs
 safe.html
 index.html
 vite.config.ts

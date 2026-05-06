@@ -39,6 +39,26 @@ import {
   sampleProjectMarkdown,
 } from './lib/sample';
 import { storageKeys } from './lib/storage';
+import PixiCanvasSurface, {
+  type PixiScenePointer,
+  type PixiSceneModel,
+} from './components/PixiCanvasSurface';
+import {
+  LMD_GRID_SIZE,
+  quantizeNodesToGrid,
+  quantizeNodeToGrid,
+  snapRectToGrid,
+  snapToGrid,
+} from './lib/grid';
+import {
+  buildPixelGroupShapes,
+  findPixelGroupAtPoint,
+} from './lib/pixelGroups';
+import { createSceneIndex } from './lib/sceneIndex';
+import {
+  readMermaidLayoutPreference,
+  registerMermaidElkLayoutIfNeeded,
+} from './lib/mermaidLayoutConfig';
 import type {
   Direction,
   EditorMode,
@@ -1488,7 +1508,9 @@ function materializeDocument(
   },
 ): GraphDocument {
   const normalizedCandidate = normalizeFlowchartDocumentNodeIds(candidate, options);
-  const normalizedNodes = normalizedCandidate.nodes.map((node) => resizeNodeToContent(node, node.label));
+  const normalizedNodes = quantizeNodesToGrid(
+    normalizedCandidate.nodes.map((node) => resizeNodeToContent(node, node.label)),
+  );
   const normalizedEdges = normalizedCandidate.edges.map(normalizeEdgeStyle);
   const layout: LayoutSidecar = {
     version: normalizedCandidate.layout.version,
@@ -1772,19 +1794,19 @@ function buildNode(
 ): GraphNode {
   const { title, description } = splitEntityText(label);
   const size = measureNodeContentSize(title, description);
-  return {
+  return quantizeNodeToGrid({
     id,
     label: composeEntityText(title, description),
     shape: 'rect',
-    x: position.x,
-    y: position.y,
+    x: snapToGrid(position.x),
+    y: snapToGrid(position.y),
     width: size.width,
     height: size.height,
     fill: '#fff8ef',
     stroke: '#24404f',
     textColor: '#12212c',
     subgraphId,
-  };
+  });
 }
 
 function normalizeFlowchartDocumentNodeIds(
@@ -1847,12 +1869,12 @@ function resizeNodeToContent(node: GraphNode, content: string, description?: str
   const nextParts = splitEntityText(nextText);
   const size = measureNodeContentSize(nextParts.title, nextParts.description);
 
-  return {
+  return quantizeNodeToGrid({
     ...node,
     label: composeEntityText(nextParts.title, nextParts.description),
     width: size.width,
     height: size.height,
-  };
+  });
 }
 
 function getShortcutNodePlacement(
@@ -5061,102 +5083,6 @@ function primitiveCenter(primitive: BlobPrimitive) {
   };
 }
 
-function primitiveSamplePoints(primitive: BlobPrimitive) {
-  if (primitive.kind === 'rounded-rect') {
-    const rect = primitive.rect;
-    return [
-      { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 },
-      { x: rect.x + rect.width * 0.18, y: rect.y + rect.height / 2 },
-      { x: rect.x + rect.width * 0.82, y: rect.y + rect.height / 2 },
-      { x: rect.x + rect.width / 2, y: rect.y + rect.height * 0.18 },
-      { x: rect.x + rect.width / 2, y: rect.y + rect.height * 0.82 },
-    ];
-  }
-
-  return [
-    primitive.start,
-    primitive.end,
-    {
-      x: (primitive.start.x + primitive.end.x) / 2,
-      y: (primitive.start.y + primitive.end.y) / 2,
-    },
-  ];
-}
-
-function rectSamplePoints(rect: Rect) {
-  return [
-    { x: rect.x, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y + rect.height },
-    { x: rect.x, y: rect.y + rect.height },
-    { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 },
-    { x: rect.x + rect.width / 2, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y + rect.height / 2 },
-    { x: rect.x + rect.width / 2, y: rect.y + rect.height },
-    { x: rect.x, y: rect.y + rect.height / 2 },
-  ];
-}
-
-function subgraphShapeContainsPoint(shape: SubgraphBlobShape, point: Point) {
-  if (!pointInRect(point, shape.bounds)) {
-    return false;
-  }
-
-  return measureBlobField(point, shape.primitives) >= shape.fieldThreshold;
-}
-
-function intersectRects(left: Rect, right: Rect): Rect | null {
-  const minX = Math.max(left.x, right.x);
-  const minY = Math.max(left.y, right.y);
-  const maxX = Math.min(left.x + left.width, right.x + right.width);
-  const maxY = Math.min(left.y + left.height, right.y + right.height);
-
-  if (maxX <= minX || maxY <= minY) {
-    return null;
-  }
-
-  return {
-    x: minX,
-    y: minY,
-    width: maxX - minX,
-    height: maxY - minY,
-  };
-}
-
-function sampleRectGrid(rect: Rect, step: number) {
-  const resolvedStep = Math.max(step, 8);
-  const columns = Math.max(2, Math.ceil(rect.width / resolvedStep) + 1);
-  const rows = Math.max(2, Math.ceil(rect.height / resolvedStep) + 1);
-  const samples: Point[] = [];
-
-  for (let rowIndex = 0; rowIndex <= rows; rowIndex += 1) {
-    const y = rect.y + (rect.height * rowIndex) / rows;
-    for (let columnIndex = 0; columnIndex <= columns; columnIndex += 1) {
-      const x = rect.x + (rect.width * columnIndex) / columns;
-      samples.push({ x, y });
-    }
-  }
-
-  return samples;
-}
-
-function subgraphShapeIntersectsRect(shape: SubgraphBlobShape, rect: Rect) {
-  const overlap = intersectRects(shape.bounds, rect);
-  if (!overlap) {
-    return false;
-  }
-
-  const samples = [
-    ...rectSamplePoints(overlap),
-    ...sampleRectGrid(overlap, clamp(Math.min(overlap.width, overlap.height) / 3, 12, 26)),
-    ...shape.primitives
-      .flatMap((primitive) => primitiveSamplePoints(primitive))
-      .filter((point) => pointInRect(point, overlap)),
-  ];
-
-  return samples.some((point) => measureBlobField(point, shape.primitives) >= shape.fieldThreshold);
-}
-
 function buildSubgraphBlobPrimitives(
   frame: SubgraphFrame,
   memberRects: Rect[],
@@ -5780,29 +5706,10 @@ function applyDragPreview(nodes: GraphNode[], dragState: DragState | null) {
 
     return {
       ...node,
-      x: Math.round(initial.x + deltaX),
-      y: Math.round(initial.y + deltaY),
+      x: snapToGrid(initial.x + deltaX),
+      y: snapToGrid(initial.y + deltaY),
     };
   });
-}
-
-function findSubgraphDropTarget(
-  shapes: SubgraphBlobShape[],
-  point: Point,
-  excludedIds: string[] = [],
-) {
-  const excluded = new Set(excludedIds);
-
-  return [...shapes]
-    .filter((shape) => !excluded.has(shape.id))
-    .filter((shape) => subgraphShapeContainsPoint(shape, point))
-    .sort((left, right) => {
-      if (left.depth !== right.depth) {
-        return right.depth - left.depth;
-      }
-
-      return left.bounds.width * left.bounds.height - right.bounds.width * right.bounds.height;
-    })[0]?.id ?? null;
 }
 
 function findNodeDropTarget(
@@ -5915,8 +5822,8 @@ function offsetMovedNodes(
     movedSet.has(node.id)
       ? {
           ...node,
-          x: Math.round(node.x + offsetX),
-          y: Math.round(node.y + offsetY),
+          x: snapToGrid(node.x + offsetX),
+          y: snapToGrid(node.y + offsetY),
         }
       : node,
   );
@@ -6104,6 +6011,7 @@ function searchFreeRect(
   directionHint: Point,
   bounds?: Rect | null,
 ) {
+  const quantizedDesired = snapRectToGrid(desired);
   const direction = normalizeVector(directionHint);
   const perpendicular = { x: -direction.y, y: direction.x };
 
@@ -6123,30 +6031,30 @@ function searchFreeRect(
     return obstacles.every((obstacle) => !rectsIntersect(rect, obstacle));
   };
 
-  if (fits(desired)) {
-    return desired;
+  if (fits(quantizedDesired)) {
+    return quantizedDesired;
   }
 
   for (let step = 1; step <= 64; step += 1) {
     const travel = step * 18;
     const fan = Math.ceil(step / 2) * 12;
     const candidates = [
-      { x: desired.x + direction.x * travel, y: desired.y + direction.y * travel },
-      { x: desired.x + direction.x * travel + perpendicular.x * fan, y: desired.y + direction.y * travel + perpendicular.y * fan },
-      { x: desired.x + direction.x * travel - perpendicular.x * fan, y: desired.y + direction.y * travel - perpendicular.y * fan },
-      { x: desired.x + perpendicular.x * travel, y: desired.y + perpendicular.y * travel },
-      { x: desired.x - perpendicular.x * travel, y: desired.y - perpendicular.y * travel },
+      { x: quantizedDesired.x + direction.x * travel, y: quantizedDesired.y + direction.y * travel },
+      { x: quantizedDesired.x + direction.x * travel + perpendicular.x * fan, y: quantizedDesired.y + direction.y * travel + perpendicular.y * fan },
+      { x: quantizedDesired.x + direction.x * travel - perpendicular.x * fan, y: quantizedDesired.y + direction.y * travel - perpendicular.y * fan },
+      { x: quantizedDesired.x + perpendicular.x * travel, y: quantizedDesired.y + perpendicular.y * travel },
+      { x: quantizedDesired.x - perpendicular.x * travel, y: quantizedDesired.y - perpendicular.y * travel },
     ];
 
     for (const candidate of candidates) {
-      const rect = { ...desired, x: Math.round(candidate.x), y: Math.round(candidate.y) };
+      const rect = snapRectToGrid({ ...desired, x: candidate.x, y: candidate.y });
       if (fits(rect)) {
         return rect;
       }
     }
   }
 
-  return desired;
+  return quantizedDesired;
 }
 
 function isPrimaryVertical(direction: Direction) {
@@ -7068,6 +6976,7 @@ function MermaidPreview({ source }: { source: string }) {
         setLoading(true);
         const mermaidModule = await import('mermaid');
         const mermaid = mermaidModule.default;
+        await registerMermaidElkLayoutIfNeeded();
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: 'loose',
@@ -7202,6 +7111,7 @@ export default function App() {
     [documentState, selection],
   );
   const [canvasHovered, setCanvasHovered] = useState(false);
+  const [pixiCanvasReady, setPixiCanvasReady] = useState(true);
   const [history, setHistory] = useState<HistoryEntry[]>(initialWorkspace.history);
   const [documentRevision, setDocumentRevision] = useState(1);
   const [, setUndoStack] = useState<GraphDocument[]>([]);
@@ -7385,6 +7295,13 @@ export default function App() {
     point: Point;
   } | null>(null);
   perfRenderCountRef.current += 1;
+
+  const handlePixiReadyChange = useCallback((ready: boolean) => {
+    if (ready) {
+      return;
+    }
+    setPixiCanvasReady((current) => (current === ready ? current : ready));
+  }, []);
 
   const recordPerfMetric = useCallback((label: string, durationMs: number) => {
     if (!perfDebugEnabled) {
@@ -7650,6 +7567,17 @@ export default function App() {
     () => new Map(subgraphBlobShapes.map((shape) => [shape.id, shape])),
     [subgraphBlobShapes],
   );
+  const allSubgraphPixelShapes = useMemo(
+    () => measurePerf(
+      'buildPixelGroupShapes',
+      () => buildPixelGroupShapes(documentState.subgraphs, visibleSubgraphNodes, LMD_GRID_SIZE),
+    ),
+    [documentState.subgraphs, measurePerf, visibleSubgraphNodes],
+  );
+  const allSubgraphPixelShapeMap = useMemo(
+    () => new Map(allSubgraphPixelShapes.map((shape) => [shape.id, shape])),
+    [allSubgraphPixelShapes],
+  );
   const nodeTitleValidationMap = useMemo(
     () => buildNodeTitleValidationMap(documentState.nodes, editingNodeId, editingLabel),
     [documentState.nodes, editingLabel, editingNodeId],
@@ -7847,6 +7775,8 @@ export default function App() {
     () => new Map(allSubgraphBlobShapes.map((shape) => [shape.id, shape])),
     [allSubgraphBlobShapes],
   );
+  const allSubgraphHitShapes = allSubgraphPixelShapes;
+  const allSubgraphHitShapeMap = allSubgraphPixelShapeMap;
   perfSnapshotRef.current = {
     visibleNodeCount: visibleNodes.length,
     visibleEdgeCount: visibleEdges.length,
@@ -7926,7 +7856,8 @@ export default function App() {
     () => new Set(canvasSearchResults.filter((item) => item.kind === 'subgraph').map((item) => item.id)),
     [canvasSearchResults],
   );
-  const hybridSceneActive = hybridSceneDensityHint;
+  const pixiSceneActive = pixiCanvasReady && mode === 'canvas';
+  const hybridSceneActive = !pixiSceneActive && hybridSceneDensityHint;
   const sceneRenderableNodes = useMemo(
     () => (
       sceneRenderRect
@@ -7934,6 +7865,18 @@ export default function App() {
         : visibleNodes
     ),
     [sceneRenderRect, visibleNodes],
+  );
+  const sceneRenderableGroupShapes = useMemo(
+    () => (
+      sceneRenderRect
+        ? allSubgraphHitShapes.filter((shape) => intersects(sceneRenderRect, shape.bounds))
+        : allSubgraphHitShapes
+    ),
+    [allSubgraphHitShapes, sceneRenderRect],
+  );
+  const sceneIndex = useMemo(
+    () => measurePerf('buildSceneIndex', () => createSceneIndex(sceneRenderableNodes, sceneRenderableGroupShapes)),
+    [measurePerf, sceneRenderableGroupShapes, sceneRenderableNodes],
   );
   const sceneRenderableEdges = useMemo<SceneRenderableEdge[]>(
     () => visibleEdges.flatMap((edge) => {
@@ -8016,12 +7959,18 @@ export default function App() {
     [hybridSceneActive, sceneInteractiveNodeIds, sceneRenderableNodes],
   );
   const sceneOverlayNodes = useMemo(
-    () => (
-      hybridSceneActive
+    () => {
+      if (pixiSceneActive) {
+        return editingNodeId
+          ? sceneRenderableNodes.filter((node) => node.id === editingNodeId)
+          : [];
+      }
+
+      return hybridSceneActive
         ? sceneRenderableNodes.filter((node) => sceneInteractiveNodeIds.has(node.id))
-        : sceneRenderableNodes
-    ),
-    [hybridSceneActive, sceneInteractiveNodeIds, sceneRenderableNodes],
+        : sceneRenderableNodes;
+    },
+    [editingNodeId, hybridSceneActive, pixiSceneActive, sceneInteractiveNodeIds, sceneRenderableNodes],
   );
   const sceneCanvasEdges = useMemo(
     () => (
@@ -8032,13 +7981,52 @@ export default function App() {
     [hybridSceneActive, sceneInteractiveEdgeIds, sceneRenderableEdges],
   );
   const sceneOverlayEdges = useMemo(
-    () => (
-      hybridSceneActive
+    () => {
+      if (pixiSceneActive) {
+        return editingEdgeId
+          ? sceneRenderableEdges
+              .filter((entry) => entry.edge.id === editingEdgeId)
+              .map((entry) => entry.edge)
+          : [];
+      }
+
+      return hybridSceneActive
         ? sceneRenderableEdges.filter((entry) => sceneInteractiveEdgeIds.has(entry.edge.id)).map((entry) => entry.edge)
-        : sceneRenderableEdges.map((entry) => entry.edge)
-    ),
-    [hybridSceneActive, sceneInteractiveEdgeIds, sceneRenderableEdges],
+        : sceneRenderableEdges.map((entry) => entry.edge);
+    },
+    [editingEdgeId, hybridSceneActive, pixiSceneActive, sceneInteractiveEdgeIds, sceneRenderableEdges],
   );
+  const pixiSceneModel = useMemo<PixiSceneModel>(() => ({
+    nodes: sceneRenderableNodes,
+    edges: sceneRenderableEdges.map((entry) => entry.edge),
+    subgraphs: documentState.subgraphs,
+    groupShapes: sceneRenderableGroupShapes,
+    viewport: documentState.layout.viewport,
+    selection,
+    hoveredNodeId,
+    editingNodeId,
+    dragTargetNodeId,
+    dragTargetSubgraphId,
+    dragTargetEdgeId,
+    searchNodeIds: canvasSearchNodeIds,
+    searchSubgraphIds: canvasSearchSubgraphIds,
+    sceneIndex,
+  }), [
+    canvasSearchNodeIds,
+    canvasSearchSubgraphIds,
+    documentState.layout.viewport,
+    documentState.subgraphs,
+    dragTargetEdgeId,
+    dragTargetNodeId,
+    dragTargetSubgraphId,
+    editingNodeId,
+    hoveredNodeId,
+    sceneIndex,
+    sceneRenderableEdges,
+    sceneRenderableGroupShapes,
+    sceneRenderableNodes,
+    selection,
+  ]);
 
   useEffect(() => {
     const canvas = sceneCanvasRef.current;
@@ -8344,18 +8332,20 @@ export default function App() {
 
   const rememberSubgraphBadgeAnchor = useCallback((subgraphId: string, point: Point) => {
     const shape = allSubgraphBlobShapeMap.get(subgraphId) ?? subgraphBlobShapeMap.get(subgraphId);
-    if (!shape) {
+    const pixelShape = allSubgraphHitShapeMap.get(subgraphId);
+    const bounds = shape?.bounds ?? pixelShape?.bounds;
+    if (!bounds) {
       return;
     }
 
     setSubgraphBadgeAnchors((current) => ({
       ...current,
       [subgraphId]: {
-        offsetX: clamp(point.x - shape.bounds.x, 12, Math.max(shape.bounds.width - 12, 12)),
-        offsetY: clamp(point.y - shape.bounds.y, 12, Math.max(shape.bounds.height - 12, 12)),
+        offsetX: clamp(point.x - bounds.x, 12, Math.max(bounds.width - 12, 12)),
+        offsetY: clamp(point.y - bounds.y, 12, Math.max(bounds.height - 12, 12)),
       },
     }));
-  }, [allSubgraphBlobShapeMap, subgraphBlobShapeMap]);
+  }, [allSubgraphBlobShapeMap, allSubgraphHitShapeMap, subgraphBlobShapeMap]);
 
   const selectSubgraphAtPoint = useCallback((
     subgraphId: string,
@@ -9281,8 +9271,8 @@ export default function App() {
   }, [commitDocument]);
 
   const resolveSubgraphAtPoint = useCallback((point: Point) => (
-    findSubgraphDropTarget(allSubgraphBlobShapes, point)
-  ), [allSubgraphBlobShapes]);
+    findPixelGroupAtPoint(allSubgraphHitShapes, point)
+  ), [allSubgraphHitShapes]);
 
   const compactLayout = useCallback(() => {
     commitDocument(
@@ -9307,6 +9297,11 @@ export default function App() {
   }, [commitDocument, selection]);
 
   const autoLayout = useCallback(() => {
+    const layoutPreference = readMermaidLayoutPreference(documentRef.current.source);
+    if (layoutPreference.layout.startsWith('elk')) {
+      void registerMermaidElkLayoutIfNeeded();
+    }
+
     commitDocument(
       (current) => {
         const scopedNodeIds = collectLayoutScopeNodeIds(current, selection);
@@ -9324,7 +9319,9 @@ export default function App() {
         };
       },
       '已重排布局',
-      '已按拓扑结构重新布局，优先减少打结、遮挡和无效留白。',
+      layoutPreference.supportedForAutoLayout
+        ? `已按 ${layoutPreference.layout} 兼容策略重排布局，并量化到 32px 网格。`
+        : `当前 Mermaid layout=${layoutPreference.layout} 暂以 dagre 兼容策略重排，并量化到 32px 网格。`,
     );
   }, [commitDocument, selection]);
 
@@ -11304,8 +11301,8 @@ export default function App() {
         const nextSubgraphTargetId =
           nextNodeTargetId || nextEdgeTargetId
             ? null
-            : findSubgraphDropTarget(
-              allSubgraphBlobShapes,
+            : findPixelGroupAtPoint(
+              allSubgraphHitShapes,
               pointer,
               excludedSubgraphIds,
             );
@@ -11512,8 +11509,8 @@ export default function App() {
         const resolvedTargetNodeId = liveTargets?.nodeId ?? null;
         const resolvedTargetEdgeId = liveTargets?.edgeId ?? null;
         const ambientSubgraphId = shouldReparent
-          ? findSubgraphDropTarget(
-            allSubgraphBlobShapes,
+          ? findPixelGroupAtPoint(
+            allSubgraphHitShapes,
             dragState.current,
             dragState.kind === 'subgraph' && dragState.entityId ? [dragState.entityId] : [],
           )
@@ -11557,8 +11554,8 @@ export default function App() {
 
                 return {
                   ...node,
-                  x: Math.round(initial.x + deltaX),
-                  y: Math.round(initial.y + deltaY),
+                  x: snapToGrid(initial.x + deltaX),
+                  y: snapToGrid(initial.y + deltaY),
                 };
               });
               let workingDocument: GraphDocument = {
@@ -11782,10 +11779,9 @@ export default function App() {
 
       if (boxState) {
         const rect = rectFromPoints(boxState.origin, boxState.current);
-        const nextNodeIds = visibleNodes.filter((node) => intersects(rect, node)).map((node) => node.id);
-        const nextSubgraphIds = subgraphBlobShapes
-          .filter((shape) => subgraphShapeIntersectsRect(shape, rect))
-          .map((shape) => shape.id);
+        const indexedSelection = sceneIndex.queryRect(rect);
+        const nextNodeIds = indexedSelection.nodeIds;
+        const nextSubgraphIds = indexedSelection.subgraphIds;
 
         if (nextNodeIds.length > 0) {
           setSelection((current) =>
@@ -11952,7 +11948,7 @@ export default function App() {
     edgeEndpointMap,
     edgeLaneMap,
     edgeEndpointOffsetMap,
-    allSubgraphBlobShapes,
+    allSubgraphHitShapes,
     allSubgraphFrames,
     measurePerf,
     perfDebugEnabled,
@@ -11962,7 +11958,7 @@ export default function App() {
     panState,
     pointFromClient,
     resolveSubgraphAtPoint,
-    subgraphBlobShapes,
+    sceneIndex,
     visibleEdges,
     visibleNodes,
   ]);
@@ -12102,6 +12098,11 @@ export default function App() {
   }, [applyCommittedDocument, documentState.layout.viewport, documentState.nodes, editingNodeId, pointFromClient, selection]);
 
   const findSceneHitAtPoint = useCallback((point: Point) => {
+    const indexedHit = sceneIndex.hitTest(point);
+    if (indexedHit?.kind === 'node') {
+      return { kind: 'node' as const, id: indexedHit.id };
+    }
+
     const nodeId = findNodeDropTarget(sceneRenderableNodes, point);
     if (nodeId) {
       return { kind: 'node' as const, id: nodeId };
@@ -12118,8 +12119,79 @@ export default function App() {
       return { kind: 'edge' as const, id: edgeId };
     }
 
+    if (indexedHit?.kind === 'subgraph') {
+      return { kind: 'subgraph' as const, id: indexedHit.id };
+    }
+
     return null;
-  }, [edgeEndpointMap, edgeEndpointOffsetMap, edgeLaneMap, sceneRenderableEdges, sceneRenderableNodes]);
+  }, [edgeEndpointMap, edgeEndpointOffsetMap, edgeLaneMap, sceneIndex, sceneRenderableEdges, sceneRenderableNodes]);
+
+  const startBackgroundInteractionFromPointer = useCallback((pointer: PixiScenePointer) => {
+    if (canvasSearchOpen) {
+      setCanvasSearchOpen(false);
+    }
+
+    if (pointer.button === 1) {
+      setPanState({
+        origin: { x: pointer.clientX, y: pointer.clientY },
+        initialViewport: { ...documentState.layout.viewport },
+      });
+      return;
+    }
+
+    if (pointer.button !== 0) {
+      return;
+    }
+
+    const viewport = documentState.layout.viewport;
+    const point = pointFromClient(pointer.clientX, pointer.clientY, viewport);
+    if (!point) {
+      return;
+    }
+
+    if (spacePressed) {
+      setPanState({
+        origin: { x: pointer.clientX, y: pointer.clientY },
+        initialViewport: { ...viewport },
+      });
+      return;
+    }
+
+    if (!pointer.shiftKey) {
+      clearSelection();
+    }
+    if (isMobileViewport || pointer.pointerType === 'touch') {
+      clearPendingBackgroundInteraction();
+      pendingBackgroundRef.current = {
+        clientX: pointer.clientX,
+        clientY: pointer.clientY,
+        point,
+      };
+      backgroundHoldRef.current = window.setTimeout(() => {
+        setBoxState({
+          origin: point,
+          current: point,
+          toggle: pointer.shiftKey,
+        });
+        clearPendingBackgroundInteraction();
+      }, 220);
+      return;
+    }
+
+    setBoxState({
+      origin: point,
+      current: point,
+      toggle: pointer.shiftKey,
+    });
+  }, [
+    canvasSearchOpen,
+    clearPendingBackgroundInteraction,
+    clearSelection,
+    documentState.layout.viewport,
+    isMobileViewport,
+    pointFromClient,
+    spacePressed,
+  ]);
 
   function startBackgroundInteraction(event: ReactPointerEvent<HTMLDivElement>) {
     if (canvasSearchOpen) {
@@ -12140,6 +12212,9 @@ export default function App() {
     }
 
     const target = event.target as HTMLElement;
+    if (target.closest('.pixi-canvas-surface')) {
+      return;
+    }
     if (target.closest('.graph-node, .subgraph-frame, .content-card')) {
       return;
     }
@@ -12232,6 +12307,22 @@ export default function App() {
     }, node);
   }
 
+  const startPixiNodeInteraction = useCallback((pointer: PixiScenePointer, nodeId: string) => {
+    const node = documentState.nodes.find((entry) => entry.id === nodeId);
+    if (!node) {
+      return;
+    }
+    handleNodePointerInteraction(pointer, node);
+  }, [documentState.nodes, handleNodePointerInteraction]);
+
+  const startPixiEdgeInteraction = useCallback((pointer: PixiScenePointer, edgeId: string) => {
+    if (pointer.shiftKey) {
+      setSelection((current) => toggleSelectionIds(current, 'edge', [edgeId]));
+      return;
+    }
+    setSelection({ kind: 'edge', ids: [edgeId] });
+  }, []);
+
   function startSubgraphDrag(
     event: ReactPointerEvent<Element>,
     subgraphId: string,
@@ -12306,18 +12397,96 @@ export default function App() {
     });
   }
 
-  function beginConnection(
-    event: ReactPointerEvent<HTMLElement>,
+  const handleSubgraphPointerInteraction = useCallback((
+    pointer: PixiScenePointer,
+    subgraphId: string,
+  ) => {
+    if (editingSubgraphId) {
+      return;
+    }
+
+    const point = pointFromClient(pointer.clientX, pointer.clientY);
+    if (!point) {
+      return;
+    }
+
+    rememberSubgraphBadgeAnchor(subgraphId, point);
+
+    if (pointer.button === 1) {
+      setPanState({
+        origin: { x: pointer.clientX, y: pointer.clientY },
+        initialViewport: { ...documentState.layout.viewport },
+      });
+      return;
+    }
+
+    if (pointer.button === 2) {
+      const frame = allSubgraphFrameMap.get(subgraphId);
+      setSelection({ kind: 'subgraph', ids: [subgraphId] });
+      setConnectingState({
+        fromId: subgraphId,
+        fromIds: [subgraphId],
+        origin: point,
+        current: point,
+        edgeType: pointer.ctrlKey || pointer.metaKey ? 'line' : 'solid',
+        handleSide: pointer.clientX < ((frame?.x ?? 0) + (frame?.width ?? 0) / 2) ? 'left' : 'right',
+      });
+      return;
+    }
+
+    if (pointer.button !== 0) {
+      return;
+    }
+
+    if (pointer.shiftKey) {
+      setSelection((current) => toggleSelectionIds(current, 'subgraph', [subgraphId]));
+      return;
+    }
+
+    const memberIds = collectNodeIdsForSubgraph(subgraphId, documentState.nodes, fullSubgraphLookup);
+    if (memberIds.length === 0) {
+      setSelection({ kind: 'subgraph', ids: [subgraphId] });
+      return;
+    }
+
+    setSelection({ kind: 'subgraph', ids: [subgraphId] });
+    setDragState({
+      kind: 'subgraph',
+      origin: point,
+      current: point,
+      ids: memberIds,
+      initialPositions: Object.fromEntries(
+        documentState.nodes
+          .filter((node) => memberIds.includes(node.id))
+          .map((node) => [node.id, { x: node.x, y: node.y }]),
+      ),
+      entityId: subgraphId,
+    });
+  }, [
+    allSubgraphFrameMap,
+    documentState.layout.viewport,
+    documentState.nodes,
+    editingSubgraphId,
+    fullSubgraphLookup,
+    pointFromClient,
+    rememberSubgraphBadgeAnchor,
+  ]);
+
+  const beginConnectionFromPointer = useCallback((
+    pointer: PixiScenePointer | {
+      clientX: number;
+      clientY: number;
+      ctrlKey: boolean;
+      metaKey: boolean;
+    },
     endpoint: Pick<EdgeEndpointBox, 'id' | 'x' | 'y' | 'width' | 'height'>,
     handleSide: 'left' | 'right',
-  ) {
-    event.stopPropagation();
-    event.preventDefault();
+  ) => {
     if (!canvasRef.current) {
       return;
     }
 
-    const current = pointFromClient(event.clientX, event.clientY);
+    const current = pointFromClient(pointer.clientX, pointer.clientY);
     if (!current) {
       return;
     }
@@ -12326,9 +12495,31 @@ export default function App() {
       fromIds: [endpoint.id],
       origin: current,
       current,
-      edgeType: event.ctrlKey || event.metaKey ? 'line' : 'solid',
+      edgeType: pointer.ctrlKey || pointer.metaKey ? 'line' : 'solid',
       handleSide,
     });
+  }, [pointFromClient]);
+
+  const startPixiEndpointConnection = useCallback((
+    pointer: PixiScenePointer,
+    endpointId: string,
+    side: 'left' | 'right',
+  ) => {
+    const endpoint = edgeEndpointMap.get(endpointId);
+    if (!endpoint) {
+      return;
+    }
+    beginConnectionFromPointer(pointer, endpoint, side);
+  }, [beginConnectionFromPointer, edgeEndpointMap]);
+
+  function beginConnection(
+    event: ReactPointerEvent<HTMLElement>,
+    endpoint: Pick<EdgeEndpointBox, 'id' | 'x' | 'y' | 'width' | 'height'>,
+    handleSide: 'left' | 'right',
+  ) {
+    event.stopPropagation();
+    event.preventDefault();
+    beginConnectionFromPointer(event, endpoint, handleSide);
   }
 
   const selectedNode =
@@ -14676,7 +14867,7 @@ export default function App() {
                     return;
                   }
 
-                  if (hybridSceneActive) {
+                  if (hybridSceneActive || pixiSceneActive) {
                     const sceneHit = findSceneHitAtPoint(point);
                     if (sceneHit?.kind === 'node') {
                       const node = documentState.nodes.find((entry) => entry.id === sceneHit.id);
@@ -14701,6 +14892,13 @@ export default function App() {
                         return;
                       }
                     }
+
+                    if (sceneHit?.kind === 'subgraph') {
+                      event.stopPropagation();
+                      rememberSubgraphBadgeAnchor(sceneHit.id, point);
+                      createNodeAt(point, undefined, 'solid', sceneHit.id);
+                      return;
+                    }
                   }
 
                   createNodeAt(point, undefined, 'solid', resolveSubgraphAtPoint(point));
@@ -14709,13 +14907,24 @@ export default function App() {
                 onWheel={handleCanvasWheel}
                 ref={canvasRef}
               >
+                <PixiCanvasSurface
+                  enabled={mode === 'canvas'}
+                  model={pixiSceneModel}
+                  onBackgroundPointerDown={startBackgroundInteractionFromPointer}
+                  onEdgePointerDown={startPixiEdgeInteraction}
+                  onEndpointPointerDown={startPixiEndpointConnection}
+                  onNodeHoverChange={setHoveredNodeId}
+                  onNodePointerDown={startPixiNodeInteraction}
+                  onReadyChange={handlePixiReadyChange}
+                  onSubgraphPointerDown={handleSubgraphPointerInteraction}
+                />
                 <canvas
                   aria-hidden="true"
                   className={`scene-render-canvas${hybridSceneActive ? ' is-active' : ''}`}
                   ref={sceneCanvasRef}
                 />
                 <div
-                  className="canvas-board"
+                  className={`canvas-board${pixiSceneActive ? ' is-pixi-active' : ''}`}
                   ref={canvasBoardRef}
                   style={{
                     width: canvasBoardBounds.width,
@@ -14723,6 +14932,7 @@ export default function App() {
                     transform: `translate(${documentState.layout.viewport.x + canvasBoardBounds.x * documentState.layout.viewport.zoom}px, ${documentState.layout.viewport.y + canvasBoardBounds.y * documentState.layout.viewport.zoom}px) scale(${documentState.layout.viewport.zoom})`,
                   }}
                 >
+                  {!pixiSceneActive ? (
                   <svg className="subgraph-blob-layer" aria-hidden="true">
                     <g transform={`translate(${-canvasBoardBounds.x} ${-canvasBoardBounds.y})`}>
                       {[...subgraphBlobShapes].sort((left, right) => left.depth - right.depth).map((shape) => {
@@ -14828,6 +15038,7 @@ export default function App() {
                       })}
                     </g>
                   </svg>
+                  ) : null}
 
                   {[...subgraphFrames].sort((left, right) => left.depth - right.depth).map((frame) => {
                     const subgraph = documentState.subgraphs.find((entry) => entry.id === frame.id);
@@ -14837,19 +15048,26 @@ export default function App() {
                     const subgraphStyle = getSubgraphStyle(subgraph);
                     const subgraphParts = splitEntityText(subgraph.title);
                     const shape = subgraphBlobShapeMap.get(frame.id) ?? allSubgraphBlobShapeMap.get(frame.id) ?? null;
+                    const pixelShape = allSubgraphHitShapeMap.get(frame.id) ?? null;
                     const isExplicitSelection =
                       selection.kind === 'subgraph' && selectionContains(selection, frame.id);
                     const isDropTarget = dragTargetSubgraphId === frame.id;
                     const isSearchMatch = canvasSearchSubgraphIds.has(frame.id);
-                    const badgePoint = shape
-                      ? resolveSubgraphBadgePoint(
-                          shape,
-                          subgraphBadgeAnchors[frame.id],
-                        )
-                      : {
-                          x: frame.x + 18,
-                          y: frame.y + 18,
-                        };
+                    const badgePoint =
+                      pixiSceneActive && pixelShape
+                        ? {
+                            x: pixelShape.bounds.x + (subgraphBadgeAnchors[frame.id]?.offsetX ?? 18),
+                            y: pixelShape.bounds.y + (subgraphBadgeAnchors[frame.id]?.offsetY ?? 18),
+                          }
+                        : shape
+                          ? resolveSubgraphBadgePoint(
+                              shape,
+                              subgraphBadgeAnchors[frame.id],
+                            )
+                          : {
+                              x: frame.x + 18,
+                              y: frame.y + 18,
+                            };
                     const header = (
                       <div
                         className="subgraph-frame__header"
@@ -14964,7 +15182,7 @@ export default function App() {
                       </div>
                     );
 
-                    if (!subgraph.collapsed) {
+                    if (!subgraph.collapsed || pixiSceneActive) {
                       const showFloatingBadge =
                         editingSubgraphId === frame.id ||
                         isExplicitSelection ||

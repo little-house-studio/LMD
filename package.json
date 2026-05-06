@@ -56,7 +56,10 @@
   },
   "type": "module",
   "dependencies": {
+    "@mermaid-js/layout-elk": "^0.2.1",
+    "dagre-d3-es": "^7.0.14",
     "mermaid": "^11.13.0",
+    "pixi.js": "^8.18.1",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
