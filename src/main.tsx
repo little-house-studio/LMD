@@ -1,9 +1,21 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import App from './App';
 import { DiagnosticShell, RootErrorBoundary } from './components/BootFallbacks';
-import { storageKeys } from './lib/storage';
+import FlowApp from './lmd/FlowApp';
+import { setLmdInterpreterHooks } from './lmd';
+import { hotPathCounters } from './lmd/hotpath/sceneHotPath';
+import { storageKeys } from './lmd/storage';
 import './styles.css';
+
+// Optional: plug canvas hot-path counters into the independent LMD interpreter.
+setLmdInterpreterHooks({
+  onParseProjectMarkdown: () => {
+    hotPathCounters.parseProjectMarkdown += 1;
+  },
+  onSerializeProjectMarkdown: () => {
+    hotPathCounters.serializeProjectMarkdown += 1;
+  },
+});
 
 const params = new URLSearchParams(window.location.search);
 
@@ -12,10 +24,12 @@ if (params.has('reset')) {
   localStorage.removeItem(storageKeys.history);
 }
 
+// Legacy monolith App remains at ./App for reference.
+// Canvas runtime is Project-Graph style Canvas2D Stage via FlowApp → StageCanvas.
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <RootErrorBoundary>
-      {params.has('safe') ? <DiagnosticShell /> : <App />}
+      {params.has('safe') ? <DiagnosticShell /> : <FlowApp />}
     </RootErrorBoundary>
   </StrictMode>,
 );

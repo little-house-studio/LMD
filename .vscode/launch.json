@@ -14,7 +14,7 @@
       ],
       "preLaunchTask": "lmd-editer:dev",
       "env": {
-        "LMD_EDITER_WEBVIEW_DEV_SERVER": "http://127.0.0.1:5173"
+        "LMD_EDITER_WEBVIEW_DEV_SERVER": "http://127.0.0.1:5280"
       }
     }
   ]

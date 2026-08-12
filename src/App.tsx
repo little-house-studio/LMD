@@ -39,6 +39,25 @@ import {
   sampleProjectMarkdown,
 } from './lib/sample';
 import { storageKeys } from './lib/storage';
+import {
+  CanvasTextCache,
+  SceneSpatialIndex,
+  type SceneIndexEntry,
+} from './lib/canvasEngine';
+import {
+  BaseSceneCache,
+  applyWheelPanViewport,
+  applyWheelZoomViewport,
+  clientToWorldPoint,
+  hotPathCounters,
+  resolveInteractionViewport,
+  seedPanInitialViewport,
+  selectPaintEdgesFromTopology,
+  selectPaintNodesFromTopology,
+  topologyRevisionFromGraph,
+  viewportToWorldRect,
+  type HotPathViewport,
+} from './lib/sceneHotPath';
 import type {
   Direction,
   EditorMode,
@@ -52,6 +71,7 @@ import type {
   HistoryEntry,
   LayoutSidecar,
   NodeShape,
+  EdgeType,
   ProjectCompatExtras,
   SelectionState,
   ViewportState,
@@ -264,6 +284,10 @@ const HYBRID_SCENE_TITLE_ZOOM_THRESHOLD = 0.38;
 const HYBRID_SCENE_DESCRIPTION_ZOOM_THRESHOLD = 0.72;
 const HYBRID_SCENE_SIMPLIFIED_ZOOM_THRESHOLD = 0.22;
 const HYBRID_SCENE_ARROW_ZOOM_THRESHOLD = 0.28;
+const SCENE_INDEX_BUCKET_SIZE = 512;
+const SCENE_EDGE_INDEX_BUCKET_SIZE = 768;
+const NODE_DRAG_PREVIEW_CLASS = 'is-engine-dragging';
+const sceneTextCache = new CanvasTextCache(2400);
 
 interface ExplorerItem {
   id: string;
@@ -436,6 +460,10 @@ interface PerfDebugSnapshot {
   subgraphFrameCount: number;
   blobRegionCount: number;
   blobPrimitiveCount: number;
+  canvasNodeCount: number;
+  canvasEdgeCount: number;
+  overlayNodeCount: number;
+  overlayEdgeCount: number;
 }
 
 interface PerfDebugSummary {
@@ -492,33 +520,33 @@ const shapeOptions: Array<{ label: string; value: NodeShape }> = [
 ];
 
 const nodeStylePresets = [
-  { id: 'sunrise', label: '晨曦', fill: '#ffd5a1', stroke: '#f97316', textColor: '#4a1d00' },
-  { id: 'ocean', label: '海岸', fill: '#8ed8ff', stroke: '#0284c7', textColor: '#082f49' },
-  { id: 'mint', label: '薄荷', fill: '#9ef0b8', stroke: '#16a34a', textColor: '#052e16' },
-  { id: 'rose', label: '玫瑰', fill: '#ffb4c7', stroke: '#e11d48', textColor: '#4a001f' },
-  { id: 'violet', label: '暮紫', fill: '#cdb7ff', stroke: '#7c3aed', textColor: '#2e1065' },
-  { id: 'slate', label: '石墨', fill: '#cfd8e3', stroke: '#475569', textColor: '#111827' },
-  { id: 'ember', label: '炽焰', fill: '#ffb089', stroke: '#ea580c', textColor: '#431407' },
-  { id: 'teal', label: '湖青', fill: '#88ede0', stroke: '#0f766e', textColor: '#042f2e' },
-  { id: 'gold', label: '琥珀', fill: '#ffd86e', stroke: '#ca8a04', textColor: '#422006' },
-  { id: 'night', label: '夜幕', fill: '#0f172a', stroke: '#60a5fa', textColor: '#f8fafc' },
+  { id: 'void', label: '虚空', fill: '#121214', stroke: '#d6ff3a', textColor: '#f4f4f5' },
+  { id: 'acid', label: '酸青', fill: '#0e1a14', stroke: '#00f0ff', textColor: '#e8fffb' },
+  { id: 'signal', label: '信号', fill: '#1a1808', stroke: '#ffe600', textColor: '#fff8c8' },
+  { id: 'hotzone', label: '热区', fill: '#1a0a12', stroke: '#ff2a6d', textColor: '#ffe0ea' },
+  { id: 'matrix', label: '矩阵', fill: '#10160c', stroke: '#7cff6b', textColor: '#e8ffe4' },
+  { id: 'plasma', label: '等离子', fill: '#140e1c', stroke: '#c77dff', textColor: '#f3e8ff' },
+  { id: 'ember', label: '燃核', fill: '#1a100a', stroke: '#ff6b2c', textColor: '#ffe8d8' },
+  { id: 'mono', label: '单色', fill: '#0a0a0c', stroke: '#f4f4f5', textColor: '#f4f4f5' },
+  { id: 'invert', label: '反相', fill: '#f4f4f5', stroke: '#0a0a0c', textColor: '#0a0a0c' },
+  { id: 'runner', label: 'Runner', fill: '#0c0c10', stroke: '#d6ff3a', textColor: '#d6ff3a' },
 ] as const;
 
 const subgraphColorPresets = [
-  { fill: '#ffd8a8', stroke: '#f08c00', textColor: '#5f370e' },
-  { fill: '#c7d2fe', stroke: '#4f46e5', textColor: '#312e81' },
-  { fill: '#a7f3d0', stroke: '#059669', textColor: '#064e3b' },
-  { fill: '#fecdd3', stroke: '#e11d48', textColor: '#881337' },
-  { fill: '#bfdbfe', stroke: '#2563eb', textColor: '#1e3a8a' },
-  { fill: '#fde68a', stroke: '#ca8a04', textColor: '#713f12' },
-  { fill: '#d9f99d', stroke: '#65a30d', textColor: '#365314' },
-  { fill: '#fbcfe8', stroke: '#db2777', textColor: '#831843' },
+  { fill: '#121418', stroke: '#00f0ff', textColor: '#e8fffb' },
+  { fill: '#14120a', stroke: '#ffe600', textColor: '#fff8c8' },
+  { fill: '#141018', stroke: '#c77dff', textColor: '#f3e8ff' },
+  { fill: '#10160e', stroke: '#7cff6b', textColor: '#e8ffe4' },
+  { fill: '#180c12', stroke: '#ff2a6d', textColor: '#ffe0ea' },
+  { fill: '#121214', stroke: '#d6ff3a', textColor: '#f4f4f5' },
+  { fill: '#1a100a', stroke: '#ff6b2c', textColor: '#ffe8d8' },
+  { fill: '#0a0a0c', stroke: '#f4f4f5', textColor: '#f4f4f5' },
 ] as const;
 
 const collaboratorPresets = [
-  { id: 'lin', name: 'Lin', role: '画布', color: '#f97316' },
-  { id: 'mina', name: 'Mina', role: '源码', color: '#22c55e' },
-  { id: 'kai', name: 'Kai', role: '评审', color: '#38bdf8' },
+  { id: 'lin', name: 'Lin', role: '画布', color: '#d6ff3a' },
+  { id: 'mina', name: 'Mina', role: '源码', color: '#00f0ff' },
+  { id: 'kai', name: 'Kai', role: '评审', color: '#ff2a6d' },
 ] as const;
 
 function hashStringToNumber(value: string) {
@@ -755,6 +783,24 @@ function normalizeStoredAiMessages(messages: AiMessage[]) {
     ...message,
     createdAt: message.createdAt ?? new Date().toISOString(),
   }));
+}
+
+function sameAiMessages(left: AiMessage[], right: AiMessage[]) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((message, index) => {
+    const candidate = right[index];
+    return (
+      candidate &&
+      message.id === candidate.id &&
+      message.role === candidate.role &&
+      message.content === candidate.content &&
+      message.createdAt === candidate.createdAt &&
+      message.status === candidate.status
+    );
+  });
 }
 
 function readInitialAiConversationRecords() {
@@ -1124,6 +1170,10 @@ function createPerfDebugSnapshot(): PerfDebugSnapshot {
     subgraphFrameCount: 0,
     blobRegionCount: 0,
     blobPrimitiveCount: 0,
+    canvasNodeCount: 0,
+    canvasEdgeCount: 0,
+    overlayNodeCount: 0,
+    overlayEdgeCount: 0,
   };
 }
 
@@ -1148,9 +1198,9 @@ function WorkbenchIcon({ name, className }: { name: IconName; className?: string
     viewBox: '0 0 24 24',
     fill: 'none',
     stroke: 'currentColor',
-    strokeWidth: 1.8,
-    strokeLinecap: 'round' as const,
-    strokeLinejoin: 'round' as const,
+    strokeWidth: 1.7,
+    strokeLinecap: 'square' as const,
+    strokeLinejoin: 'miter' as const,
     'aria-hidden': true,
   };
 
@@ -1780,9 +1830,9 @@ function buildNode(
     y: position.y,
     width: size.width,
     height: size.height,
-    fill: '#fff8ef',
-    stroke: '#24404f',
-    textColor: '#12212c',
+    fill: '#121214',
+    stroke: '#d6ff3a',
+    textColor: '#f4f4f5',
     subgraphId,
   };
 }
@@ -3482,27 +3532,225 @@ function tangentAxisFromAnchor(anchor: { dirX: number; dirY: number }) {
   return anchor.dirX !== 0 ? { x: 0, y: 1 } : { x: 1, y: 0 };
 }
 
+function snapRouteValue(value: number, grid = 16) {
+  return Math.round(value / grid) * grid;
+}
+
+function simplifyPolylinePoints(points: Point[]) {
+  const deduped: Point[] = [];
+  points.forEach((point) => {
+    const previous = deduped[deduped.length - 1];
+    if (!previous || Math.hypot(previous.x - point.x, previous.y - point.y) >= 0.75) {
+      deduped.push({ x: point.x, y: point.y });
+    }
+  });
+
+  return deduped.filter((point, index) => {
+    if (index === 0 || index === deduped.length - 1) {
+      return true;
+    }
+    const previous = deduped[index - 1];
+    const next = deduped[index + 1];
+    const cross =
+      (point.x - previous.x) * (next.y - point.y) -
+      (point.y - previous.y) * (next.x - point.x);
+    // Drop collinear middle points so routes stay minimal.
+    return Math.abs(cross) > 0.75;
+  });
+}
+
+/**
+ * Clean Manhattan routing: fewest right-angle bends, no diagonal jogs.
+ * Readable first; design language is carried by stroke/arrow styling.
+ */
+function buildTechnoPolylinePoints(
+  start: Point,
+  end: Point,
+  fromAnchor: { dirX: number; dirY: number },
+  toAnchor: { dirX: number; dirY: number },
+  laneOffset: number,
+) {
+  const stub = 22;
+  const s1 = {
+    x: start.x + fromAnchor.dirX * stub,
+    y: start.y + fromAnchor.dirY * stub,
+  };
+  const e1 = {
+    x: end.x + toAnchor.dirX * stub,
+    y: end.y + toAnchor.dirY * stub,
+  };
+
+  const fromH = fromAnchor.dirX !== 0;
+  const toH = toAnchor.dirX !== 0;
+  const lane = laneOffset;
+
+  // Short hop: keep it almost direct with only stubs.
+  if (Math.hypot(e1.x - s1.x, e1.y - s1.y) < 28) {
+    return simplifyPolylinePoints([start, s1, e1, end]);
+  }
+
+  // Both leave/enter on horizontal faces → vertical mid corridor.
+  if (fromH && toH) {
+    const facing = fromAnchor.dirX === -toAnchor.dirX;
+    let midX: number;
+    if (facing) {
+      midX = (s1.x + e1.x) / 2 + lane;
+      // If stubs already crossed (nodes very close / overlapping axis), push corridor out.
+      if (
+        (fromAnchor.dirX > 0 && midX < s1.x) ||
+        (fromAnchor.dirX < 0 && midX > s1.x)
+      ) {
+        midX = s1.x + fromAnchor.dirX * (28 + Math.abs(lane));
+      }
+    } else {
+      // Same-side exits: loop outward then down/up.
+      midX =
+        fromAnchor.dirX > 0
+          ? Math.max(s1.x, e1.x) + 28 + Math.abs(lane)
+          : Math.min(s1.x, e1.x) - 28 - Math.abs(lane);
+    }
+
+    return simplifyPolylinePoints([
+      start,
+      s1,
+      { x: midX, y: s1.y },
+      { x: midX, y: e1.y },
+      e1,
+      end,
+    ]);
+  }
+
+  // Both vertical faces → horizontal mid corridor.
+  if (!fromH && !toH) {
+    const facing = fromAnchor.dirY === -toAnchor.dirY;
+    let midY: number;
+    if (facing) {
+      midY = (s1.y + e1.y) / 2 + lane;
+      if (
+        (fromAnchor.dirY > 0 && midY < s1.y) ||
+        (fromAnchor.dirY < 0 && midY > s1.y)
+      ) {
+        midY = s1.y + fromAnchor.dirY * (28 + Math.abs(lane));
+      }
+    } else {
+      midY =
+        fromAnchor.dirY > 0
+          ? Math.max(s1.y, e1.y) + 28 + Math.abs(lane)
+          : Math.min(s1.y, e1.y) - 28 - Math.abs(lane);
+    }
+
+    return simplifyPolylinePoints([
+      start,
+      s1,
+      { x: s1.x, y: midY },
+      { x: e1.x, y: midY },
+      e1,
+      end,
+    ]);
+  }
+
+  // Mixed faces → single L (or slight offset L when lanes stack).
+  if (fromH) {
+    const corner = { x: e1.x + lane * 0.15, y: s1.y };
+    return simplifyPolylinePoints([start, s1, corner, e1, end]);
+  }
+
+  const corner = { x: s1.x, y: e1.y + lane * 0.15 };
+  return simplifyPolylinePoints([start, s1, corner, e1, end]);
+}
+
+function getEdgeDashArray(type: EdgeType): string | undefined {
+  if (type === 'dotted') {
+    return '3 7';
+  }
+  return undefined;
+}
+
+/** Orthogonal path with soft corner radius — cleaner than raw miter jogs. */
+function buildPolylinePath(points: Point[], cornerRadius = 10) {
+  if (points.length === 0) {
+    return '';
+  }
+  if (points.length === 1) {
+    return `M ${points[0].x} ${points[0].y}`;
+  }
+  if (points.length === 2 || cornerRadius <= 0) {
+    return points
+      .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
+      .join(' ');
+  }
+
+  let path = `M ${points[0].x} ${points[0].y}`;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const prev = points[index - 1];
+    const curr = points[index];
+    const next = points[index + 1];
+    const d1x = curr.x - prev.x;
+    const d1y = curr.y - prev.y;
+    const d2x = next.x - curr.x;
+    const d2y = next.y - curr.y;
+    const len1 = Math.hypot(d1x, d1y) || 1;
+    const len2 = Math.hypot(d2x, d2y) || 1;
+    const radius = Math.min(cornerRadius, len1 / 2, len2 / 2);
+    const p1 = {
+      x: curr.x - (d1x / len1) * radius,
+      y: curr.y - (d1y / len1) * radius,
+    };
+    const p2 = {
+      x: curr.x + (d2x / len2) * radius,
+      y: curr.y + (d2y / len2) * radius,
+    };
+    path += ` L ${p1.x} ${p1.y} Q ${curr.x} ${curr.y} ${p2.x} ${p2.y}`;
+  }
+  const last = points[points.length - 1];
+  path += ` L ${last.x} ${last.y}`;
+  return path;
+}
+
+function pointAlongPolyline(points: Point[], ratio: number) {
+  if (points.length === 0) {
+    return { x: 0, y: 0 };
+  }
+  if (points.length === 1) {
+    return points[0];
+  }
+
+  let totalLength = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    totalLength += distanceBetweenPoints(points[index - 1], points[index]);
+  }
+
+  const targetLength = totalLength * clamp(ratio, 0, 1);
+  let traversed = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const start = points[index - 1];
+    const end = points[index];
+    const segmentLength = distanceBetweenPoints(start, end);
+    if (traversed + segmentLength >= targetLength) {
+      const localRatio = segmentLength <= 0 ? 0 : (targetLength - traversed) / segmentLength;
+      return {
+        x: start.x + (end.x - start.x) * localRatio,
+        y: start.y + (end.y - start.y) * localRatio,
+      };
+    }
+    traversed += segmentLength;
+  }
+
+  return points[points.length - 1];
+}
+
 function buildEdgeGeometry(
   fromNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
   toNode: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
   laneOffset = 0,
   endpointOffsets: { from: number; to: number } = { from: 0, to: 0 },
 ) {
-  const endInset = 12;
+  // Anchor slightly outside the border so arrows don't clip the node face.
+  const endInset = 2;
   const fromAnchor = getNodeAnchor(fromNode, getNodeCenter(toNode));
   const toAnchor = getNodeAnchor(toNode, getNodeCenter(fromNode));
-  const fromCenter = getNodeCenter(fromNode);
-  const toCenter = getNodeCenter(toNode);
-  const deltaX = toCenter.x - fromCenter.x;
-  const deltaY = toCenter.y - fromCenter.y;
-  const distance = Math.max(1, Math.hypot(deltaX, deltaY));
-  const centerNormal = {
-    x: -deltaY / distance,
-    y: deltaX / distance,
-  };
   const fromNormal = normalFromAnchor(fromAnchor);
   const toNormal = normalFromAnchor(toAnchor);
-  const handleLength = Math.max(32, Math.min(78, distance * 0.28));
   const start = {
     x: fromAnchor.x + fromAnchor.dirX * endInset + fromNormal.x * endpointOffsets.from,
     y: fromAnchor.y + fromAnchor.dirY * endInset + fromNormal.y * endpointOffsets.from,
@@ -3511,109 +3759,21 @@ function buildEdgeGeometry(
     x: toAnchor.x + toAnchor.dirX * endInset + toNormal.x * endpointOffsets.to,
     y: toAnchor.y + toAnchor.dirY * endInset + toNormal.y * endpointOffsets.to,
   };
-  const startOffsetVector = {
-    x: fromNormal.x * endpointOffsets.from,
-    y: fromNormal.y * endpointOffsets.from,
-  };
-  const endOffsetVector = {
-    x: toNormal.x * endpointOffsets.to,
-    y: toNormal.y * endpointOffsets.to,
-  };
-  const combinedEndpointOffset = {
-    x: startOffsetVector.x + endOffsetVector.x,
-    y: startOffsetVector.y + endOffsetVector.y,
-  };
-  const combinedEndpointOffsetLength = Math.hypot(
-    combinedEndpointOffset.x,
-    combinedEndpointOffset.y,
-  );
-  const useEndpointDrivenBend = combinedEndpointOffsetLength >= 8;
-  const horizontalPassage = fromAnchor.dirX !== 0 && toAnchor.dirX !== 0;
-  const verticalPassage = fromAnchor.dirY !== 0 && toAnchor.dirY !== 0;
-  const normalProjection =
-    combinedEndpointOffset.x * centerNormal.x +
-    combinedEndpointOffset.y * centerNormal.y;
-  const bendSign = useEndpointDrivenBend
-    ? Math.sign(normalProjection || laneOffset || 1)
-    : Math.sign(laneOffset || 1);
-  const bendMagnitude = useEndpointDrivenBend
-    ? bendSign * Math.max(
-      Math.abs(laneOffset) * (Math.abs(laneOffset) >= 34 ? 0.82 : 0.66),
-      Math.abs(normalProjection) * 0.92,
-    )
-    : laneOffset * (Math.abs(laneOffset) >= 34 ? 0.72 : 0.56);
-  const bendVector = {
-    x: centerNormal.x * bendMagnitude,
-    y: centerNormal.y * bendMagnitude,
-  };
-  let controlA: Point;
-  let controlB: Point;
-
-  if (horizontalPassage) {
-    const axisGap = Math.abs(end.x - start.x);
-    const axialHandle = Math.min(handleLength, Math.max(18, axisGap * 0.34));
-    const routeOffset = Math.abs(laneOffset) >= 10
-      ? laneOffset * 0.74
-      : bendVector.y * 0.58;
-    controlA = {
-      x: start.x + fromAnchor.dirX * axialHandle,
-      y: start.y + routeOffset,
-    };
-    controlB = {
-      x: end.x + toAnchor.dirX * axialHandle,
-      y: end.y + routeOffset,
-    };
-  } else if (verticalPassage) {
-    const axisGap = Math.abs(end.y - start.y);
-    const axialHandle = Math.min(handleLength, Math.max(18, axisGap * 0.34));
-    const routeOffset = Math.abs(laneOffset) >= 10
-      ? laneOffset * 0.74
-      : bendVector.x * 0.58;
-    controlA = {
-      x: start.x + routeOffset,
-      y: start.y + fromAnchor.dirY * axialHandle,
-    };
-    controlB = {
-      x: end.x + routeOffset,
-      y: end.y + toAnchor.dirY * axialHandle,
-    };
-  } else {
-    controlA = {
-      x:
-        start.x +
-        fromAnchor.dirX * handleLength +
-        fromNormal.x * endpointOffsets.from * 0.48 +
-        bendVector.x,
-      y:
-        start.y +
-        fromAnchor.dirY * handleLength +
-        fromNormal.y * endpointOffsets.from * 0.48 +
-        bendVector.y,
-    };
-    controlB = {
-      x:
-        end.x +
-        toAnchor.dirX * handleLength +
-        toNormal.x * endpointOffsets.to * 0.48 +
-        bendVector.x,
-      y:
-        end.y +
-        toAnchor.dirY * handleLength +
-        toNormal.y * endpointOffsets.to * 0.48 +
-        bendVector.y,
-    };
-  }
-  const mid = cubicPoint(start, controlA, controlB, end, 0.5);
-  const label = cubicPoint(start, controlA, controlB, end, 0.68);
+  const points = buildTechnoPolylinePoints(start, end, fromAnchor, toAnchor, laneOffset);
+  const mid = pointAlongPolyline(points, 0.5);
+  const label = pointAlongPolyline(points, 0.5);
+  const controlA = points[1] ?? start;
+  const controlB = points[Math.max(0, points.length - 2)] ?? end;
 
   return {
-    path: `M ${start.x} ${start.y} C ${controlA.x} ${controlA.y}, ${controlB.x} ${controlB.y}, ${end.x} ${end.y}`,
+    path: buildPolylinePath(points, 12),
     mid,
     label,
     start,
     controlA,
     controlB,
     end,
+    points,
   };
 }
 
@@ -3646,7 +3806,7 @@ function buildEdgeLaneMap(edges: GraphEdge[]) {
       const assignReciprocalOffsets = (directionEdges: GraphEdge[], baseSign: 1 | -1) => {
         const center = (directionEdges.length - 1) / 2;
         directionEdges.forEach((edge, index) => {
-          laneMap.set(edge.id, baseSign * (48 + (index - center) * 22));
+          laneMap.set(edge.id, baseSign * (18 + (index - center) * 16));
         });
       };
 
@@ -3655,7 +3815,7 @@ function buildEdgeLaneMap(edges: GraphEdge[]) {
       return;
     }
 
-    const spacing = 34;
+    const spacing = 22;
     sorted.forEach((edge, index) => {
       laneMap.set(edge.id, (index - (sorted.length - 1) / 2) * spacing);
     });
@@ -3744,8 +3904,9 @@ function edgeIntersectsRect(
   rect: { x: number; y: number; width: number; height: number },
   geometry: ReturnType<typeof buildEdgeGeometry>,
 ) {
-  const cubicPoints = sampleCubic(geometry.start, geometry.controlA, geometry.controlB, geometry.end);
-  const samples = [geometry.start, ...cubicPoints, geometry.end];
+  const samples = geometry.points.length >= 2
+    ? geometry.points
+    : [geometry.start, ...sampleCubic(geometry.start, geometry.controlA, geometry.controlB, geometry.end), geometry.end];
   return samples.some((point) => pointInRect(point, rect, 10));
 }
 
@@ -3794,50 +3955,12 @@ function appendRoundedRectPath(path: Path2D, rect: Rect, radius: number) {
 }
 
 function buildCanvasNodePath(
-  shape: NodeShape,
+  _shape: NodeShape,
   rect: Rect,
 ) {
   const path = new Path2D();
-
-  switch (shape) {
-    case 'diamond':
-      path.moveTo(rect.x + rect.width * 0.12, rect.y + rect.height * 0.5);
-      path.lineTo(rect.x + rect.width * 0.5, rect.y + rect.height * 0.06);
-      path.lineTo(rect.x + rect.width * 0.88, rect.y + rect.height * 0.5);
-      path.lineTo(rect.x + rect.width * 0.5, rect.y + rect.height * 0.94);
-      path.closePath();
-      return path;
-    case 'hexagon':
-      path.moveTo(rect.x + rect.width * 0.15, rect.y);
-      path.lineTo(rect.x + rect.width * 0.85, rect.y);
-      path.lineTo(rect.x + rect.width, rect.y + rect.height * 0.5);
-      path.lineTo(rect.x + rect.width * 0.85, rect.y + rect.height);
-      path.lineTo(rect.x + rect.width * 0.15, rect.y + rect.height);
-      path.lineTo(rect.x, rect.y + rect.height * 0.5);
-      path.closePath();
-      return path;
-    case 'circle':
-      path.ellipse(
-        rect.x + rect.width / 2,
-        rect.y + rect.height / 2,
-        rect.width / 2,
-        rect.height / 2,
-        0,
-        0,
-        Math.PI * 2,
-      );
-      path.closePath();
-      return path;
-    case 'round':
-      appendRoundedRectPath(path, rect, Math.min(rect.height / 2, 999));
-      return path;
-    case 'database':
-    case 'subroutine':
-    case 'rect':
-    default:
-      appendRoundedRectPath(path, rect, 18);
-      return path;
-  }
+  path.rect(rect.x, rect.y, rect.width, rect.height);
+  return path;
 }
 
 function drawCanvasTextBlock(
@@ -3861,7 +3984,14 @@ function drawCanvasTextBlock(
   context.textBaseline = 'middle';
   context.font = `${fontWeight} ${fontSize}px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
   lines.forEach((line, index) => {
-    context.fillText(line || ' ', centerX, startY + index * lineHeight);
+    sceneTextCache.drawCenteredLine(
+      context,
+      line || ' ',
+      centerX,
+      startY + index * lineHeight,
+      context.font,
+      fill,
+    );
   });
   context.restore();
 }
@@ -3872,17 +4002,21 @@ function drawCanvasEdgeArrow(
   color: string,
   scale: number,
 ) {
-  const deltaX = geometry.end.x - geometry.controlB.x;
-  const deltaY = geometry.end.y - geometry.controlB.y;
+  const arrowSource = geometry.points.length >= 2
+    ? geometry.points[geometry.points.length - 2]
+    : geometry.controlB;
+  const deltaX = geometry.end.x - arrowSource.x;
+  const deltaY = geometry.end.y - arrowSource.y;
   const length = Math.hypot(deltaX, deltaY) || 1;
   const dirX = deltaX / length;
   const dirY = deltaY / length;
   const normalX = -dirY;
   const normalY = dirX;
-  const arrowLength = 12 * scale;
-  const arrowWidth = 6 * scale;
-  const tipX = geometry.end.x;
-  const tipY = geometry.end.y;
+  // Compact filled triangle, slightly pulled back from the node face
+  const arrowLength = 9 * scale;
+  const arrowWidth = 4.2 * scale;
+  const tipX = geometry.end.x - dirX * 1.5;
+  const tipY = geometry.end.y - dirY * 1.5;
   const baseX = tipX - dirX * arrowLength;
   const baseY = tipY - dirY * arrowLength;
 
@@ -3985,37 +4119,66 @@ function drawCanvasEdge(
   const edgeBaseColor = inheritsSourceColor
     ? getEndpointAccentColor(edgeInfo.fromEndpoint)
     : normalizedEdge.strokeColor;
-  const baseStrokeWidth = isGroupEdge ? normalizedEdge.strokeWidth * 2 : normalizedEdge.strokeWidth;
-  const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 4.2 : 3.2);
-  const outlineStroke = mixColors(edgeBaseColor, '#0f172a', isGroupEdge ? 0.56 : 0.5);
-  const outlineWidth = visualStrokeWidth + (isGroupEdge ? 0.34 : 0.26);
+  const baseStrokeWidth = isGroupEdge ? normalizedEdge.strokeWidth * 1.35 : normalizedEdge.strokeWidth;
+  const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 2.4 : 1.75);
   const path = new Path2D(edgeInfo.geometry.path);
   const simplified = zoom <= HYBRID_SCENE_SIMPLIFIED_ZOOM_THRESHOLD;
+  const dash = getEdgeDashArray(normalizedEdge.type);
 
   context.save();
   context.lineCap = 'round';
   context.lineJoin = 'round';
 
+  // Thin dark halo for contrast on black canvas — not a thick sticker plate
   if (!simplified) {
-    context.strokeStyle = outlineStroke;
-    context.globalAlpha = isGroupEdge ? 0.42 : 0.34;
-    context.lineWidth = outlineWidth;
+    context.strokeStyle = 'rgba(0, 0, 0, 0.72)';
+    context.lineWidth = visualStrokeWidth + 1.6;
+    if (dash) {
+      context.setLineDash(dash.split(' ').map(Number));
+    }
     context.stroke(path);
-    context.globalAlpha = 1;
+    context.setLineDash([]);
   }
 
   context.strokeStyle = withAlpha(edgeBaseColor, 1);
-  context.lineWidth = simplified ? Math.max(1.4, visualStrokeWidth * 0.72) : visualStrokeWidth;
-  if (normalizedEdge.type === 'dotted') {
-    context.setLineDash([6, 10]);
-  } else if (normalizedEdge.type === 'thick') {
-    context.lineWidth = Math.max(context.lineWidth, 4.8);
+  context.lineWidth = simplified
+    ? Math.max(1.2, visualStrokeWidth * 0.85)
+    : normalizedEdge.type === 'thick'
+      ? Math.max(visualStrokeWidth, 3.2)
+      : visualStrokeWidth;
+  if (dash) {
+    context.setLineDash(dash.split(' ').map(Number));
   }
   context.stroke(path);
   context.setLineDash([]);
 
   if (normalizedEdge.type !== 'line' && zoom >= HYBRID_SCENE_ARROW_ZOOM_THRESHOLD) {
-    drawCanvasEdgeArrow(context, edgeInfo.geometry, edgeBaseColor, isGroupEdge ? 1.08 : 1);
+    drawCanvasEdgeArrow(context, edgeInfo.geometry, edgeBaseColor, isGroupEdge ? 1.05 : 1);
+  }
+
+  if (edgeInfo.edge.label && zoom >= HYBRID_SCENE_DESCRIPTION_ZOOM_THRESHOLD) {
+    const metrics = measureEdgeLabelBadge(edgeInfo.edge.label);
+    const labelBackground = mixColors(edgeBaseColor, '#0c0c0e', 0.82);
+    const labelTextColor = getReadableLabelTextColor(labelBackground, '#ffffff');
+    const labelX = edgeInfo.geometry.label.x - metrics.width / 2;
+    const labelY = edgeInfo.geometry.label.y - metrics.height / 2;
+    const lines = edgeInfo.edge.label.split(/\r?\n/);
+
+    context.fillStyle = labelBackground;
+    context.strokeStyle = withAlpha(edgeBaseColor, 0.85);
+    context.lineWidth = 1;
+    context.fillRect(labelX, labelY, metrics.width, metrics.height);
+    context.strokeRect(labelX, labelY, metrics.width, metrics.height);
+    drawCanvasTextBlock(
+      context,
+      lines,
+      edgeInfo.geometry.label.x,
+      edgeInfo.geometry.label.y,
+      16,
+      11,
+      700,
+      labelTextColor,
+    );
   }
 
   context.restore();
@@ -4035,24 +4198,25 @@ function buildPreviewEdgePath(
       dirY: 0,
     }
     : getNodeAnchor(fromNode, currentPoint);
-  const deltaX = currentPoint.x - startAnchor.x;
-  const deltaY = currentPoint.y - startAnchor.y;
-  const distance = Math.max(1, Math.hypot(deltaX, deltaY));
-  const handleLength = Math.max(26, Math.min(72, distance * 0.3));
   const start = {
     x: startAnchor.x + startAnchor.dirX * 10,
     y: startAnchor.y + startAnchor.dirY * 10,
   };
-  const controlA = {
-    x: start.x + startAnchor.dirX * handleLength,
-    y: start.y + startAnchor.dirY * handleLength,
-  };
-  const controlB = {
-    x: currentPoint.x - deltaX * 0.22,
-    y: currentPoint.y - deltaY * 0.22,
-  };
+  const deltaX = currentPoint.x - start.x;
+  const deltaY = currentPoint.y - start.y;
+  const endAnchor =
+    Math.abs(deltaX) >= Math.abs(deltaY)
+      ? { dirX: deltaX >= 0 ? -1 : 1, dirY: 0 }
+      : { dirX: 0, dirY: deltaY >= 0 ? -1 : 1 };
 
-  return `M ${start.x} ${start.y} C ${controlA.x} ${controlA.y}, ${controlB.x} ${controlB.y}, ${currentPoint.x} ${currentPoint.y}`;
+  const points = buildTechnoPolylinePoints(
+    start,
+    currentPoint,
+    startAnchor,
+    endAnchor,
+    0,
+  );
+  return buildPolylinePath(points);
 }
 
 function duplicateNodesWithEdges(document: GraphDocument, sourceIds: string[], offset: Point) {
@@ -5163,17 +5327,76 @@ function buildSubgraphBlobPrimitives(
   maxDepth: number,
 ): BlobPrimitive[] {
   const layerBoost = Math.max(maxDepth - frame.depth, 0);
-  const nodePadding = clamp(34 + layerBoost * 10, 32, 86);
-  const nodeRadius = clamp(28 + layerBoost * 5, 24, 48);
-  const softness = clamp(92 + layerBoost * 24, 88, 180);
+  const nodePadding = clamp(58 + layerBoost * 18, 58, 132);
 
   return memberRects.map((rect) => ({
     kind: 'rounded-rect',
     rect: expandRect(rect, nodePadding),
-    radius: nodeRadius,
-    softness,
+    radius: 0,
+    softness: 0,
     weight: 1,
   }));
+}
+
+function buildPixelBlobPrimitiveClusters(primitives: BlobPrimitive[]) {
+  if (primitives.length <= 1) {
+    return primitives.length === 0 ? [] : [primitives];
+  }
+
+  const bounds = primitives.map((primitive) => primitiveBounds(primitive));
+  const visited = new Set<number>();
+  const clusters: BlobPrimitive[][] = [];
+
+  for (let index = 0; index < primitives.length; index += 1) {
+    if (visited.has(index)) {
+      continue;
+    }
+
+    const stack = [index];
+    const clusterIndices: number[] = [];
+    visited.add(index);
+
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current === undefined) {
+        continue;
+      }
+
+      clusterIndices.push(current);
+      for (let candidate = 0; candidate < primitives.length; candidate += 1) {
+        if (visited.has(candidate) || candidate === current) {
+          continue;
+        }
+
+        if (!rectsIntersect(bounds[current], bounds[candidate])) {
+          continue;
+        }
+
+        visited.add(candidate);
+        stack.push(candidate);
+      }
+    }
+
+    clusters.push(clusterIndices.map((clusterIndex) => primitives[clusterIndex]));
+  }
+
+  return clusters;
+}
+
+function rectToPixelLoop(rect: Rect) {
+  const snapped = {
+    x: snapRouteValue(rect.x, 8),
+    y: snapRouteValue(rect.y, 8),
+    width: Math.max(32, snapRouteValue(rect.width, 8)),
+    height: Math.max(32, snapRouteValue(rect.height, 8)),
+  };
+
+  return [
+    { x: snapped.x, y: snapped.y },
+    { x: snapped.x + snapped.width, y: snapped.y },
+    { x: snapped.x + snapped.width, y: snapped.y + snapped.height },
+    { x: snapped.x, y: snapped.y + snapped.height },
+  ];
 }
 
 function buildBlobPrimitiveClusters(
@@ -5470,21 +5693,12 @@ function buildSmoothClosedPath(points: Point[]) {
       y: minY,
       width: Math.max(32, maxX - minX),
       height: Math.max(32, maxY - minY),
-    }, 18);
+    }, 0);
   }
 
-  const midpoints = points.map((point, index) => {
-    const next = points[(index + 1) % points.length];
-    return {
-      x: (point.x + next.x) / 2,
-      y: (point.y + next.y) / 2,
-    };
-  });
-
-  const commands = [`M ${midpoints[midpoints.length - 1].x} ${midpoints[midpoints.length - 1].y}`];
-  points.forEach((point, index) => {
-    commands.push(`Q ${point.x} ${point.y} ${midpoints[index].x} ${midpoints[index].y}`);
-  });
+  const commands = points.map((point, index) =>
+    `${index === 0 ? 'M' : 'L'} ${snapRouteValue(point.x, 8)} ${snapRouteValue(point.y, 8)}`
+  );
   commands.push('Z');
   return commands.join(' ');
 }
@@ -5618,13 +5832,15 @@ function buildSubgraphBlobContours(
   frame: SubgraphFrame,
   memberRects: Rect[],
   maxDepth: number,
-  detail: BlobContourDetail = 'full',
+  _detail: BlobContourDetail = 'full',
 ) {
-  const layerBoost = Math.max(maxDepth - frame.depth, 0);
-  const fieldThreshold = clamp(0.5 - layerBoost * 0.035, 0.34, 0.5);
+  const fieldThreshold = 0.5;
   const primitives = buildSubgraphBlobPrimitives(frame, memberRects, maxDepth);
-  const loops = buildBlobPrimitiveClusters(primitives, fieldThreshold)
-    .flatMap((cluster) => buildBlobContourLoopsForPrimitives(cluster, fieldThreshold, detail));
+  const loops = buildPixelBlobPrimitiveClusters(primitives)
+    .flatMap((cluster) => {
+      const bounds = buildBlobPrimitiveBounds(cluster);
+      return bounds ? [rectToPixelLoop(bounds)] : [];
+    });
   return {
     loops,
     primitives,
@@ -5688,14 +5904,14 @@ function buildSubgraphBlobShapes(
         primitives: [{
           kind: 'rounded-rect',
           rect: bounds,
-          radius: 22,
+          radius: 0,
           softness: 0,
           weight: 1,
         }],
-        regions: [{
-          bounds,
-          path: buildRoundedRectPath(bounds, 22),
-        }],
+      regions: [{
+        bounds,
+        path: buildRoundedRectPath(bounds, 0),
+      }],
       };
     }
 
@@ -5718,17 +5934,17 @@ function buildSubgraphBlobShapes(
           }))) ?? fallbackBounds;
           return {
             bounds,
-            path: buildSmoothClosedPath(smoothClosedPolygon(loop, detail === 'interactive' ? 1 : 3)),
+            path: buildSmoothClosedPath(loop),
           };
         })
       : [{
           bounds: fallbackBounds,
-          path: buildRoundedRectPath(fallbackBounds, 34),
+          path: buildRoundedRectPath(fallbackBounds, 0),
         }];
     const bounds = buildRectBounds(regions.map((region) => region.bounds)) ?? fallbackBounds;
     const largestRegion = regions[0] ?? {
       bounds,
-      path: buildRoundedRectPath(bounds, 34),
+      path: buildRoundedRectPath(bounds, 0),
     };
 
     return {
@@ -5844,13 +6060,15 @@ function distancePointToEdgeGeometry(
   point: Point,
   geometry: ReturnType<typeof buildEdgeGeometry>,
 ) {
-  const samples = sampleCubic(
-    geometry.start,
-    geometry.controlA,
-    geometry.controlB,
-    geometry.end,
-    20,
-  );
+  const samples = geometry.points.length >= 2
+    ? geometry.points
+    : sampleCubic(
+      geometry.start,
+      geometry.controlA,
+      geometry.controlB,
+      geometry.end,
+      20,
+    );
 
   let minDistance = Number.POSITIVE_INFINITY;
   for (let index = 1; index < samples.length; index += 1) {
@@ -5891,6 +6109,65 @@ function findEdgeDropTarget(
       laneMap.get(edge.id) ?? 0,
       endpointOffsets.get(edge.id),
     );
+    const distance = distancePointToEdgeGeometry(point, geometry);
+    if (distance > 18) {
+      continue;
+    }
+
+    if (!bestMatch || distance < bestMatch.distance) {
+      bestMatch = { edgeId: edge.id, distance };
+    }
+  }
+
+  return bestMatch?.edgeId ?? null;
+}
+
+function findNodeDropTargetFromEntries(
+  entries: SceneIndexEntry<GraphNode>[],
+  point: Point,
+  excludedIds: string[] = [],
+) {
+  const excluded = new Set(excludedIds);
+
+  return entries
+    .filter((entry) => !excluded.has(entry.item.id))
+    .sort((left, right) => left.item.width * left.item.height - right.item.width * right.item.height)[0]?.item.id ?? null;
+}
+
+function findSubgraphDropTargetFromEntries(
+  entries: SceneIndexEntry<SubgraphBlobShape>[],
+  point: Point,
+  excludedIds: string[] = [],
+) {
+  const excluded = new Set(excludedIds);
+
+  return entries
+    .map((entry) => entry.item)
+    .filter((shape) => !excluded.has(shape.id))
+    .filter((shape) => subgraphShapeContainsPoint(shape, point))
+    .sort((left, right) => {
+      if (left.depth !== right.depth) {
+        return right.depth - left.depth;
+      }
+
+      return left.bounds.width * left.bounds.height - right.bounds.width * right.bounds.height;
+    })[0]?.id ?? null;
+}
+
+function findEdgeDropTargetFromEntries(
+  point: Point,
+  entries: SceneIndexEntry<SceneRenderableEdge>[],
+  excludedEndpointIds: string[] = [],
+) {
+  const excluded = new Set(excludedEndpointIds);
+  let bestMatch: { edgeId: string; distance: number } | null = null;
+
+  for (const entry of entries) {
+    const { edge, geometry } = entry.item;
+    if (excluded.has(edge.from) || excluded.has(edge.to)) {
+      continue;
+    }
+
     const distance = distancePointToEdgeGeometry(point, geometry);
     if (distance > 18) {
       continue;
@@ -7222,9 +7499,9 @@ export default function App() {
     label: '',
     description: '',
     shape: 'rect',
-    fill: '#fff8ef',
-    stroke: '#24404f',
-    textColor: '#12212c',
+    fill: '#121214',
+    stroke: '#d6ff3a',
+    textColor: '#f4f4f5',
   });
   const [edgeInspectorDraft, setEdgeInspectorDraft] = useState<EdgeInspectorDraft>({
     label: '',
@@ -7365,6 +7642,21 @@ export default function App() {
   const editingSubgraphTitleRef = useRef(editingSubgraphTitle);
   const gestureStateRef = useRef<GestureState | null>(null);
   const perfMetricsRef = useRef<Map<string, PerfMetricAccumulator>>(new Map());
+  /** Live viewport for pan/zoom frames — avoids setDocumentState per pointermove. */
+  const liveViewportRef = useRef<ViewportState>(documentState.layout.viewport);
+  const panCommitNeededRef = useRef(false);
+  const baseNodeSceneCacheRef = useRef(new BaseSceneCache<GraphNode>());
+  const topologyRevisionRef = useRef('');
+  const viewportPaintFrameRef = useRef<number | null>(null);
+  const viewportCommitTimerRef = useRef<number | null>(null);
+  /** Full topology paint sources (NOT viewport-pre-culled) for live pan/zoom paint. */
+  const hybridPaintTopologyRef = useRef<{
+    nodes: GraphNode[];
+    edges: Array<SceneRenderableEdge & {
+      id: string;
+      bounds: { x: number; y: number; width: number; height: number };
+    }>;
+  }>({ nodes: [], edges: [] });
   const perfCountersRef = useRef(createPerfCounterSnapshot());
   const perfWindowStartedAtRef = useRef(performance.now());
   const perfRenderCountRef = useRef(0);
@@ -7378,6 +7670,20 @@ export default function App() {
     metaKey: boolean;
     shiftKey: boolean;
   } | null>(null);
+  const liveDragStateRef = useRef<DragState | null>(null);
+  const dragPreviewFrameRef = useRef<number | null>(null);
+  const dragPreviewIdsRef = useRef<Set<string>>(new Set());
+  const dragDropTargetsRef = useRef<{
+    nodeId: string | null;
+    edgeId: string | null;
+    subgraphId: string | null;
+    reparentMode: boolean;
+  }>({
+    nodeId: null,
+    edgeId: null,
+    subgraphId: null,
+    reparentMode: false,
+  });
   const backgroundHoldRef = useRef<number | null>(null);
   const pendingBackgroundRef = useRef<{
     clientX: number;
@@ -7419,23 +7725,97 @@ export default function App() {
     return result;
   }, [perfDebugEnabled, recordPerfMetric]);
 
+  const clearImperativeDragPreview = useCallback(() => {
+    if (dragPreviewFrameRef.current !== null) {
+      window.cancelAnimationFrame(dragPreviewFrameRef.current);
+      dragPreviewFrameRef.current = null;
+    }
+
+    const board = canvasBoardRef.current;
+    if (board) {
+      board.querySelectorAll<HTMLElement>(`.graph-node.${NODE_DRAG_PREVIEW_CLASS}`).forEach((element) => {
+        element.classList.remove(NODE_DRAG_PREVIEW_CLASS);
+        element.style.removeProperty('--lmd-drag-x');
+        element.style.removeProperty('--lmd-drag-y');
+      });
+    }
+
+    dragPreviewIdsRef.current.clear();
+  }, []);
+
+  /**
+   * Live drag: rAF-coalesce React dragState so node positions + edge geometry
+   * update every frame while dragging (not only on pointerup).
+   * Absolute positions come from applyDragPreview(previewNodes) — CSS translate
+   * is intentionally not applied (would double-offset).
+   */
+  const scheduleImperativeDragPreview = useCallback((nextDragState: DragState | null) => {
+    liveDragStateRef.current = nextDragState;
+
+    if (dragPreviewFrameRef.current !== null) {
+      return;
+    }
+
+    dragPreviewFrameRef.current = window.requestAnimationFrame(() => {
+      dragPreviewFrameRef.current = null;
+      const liveDragState = liveDragStateRef.current;
+      if (!liveDragState) {
+        return;
+      }
+      setDragState(liveDragState);
+    });
+  }, []);
+
+  const beginLiveDrag = useCallback((nextDragState: DragState) => {
+    liveDragStateRef.current = nextDragState;
+    clearImperativeDragPreview();
+    setDragState(nextDragState);
+  }, [clearImperativeDragPreview]);
+
+  const endLiveDrag = useCallback(() => {
+    liveDragStateRef.current = null;
+    if (dragPreviewFrameRef.current !== null) {
+      window.cancelAnimationFrame(dragPreviewFrameRef.current);
+      dragPreviewFrameRef.current = null;
+    }
+    clearImperativeDragPreview();
+    dragDropTargetsRef.current = {
+      nodeId: null,
+      edgeId: null,
+      subgraphId: null,
+      reparentMode: false,
+    };
+    setDragState(null);
+    setDragTargetNodeId(null);
+    setDragTargetEdgeId(null);
+    setDragTargetSubgraphId(null);
+    setDragReparentMode(false);
+  }, [clearImperativeDragPreview]);
+
   const deferredSource = useDeferredValue(sourceDraft);
   const sourceParseError = useMemo(() => {
+    if (mode !== 'source') {
+      return null;
+    }
+
     return measurePerf('parseProjectMarkdown:deferredSource', () => {
       try {
         parseProjectMarkdown(
           deferredSource,
           documentState.projectName ?? 'Untitled Project',
-          documentState.layout,
+          documentRef.current.layout,
         );
         return null;
       } catch (error) {
         return error instanceof Error ? error.message : '无法解析工程 Markdown。';
       }
     });
-  }, [deferredSource, documentState.layout, documentState.projectName, measurePerf]);
+  }, [deferredSource, documentState.projectName, measurePerf, mode]);
 
-  const subgraphLookup = getVisibleSubgraphIds(documentState.subgraphs);
+  const subgraphLookup = useMemo(
+    () => getVisibleSubgraphIds(documentState.subgraphs),
+    [documentState.subgraphs],
+  );
   const fullSubgraphLookup = subgraphLookup;
   const previewNodes = useMemo(
     () => measurePerf('applyDragPreview', () => applyDragPreview(documentState.nodes, dragState)),
@@ -7590,15 +7970,32 @@ export default function App() {
     selection,
     subgraphFrames,
   ]);
-  const visibleNodes = previewNodes.filter(
-    (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
+  const visibleNodes = useMemo(
+    () => previewNodes.filter((node) => !isInsideCollapsedSubgraph(node, subgraphLookup)),
+    [previewNodes, subgraphLookup],
   );
-  const visibleSubgraphNodes = subgraphPreviewNodes.filter(
-    (node) => !isInsideCollapsedSubgraph(node, subgraphLookup),
+  const visibleSubgraphNodes = useMemo(
+    () => subgraphPreviewNodes.filter((node) => !isInsideCollapsedSubgraph(node, subgraphLookup)),
+    [subgraphLookup, subgraphPreviewNodes],
   );
   const hybridSceneDensityHint = mode === 'canvas' && (
     visibleSubgraphNodes.length >= HYBRID_SCENE_NODE_THRESHOLD ||
     documentState.edges.length >= HYBRID_SCENE_EDGE_THRESHOLD
+  );
+  // Build blob geometry from full topology only — never rebuild shapes on pan/zoom.
+  // Viewport culling is applied later when painting/DOM-listing shapes.
+  const subgraphBlobDetail: BlobContourDetail = dragState ? 'interactive' : 'full';
+  const subgraphBlobShapes = useMemo(
+    () => measurePerf(
+      `buildSubgraphBlobShapes:${subgraphBlobDetail}`,
+      () => buildSubgraphBlobShapes(
+        documentState.subgraphs,
+        subgraphFrames,
+        visibleSubgraphNodes,
+        subgraphBlobDetail,
+      ),
+    ),
+    [documentState.subgraphs, measurePerf, subgraphBlobDetail, subgraphFrames, visibleSubgraphNodes],
   );
   const blobVisibleSubgraphIds = useMemo(() => {
     if (!hybridSceneDensityHint || !sceneRenderRect) {
@@ -7606,45 +8003,18 @@ export default function App() {
     }
 
     return new Set(
-      subgraphFrames
-        .filter((frame) => intersects(sceneRenderRect, frame))
-        .map((frame) => frame.id),
+      subgraphBlobShapes
+        .filter((shape) => intersects(sceneRenderRect, shape.bounds))
+        .map((shape) => shape.id),
     );
-  }, [documentState.subgraphs, hybridSceneDensityHint, sceneRenderRect, subgraphFrames]);
-  const blobRenderableSubgraphs = useMemo(
+  }, [documentState.subgraphs, hybridSceneDensityHint, sceneRenderRect, subgraphBlobShapes]);
+  const viewportCulledBlobShapes = useMemo(
     () => (
       hybridSceneDensityHint
-        ? documentState.subgraphs.filter((subgraph) => blobVisibleSubgraphIds.has(subgraph.id))
-        : documentState.subgraphs
+        ? subgraphBlobShapes.filter((shape) => blobVisibleSubgraphIds.has(shape.id))
+        : subgraphBlobShapes
     ),
-    [blobVisibleSubgraphIds, documentState.subgraphs, hybridSceneDensityHint],
-  );
-  const blobRenderableFrames = useMemo(
-    () => (
-      hybridSceneDensityHint
-        ? subgraphFrames.filter((frame) => blobVisibleSubgraphIds.has(frame.id))
-        : subgraphFrames
-    ),
-    [blobVisibleSubgraphIds, hybridSceneDensityHint, subgraphFrames],
-  );
-  const blobRenderableNodes = useMemo(
-    () => (
-      hybridSceneDensityHint
-        ? visibleSubgraphNodes.filter((node) =>
-          !node.subgraphId ||
-          blobVisibleSubgraphIds.has(node.subgraphId) ||
-          (sceneRenderRect ? intersects(sceneRenderRect, node) : true))
-        : visibleSubgraphNodes
-    ),
-    [blobVisibleSubgraphIds, hybridSceneDensityHint, sceneRenderRect, visibleSubgraphNodes],
-  );
-  const subgraphBlobDetail: BlobContourDetail = dragState ? 'interactive' : 'full';
-  const subgraphBlobShapes = useMemo(
-    () => measurePerf(
-      `buildSubgraphBlobShapes:${subgraphBlobDetail}`,
-      () => buildSubgraphBlobShapes(blobRenderableSubgraphs, blobRenderableFrames, blobRenderableNodes, subgraphBlobDetail),
-    ),
-    [blobRenderableFrames, blobRenderableNodes, blobRenderableSubgraphs, measurePerf, subgraphBlobDetail],
+    [blobVisibleSubgraphIds, hybridSceneDensityHint, subgraphBlobShapes],
   );
   const subgraphBlobShapeMap = useMemo(
     () => new Map(subgraphBlobShapes.map((shape) => [shape.id, shape])),
@@ -7853,6 +8223,10 @@ export default function App() {
     subgraphFrameCount: subgraphFrames.length,
     blobRegionCount: subgraphBlobShapes.reduce((total, shape) => total + shape.regions.length, 0),
     blobPrimitiveCount: subgraphBlobShapes.reduce((total, shape) => total + shape.primitives.length, 0),
+    canvasNodeCount: 0,
+    canvasEdgeCount: 0,
+    overlayNodeCount: 0,
+    overlayEdgeCount: 0,
   };
   const canvasSearchResults = useMemo<CanvasSearchResult[]>(() => {
     const query = canvasSearchQuery.trim().toLowerCase();
@@ -7927,24 +8301,12 @@ export default function App() {
     [canvasSearchResults],
   );
   const hybridSceneActive = hybridSceneDensityHint;
-  const sceneRenderableNodes = useMemo(
-    () => (
-      sceneRenderRect
-        ? visibleNodes.filter((node) => intersects(sceneRenderRect, node))
-        : visibleNodes
-    ),
-    [sceneRenderRect, visibleNodes],
-  );
-  const sceneRenderableEdges = useMemo<SceneRenderableEdge[]>(
-    () => visibleEdges.flatMap((edge) => {
+  // Full topology edge geometry — rebuilt only when endpoints/lanes change, NEVER on pan/zoom.
+  const topologySceneEdges = useMemo<SceneRenderableEdge[]>(
+    () => measurePerf('buildTopologySceneEdges', () => visibleEdges.flatMap((edge) => {
       const fromEndpoint = edgeEndpointMap.get(edge.from);
       const toEndpoint = edgeEndpointMap.get(edge.to);
       if (!fromEndpoint || !toEndpoint) {
-        return [];
-      }
-
-      const approximateBounds = buildEdgeApproxBounds(fromEndpoint, toEndpoint);
-      if (sceneRenderRect && !intersects(sceneRenderRect, approximateBounds)) {
         return [];
       }
 
@@ -7959,9 +8321,86 @@ export default function App() {
           edgeEndpointOffsetMap.get(edge.id),
         ),
       }];
-    }),
-    [edgeEndpointMap, edgeEndpointOffsetMap, edgeLaneMap, sceneRenderRect, visibleEdges],
+    })),
+    [edgeEndpointMap, edgeEndpointOffsetMap, edgeLaneMap, measurePerf, visibleEdges],
   );
+  // Viewport cull is a derived view for React lists / hit-tests under current committed viewport.
+  // Live pan/zoom paint must use topologySceneEdges + live worldRect instead.
+  const sceneRenderableNodes = useMemo(
+    () => (
+      sceneRenderRect
+        ? visibleNodes.filter((node) => intersects(sceneRenderRect, node))
+        : visibleNodes
+    ),
+    [sceneRenderRect, visibleNodes],
+  );
+  const sceneRenderableEdges = useMemo<SceneRenderableEdge[]>(
+    () => (
+      sceneRenderRect
+        ? topologySceneEdges.filter((entry) => intersects(
+          sceneRenderRect,
+          buildEdgeApproxBounds(entry.fromEndpoint, entry.toEndpoint),
+        ))
+        : topologySceneEdges
+    ),
+    [sceneRenderRect, topologySceneEdges],
+  );
+  const visibleNodeSpatialIndex = useMemo(
+    () => new SceneSpatialIndex<GraphNode>(
+      visibleNodes.map((node) => ({
+        id: node.id,
+        rect: node,
+        item: node,
+      })),
+      SCENE_INDEX_BUCKET_SIZE,
+    ),
+    [visibleNodes],
+  );
+  const sceneNodeSpatialIndex = useMemo(
+    () => new SceneSpatialIndex<GraphNode>(
+      sceneRenderableNodes.map((node) => ({
+        id: node.id,
+        rect: node,
+        item: node,
+      })),
+      SCENE_INDEX_BUCKET_SIZE,
+    ),
+    [sceneRenderableNodes],
+  );
+  const sceneEdgeSpatialIndex = useMemo(
+    () => new SceneSpatialIndex<SceneRenderableEdge>(
+      sceneRenderableEdges.map((entry) => ({
+        id: entry.edge.id,
+        rect: buildEdgeApproxBounds(entry.fromEndpoint, entry.toEndpoint, 72),
+        item: entry,
+      })),
+      SCENE_EDGE_INDEX_BUCKET_SIZE,
+    ),
+    [sceneRenderableEdges],
+  );
+  const subgraphBlobSpatialIndex = useMemo(
+    () => new SceneSpatialIndex<SubgraphBlobShape>(
+      subgraphBlobShapes.map((shape) => ({
+        id: shape.id,
+        rect: shape.bounds,
+        item: shape,
+      })),
+      SCENE_INDEX_BUCKET_SIZE,
+    ),
+    [subgraphBlobShapes],
+  );
+  // Topology revision: pan/zoom/selection must not change this string.
+  const topologyRevision = useMemo(
+    () => topologyRevisionFromGraph({
+      nodes: documentState.nodes,
+      edges: documentState.edges,
+      subgraphs: documentState.subgraphs,
+    }),
+    [documentState.edges, documentState.nodes, documentState.subgraphs],
+  );
+  topologyRevisionRef.current = topologyRevision;
+  // Rebuild spatial base only when topology (or committed node set) changes — not on pan.
+  baseNodeSceneCacheRef.current.ensure(topologyRevision, visibleNodes);
   const sceneInteractiveNodeIds = useMemo(() => {
     const ids = new Set<string>();
     if (selection.kind === 'node') {
@@ -8005,8 +8444,49 @@ export default function App() {
     if (dragTargetEdgeId) {
       ids.add(dragTargetEdgeId);
     }
+    // While dragging nodes/subgraphs, keep incident edges on the live overlay
+    // so geometry tracks preview positions every frame (not only on pointerup).
+    if (dragState && dragState.kind !== 'content') {
+      const moving = new Set(dragState.ids);
+      if (dragState.kind === 'subgraph' && dragState.entityId) {
+        moving.add(dragState.entityId);
+      }
+      documentState.edges.forEach((edge) => {
+        if (moving.has(edge.from) || moving.has(edge.to)) {
+          ids.add(edge.id);
+        }
+      });
+    }
     return ids;
-  }, [dragTargetEdgeId, editingEdgeId, selection]);
+  }, [documentState.edges, dragState, dragTargetEdgeId, editingEdgeId, selection]);
+  // Full topology canvas sources (exclude only interactive overlay entities) — not viewport-pre-culled.
+  const topologyCanvasNodes = useMemo(
+    () => (
+      hybridSceneActive
+        ? visibleNodes.filter((node) => !sceneInteractiveNodeIds.has(node.id))
+        : []
+    ),
+    [hybridSceneActive, sceneInteractiveNodeIds, visibleNodes],
+  );
+  const topologyCanvasEdges = useMemo(
+    () => (
+      hybridSceneActive
+        ? topologySceneEdges
+          .filter((entry) => !sceneInteractiveEdgeIds.has(entry.edge.id))
+          .map((entry) => ({
+            ...entry,
+            id: entry.edge.id,
+            bounds: buildEdgeApproxBounds(entry.fromEndpoint, entry.toEndpoint, 72),
+          }))
+        : []
+    ),
+    [hybridSceneActive, sceneInteractiveEdgeIds, topologySceneEdges],
+  );
+  hybridPaintTopologyRef.current = {
+    nodes: topologyCanvasNodes,
+    edges: topologyCanvasEdges,
+  };
+  // Viewport-culled lists for React overlay chrome under committed viewport (not live pan paint).
   const sceneCanvasNodes = useMemo(
     () => (
       hybridSceneActive
@@ -8039,6 +8519,13 @@ export default function App() {
     ),
     [hybridSceneActive, sceneInteractiveEdgeIds, sceneRenderableEdges],
   );
+  perfSnapshotRef.current = {
+    ...perfSnapshotRef.current,
+    canvasNodeCount: sceneCanvasNodes.length,
+    canvasEdgeCount: sceneCanvasEdges.length,
+    overlayNodeCount: sceneOverlayNodes.length,
+    overlayEdgeCount: sceneOverlayEdges.length,
+  };
 
   useEffect(() => {
     const canvas = sceneCanvasRef.current;
@@ -8069,32 +8556,42 @@ export default function App() {
     }
 
     measurePerf('renderSceneCanvas', () => {
+      hotPathCounters.fullCanvasClearPaint += 1;
+      const viewport = liveViewportRef.current;
       context.setTransform(1, 0, 0, 1, 0, 0);
       context.clearRect(0, 0, canvas.width, canvas.height);
       context.setTransform(dpr, 0, 0, dpr, 0, 0);
       context.imageSmoothingEnabled = true;
-      context.translate(documentState.layout.viewport.x, documentState.layout.viewport.y);
-      context.scale(documentState.layout.viewport.zoom, documentState.layout.viewport.zoom);
+      context.translate(viewport.x, viewport.y);
+      context.scale(viewport.zoom, viewport.zoom);
 
-      sceneCanvasEdges.forEach((entry) => {
-        drawCanvasEdge(
-          context,
-          entry,
-          documentState.layout.viewport.zoom,
-        );
+      const surfaceBounds = surface.getBoundingClientRect();
+      const worldRect = viewportToWorldRect(
+        viewport as HotPathViewport,
+        surfaceBounds.width,
+        surfaceBounds.height,
+        HYBRID_SCENE_VIEWPORT_MARGIN_PX,
+      );
+      // Paint from full topology sources + live cull (same path as imperative pan).
+      const paintSource = hybridPaintTopologyRef.current;
+      const edgesToDraw = selectPaintEdgesFromTopology(paintSource.edges, worldRect);
+      const nodesToDraw = selectPaintNodesFromTopology(paintSource.nodes, worldRect);
+
+      edgesToDraw.forEach((entry) => {
+        drawCanvasEdge(context, entry, viewport.zoom);
       });
-
-      sceneCanvasNodes.forEach((node) => {
-        drawCanvasNode(context, node, documentState.layout.viewport.zoom);
+      nodesToDraw.forEach((node) => {
+        drawCanvasNode(context, node, viewport.zoom);
       });
     });
   }, [
-    documentState.layout.viewport,
+    // Topology/overlay inputs — continuous pan/zoom paint via applyImperativeViewportTransform.
+    topologyRevision,
+    topologyCanvasNodes,
+    topologyCanvasEdges,
     hybridSceneActive,
     measurePerf,
     mode,
-    sceneCanvasEdges,
-    sceneCanvasNodes,
   ]);
 
   const graphTreeItems = useMemo(
@@ -8555,13 +9052,145 @@ export default function App() {
     setInspectorOpen(true);
   }, []);
 
+  const applyImperativeViewportTransform = useCallback((viewport: ViewportState) => {
+    liveViewportRef.current = viewport;
+    hotPathCounters.viewportLiveApplies += 1;
+    // Keep document ref layout in sync for hit-tests / commits without React re-derive.
+    if (documentRef.current.layout.viewport !== viewport) {
+      documentRef.current = {
+        ...documentRef.current,
+        layout: {
+          ...documentRef.current.layout,
+          viewport,
+        },
+      };
+    }
+
+    const board = canvasBoardRef.current;
+    if (board) {
+      const bounds = canvasBoardBounds;
+      board.style.transform =
+        `translate(${viewport.x + bounds.x * viewport.zoom}px, ${viewport.y + bounds.y * viewport.zoom}px) scale(${viewport.zoom})`;
+    }
+
+    const canvas = sceneCanvasRef.current;
+    const surface = canvasRef.current;
+    if (!canvas || !surface || !hybridSceneActive || mode !== 'canvas') {
+      return;
+    }
+
+    if (viewportPaintFrameRef.current !== null) {
+      return;
+    }
+
+    viewportPaintFrameRef.current = window.requestAnimationFrame(() => {
+      viewportPaintFrameRef.current = null;
+      const context = canvas.getContext('2d');
+      if (!context) {
+        return;
+      }
+
+      const liveViewport = liveViewportRef.current;
+      const surfaceBounds = surface.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const targetWidth = Math.max(1, Math.floor(surfaceBounds.width * dpr));
+      const targetHeight = Math.max(1, Math.floor(surfaceBounds.height * dpr));
+      if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+      }
+
+      hotPathCounters.incrementalPaint += 1;
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+      context.imageSmoothingEnabled = true;
+      context.translate(liveViewport.x, liveViewport.y);
+      context.scale(liveViewport.zoom, liveViewport.zoom);
+
+      // CRITICAL: cull from FULL topology paint source + live world rect.
+      // Never iterate a viewport-pre-culled React list (stale during pan).
+      const worldRect = viewportToWorldRect(
+        liveViewport as HotPathViewport,
+        surfaceBounds.width,
+        surfaceBounds.height,
+        HYBRID_SCENE_VIEWPORT_MARGIN_PX,
+      );
+      const paintSource = hybridPaintTopologyRef.current;
+      const nodesToDraw = selectPaintNodesFromTopology(paintSource.nodes, worldRect);
+      const edgesToDraw = selectPaintEdgesFromTopology(paintSource.edges, worldRect);
+
+      edgesToDraw.forEach((entry) => {
+        drawCanvasEdge(context, entry, liveViewport.zoom);
+      });
+      nodesToDraw.forEach((node) => {
+        drawCanvasNode(context, node, liveViewport.zoom);
+      });
+    });
+  }, [
+    canvasBoardBounds.x,
+    canvasBoardBounds.y,
+    canvasBoardBounds.width,
+    canvasBoardBounds.height,
+    hybridSceneActive,
+    mode,
+  ]);
+
+  const commitLiveViewportToDocument = useCallback(() => {
+    const next = liveViewportRef.current;
+    panCommitNeededRef.current = false;
+    if (viewportCommitTimerRef.current !== null) {
+      window.clearTimeout(viewportCommitTimerRef.current);
+      viewportCommitTimerRef.current = null;
+    }
+    setDocumentState((current) => {
+      if (
+        current.layout.viewport.x === next.x &&
+        current.layout.viewport.y === next.y &&
+        current.layout.viewport.zoom === next.zoom
+      ) {
+        return current;
+      }
+      hotPathCounters.viewportDocumentCommits += 1;
+      return {
+        ...current,
+        layout: {
+          ...current.layout,
+          viewport: { ...next },
+        },
+      };
+    });
+  }, []);
+
+  /** Continuous interaction (wheel/pan): live transform only; debounced document commit. */
+  const applyLiveViewportUpdate = useCallback(
+    (updater: (viewport: ViewportState) => ViewportState) => {
+      const next = updater(liveViewportRef.current);
+      panCommitNeededRef.current = true;
+      applyImperativeViewportTransform(next);
+      if (viewportCommitTimerRef.current !== null) {
+        window.clearTimeout(viewportCommitTimerRef.current);
+      }
+      viewportCommitTimerRef.current = window.setTimeout(() => {
+        viewportCommitTimerRef.current = null;
+        commitLiveViewportToDocument();
+      }, 140);
+    },
+    [applyImperativeViewportTransform, commitLiveViewportToDocument],
+  );
+
+  /** Discrete viewport changes (toolbar fit/zoom buttons): commit immediately. */
   const updateViewport = useCallback(
     (updater: (viewport: ViewportState) => ViewportState) => {
+      const base = liveViewportRef.current;
+      const next = updater(base);
+      liveViewportRef.current = next;
+      hotPathCounters.viewportDocumentCommits += 1;
       setDocumentState((current) => ({
         ...current,
         layout: {
           ...current.layout,
-          viewport: updater(current.layout.viewport),
+          viewport: next,
         },
       }));
     },
@@ -8596,19 +9225,19 @@ export default function App() {
     (
       clientX: number,
       clientY: number,
-      viewport = documentState.layout.viewport,
+      // Default MUST be live viewport — document lag after wheel/pan blanks hit-tests.
+      viewport: ViewportState = resolveInteractionViewport(
+        liveViewportRef.current as HotPathViewport,
+      ),
     ) => {
       const bounds = canvasRef.current?.getBoundingClientRect();
       if (!bounds) {
         return null;
       }
 
-      return {
-        x: (clientX - bounds.left - viewport.x) / viewport.zoom,
-        y: (clientY - bounds.top - viewport.y) / viewport.zoom,
-      };
+      return clientToWorldPoint(clientX, clientY, bounds, viewport as HotPathViewport);
     },
-    [documentState.layout.viewport],
+    [],
   );
 
   const keepNodeEditorVisibleInCanvas = useCallback((rect: Rect) => {
@@ -8653,27 +9282,27 @@ export default function App() {
   }, [updateViewport]);
 
   const zoomViewportAtPoint = useCallback(
-    (clientX: number, clientY: number, zoomFactor: number) => {
+    (clientX: number, clientY: number, zoomFactor: number, options?: { commit?: 'live' | 'document' }) => {
       const bounds = canvasRef.current?.getBoundingClientRect();
       if (!bounds) {
         return;
       }
 
-      updateViewport((viewport) => {
+      const mode = options?.commit ?? 'live';
+      const apply = mode === 'document' ? updateViewport : applyLiveViewportUpdate;
+      apply((viewport) => {
         const pointerX = clientX - bounds.left;
         const pointerY = clientY - bounds.top;
-        const nextZoom = clamp(viewport.zoom * zoomFactor, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM);
-        const worldX = (pointerX - viewport.x) / viewport.zoom;
-        const worldY = (pointerY - viewport.y) / viewport.zoom;
-
-        return {
-          zoom: nextZoom,
-          x: pointerX - worldX * nextZoom,
-          y: pointerY - worldY * nextZoom,
-        };
+        return applyWheelZoomViewport(
+          viewport as HotPathViewport,
+          { x: pointerX, y: pointerY },
+          zoomFactor,
+          MIN_CANVAS_ZOOM,
+          MAX_CANVAS_ZOOM,
+        );
       });
     },
-    [updateViewport],
+    [applyLiveViewportUpdate, updateViewport],
   );
 
   const focusViewportOnRect = useCallback(
@@ -9766,8 +10395,8 @@ export default function App() {
       const id = `edge-arrow-${markerIds.size}`;
       markerIds.set(color, id);
       markerDefs.push(`
-        <marker id="${id}" markerWidth="13.2" markerHeight="13.2" refX="10.6" refY="6.6" orient="auto" markerUnits="userSpaceOnUse">
-          <path d="M0,0 L13.2,6.6 L0,13.2 z" fill="${escapeSvgText(color)}" stroke="${escapeSvgText(mixColors(color, '#0f172a', 0.22))}" stroke-width="0.45" />
+        <marker id="${id}" markerWidth="10" markerHeight="8" refX="8.5" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0.6 L9,4 L0,7.4 Z" fill="${escapeSvgText(color)}" />
         </marker>
       `);
       return id;
@@ -9974,26 +10603,28 @@ export default function App() {
       );
       const inheritsSourceColor = shouldInheritSourceEdgeColor(normalizedEdge.strokeColor);
       const edgeBaseColor = inheritsSourceColor ? getEndpointAccentColor(fromNode) : normalizedEdge.strokeColor;
-      const baseStrokeWidth = isGroupEdge ? normalizedEdge.strokeWidth * 2 : normalizedEdge.strokeWidth;
-      const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 4.2 : 3.2);
-      const outlineStroke = mixColors(edgeBaseColor, '#0f172a', isGroupEdge ? 0.56 : 0.46);
-      const outlineWidth = visualStrokeWidth + (isGroupEdge ? 0.34 : 0.26);
+      const baseStrokeWidth = isGroupEdge ? normalizedEdge.strokeWidth * 1.35 : normalizedEdge.strokeWidth;
+      const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 2.4 : 1.75);
+      const dashArray = getEdgeDashArray(normalizedEdge.type);
+      const dashAttr = dashArray ? ` stroke-dasharray="${dashArray}"` : '';
       const markerId = edge.type === 'line' ? null : ensureMarkerId(edgeBaseColor);
       const labelMetrics = edge.label ? measureEdgeLabelBadge(edge.label) : null;
-      const labelBackground = mixColors(edgeBaseColor, '#f8fafc', inheritsSourceColor ? 0.66 : 0.76);
-      const labelBorder = withAlpha(edgeBaseColor, 0.84);
-      const labelTextColor = getReadableLabelTextColor(labelBackground, edgeBaseColor);
+      const labelBackground = mixColors(edgeBaseColor, '#0c0c0e', 0.82);
+      const labelBorder = withAlpha(edgeBaseColor, 0.8);
+      const labelTextColor = getReadableLabelTextColor(labelBackground, '#ffffff');
       const edgeLabelLines = edge.label ? edge.label.split(/\r?\n/) : [];
+      const labelW = labelMetrics?.width ?? 54;
+      const labelH = labelMetrics?.height ?? 22;
 
       return `
         <g>
-          <path d="${geometry.path}" fill="none" stroke="${escapeSvgText(outlineStroke)}" stroke-opacity="${isGroupEdge ? 0.44 : 0.34}" stroke-width="${outlineWidth}" stroke-linecap="round" stroke-linejoin="round" ${markerId ? `marker-end="url(#${markerId})"` : ''} />
-          <path d="${geometry.path}" fill="none" stroke="${escapeSvgText(edgeBaseColor)}" stroke-width="${visualStrokeWidth}" stroke-linecap="round" stroke-linejoin="round" ${markerId ? `marker-end="url(#${markerId})"` : ''} />
+          <path d="${geometry.path}" fill="none" stroke="rgba(0,0,0,0.72)" stroke-width="${visualStrokeWidth + 1.6}" stroke-linecap="round" stroke-linejoin="round"${dashAttr} />
+          <path d="${geometry.path}" fill="none" stroke="${escapeSvgText(edgeBaseColor)}" stroke-width="${normalizedEdge.type === 'thick' ? Math.max(visualStrokeWidth, 3.2) : visualStrokeWidth}" stroke-linecap="round" stroke-linejoin="round"${dashAttr}${markerId ? ` marker-end="url(#${markerId})"` : ''} />
           ${
             edge.label
               ? `
-                <rect x="${geometry.label.x - (labelMetrics?.width ?? 54) / 2}" y="${geometry.label.y - (labelMetrics?.height ?? 22) / 2}" width="${labelMetrics?.width ?? 54}" height="${labelMetrics?.height ?? 22}" rx="11" fill="${escapeSvgText(labelBackground)}" stroke="${escapeSvgText(labelBorder)}" stroke-width="1" />
-                <text x="${geometry.label.x}" fill="${escapeSvgText(labelTextColor)}" font-size="12" font-weight="650" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace">
+                <rect x="${geometry.label.x - labelW / 2}" y="${geometry.label.y - labelH / 2}" width="${labelW}" height="${labelH}" rx="2" fill="${escapeSvgText(labelBackground)}" stroke="${escapeSvgText(labelBorder)}" stroke-width="1" />
+                <text x="${geometry.label.x}" fill="${escapeSvgText(labelTextColor)}" font-size="11" font-weight="650" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace">
                   ${edgeLabelLines
                     .map(
                       (line, index) =>
@@ -10501,7 +11132,7 @@ export default function App() {
 
   const createNodeInViewportCenter = useCallback(() => {
     const bounds = canvasRef.current?.getBoundingClientRect();
-    const viewport = documentState.layout.viewport;
+    const viewport = resolveInteractionViewport(liveViewportRef.current as HotPathViewport);
     const point = bounds
       ? {
           x: (bounds.width / 2 - viewport.x) / viewport.zoom - 72,
@@ -10511,7 +11142,7 @@ export default function App() {
 
     goToMode('canvas');
     createNodeAt(point);
-  }, [createNodeAt, documentState.layout.viewport, goToMode]);
+  }, [createNodeAt, goToMode]);
 
   const undoDocument = useCallback(() => {
     setUndoStack((current) => {
@@ -10543,7 +11174,11 @@ export default function App() {
 
   useEffect(() => {
     documentRef.current = documentState;
-  }, [documentState]);
+    // External document updates (load/undo/commit) resync live viewport when not mid-pan.
+    if (!panState && !panCommitNeededRef.current) {
+      liveViewportRef.current = documentState.layout.viewport;
+    }
+  }, [documentState, panState]);
 
   useEffect(() => {
     if (!isVsCodeHost && documentState.diagramType !== 'flowchart' && mode === 'canvas') {
@@ -11285,7 +11920,11 @@ export default function App() {
         const excludedSubgraphIds = activeDragState.kind === 'subgraph' && activeDragState.entityId
           ? [activeDragState.entityId]
           : [];
-        const nextNodeTargetId = findNodeDropTarget(visibleNodes, pointer, excludedNodeIds);
+        const nextNodeTargetId = findNodeDropTargetFromEntries(
+          visibleNodeSpatialIndex.queryPoint(pointer, 8),
+          pointer,
+          excludedNodeIds,
+        );
         const insertableEndpointId = activeDragState.kind === 'subgraph'
           ? activeDragState.entityId ?? null
           : activeDragState.ids.length === 1
@@ -11293,19 +11932,16 @@ export default function App() {
             : null;
         const nextEdgeTargetId = nextNodeTargetId || !insertableEndpointId
           ? null
-          : findEdgeDropTarget(
+          : findEdgeDropTargetFromEntries(
             pointer,
-            visibleEdges,
-            edgeEndpointMap,
-            edgeLaneMap,
-            edgeEndpointOffsetMap,
+            sceneEdgeSpatialIndex.queryPoint(pointer, 36),
             [insertableEndpointId],
           );
         const nextSubgraphTargetId =
           nextNodeTargetId || nextEdgeTargetId
             ? null
-            : findSubgraphDropTarget(
-              allSubgraphBlobShapes,
+            : findSubgraphDropTargetFromEntries(
+              subgraphBlobSpatialIndex.queryPoint(pointer, 8),
               pointer,
               excludedSubgraphIds,
             );
@@ -11341,13 +11977,14 @@ export default function App() {
           clearPendingBackgroundInteraction();
           setPanState({
             origin: { x: clientX, y: clientY },
-            initialViewport: { ...documentState.layout.viewport },
+            initialViewport: seedPanInitialViewport(liveViewportRef.current as HotPathViewport),
           });
         }
       }
 
       const bounds = canvas.getBoundingClientRect();
-      const viewport = documentState.layout.viewport;
+      // Prefer live viewport during pan so hit-tests stay correct without React state.
+      const viewport = liveViewportRef.current;
       const x = (clientX - bounds.left - viewport.x) / viewport.zoom;
       const y = (clientY - bounds.top - viewport.y) / viewport.zoom;
 
@@ -11359,27 +11996,54 @@ export default function App() {
         if (perfDebugEnabled) {
           perfCountersRef.current.dragPointerMoves += 1;
         }
-        if (dragState.kind !== 'content' && (ctrlKey || metaKey)) {
-          setDragReparentMode(true);
-          const targets = resolveHierarchyTargets({ x, y }, dragState);
-          setDragTargetNodeId(targets.nodeId);
-          setDragTargetEdgeId(targets.edgeId);
-          setDragTargetSubgraphId(targets.subgraphId);
-        } else {
-          setDragReparentMode(false);
-          setDragTargetNodeId(null);
-          setDragTargetEdgeId(null);
-          setDragTargetSubgraphId(null);
-        }
+        const nextDragState = {
+          ...dragState,
+          current: { x, y },
+        };
+        scheduleImperativeDragPreview(nextDragState);
 
-        setDragState((current) =>
-          current
-            ? {
-                ...current,
-                current: { x, y },
-              }
-            : null,
-        );
+        if (dragState.kind !== 'content' && (ctrlKey || metaKey)) {
+          const targets = resolveHierarchyTargets({ x, y }, nextDragState);
+          const currentTargets = dragDropTargetsRef.current;
+          if (!currentTargets.reparentMode) {
+            dragDropTargetsRef.current = { ...currentTargets, reparentMode: true };
+            setDragReparentMode(true);
+          }
+          if (
+            currentTargets.nodeId !== targets.nodeId ||
+            currentTargets.edgeId !== targets.edgeId ||
+            currentTargets.subgraphId !== targets.subgraphId
+          ) {
+            dragDropTargetsRef.current = {
+              nodeId: targets.nodeId,
+              edgeId: targets.edgeId,
+              subgraphId: targets.subgraphId,
+              reparentMode: true,
+            };
+            setDragTargetNodeId(targets.nodeId);
+            setDragTargetEdgeId(targets.edgeId);
+            setDragTargetSubgraphId(targets.subgraphId);
+          }
+        } else {
+          const currentTargets = dragDropTargetsRef.current;
+          if (
+            currentTargets.reparentMode ||
+            currentTargets.nodeId ||
+            currentTargets.edgeId ||
+            currentTargets.subgraphId
+          ) {
+            dragDropTargetsRef.current = {
+              nodeId: null,
+              edgeId: null,
+              subgraphId: null,
+              reparentMode: false,
+            };
+            setDragReparentMode(false);
+            setDragTargetNodeId(null);
+            setDragTargetEdgeId(null);
+            setDragTargetSubgraphId(null);
+          }
+        }
       }
 
       if (boxState) {
@@ -11406,13 +12070,9 @@ export default function App() {
           x: panState.initialViewport.x + (clientX - panState.origin.x),
           y: panState.initialViewport.y + (clientY - panState.origin.y),
         };
-        setDocumentState((current) => ({
-          ...current,
-          layout: {
-            ...current.layout,
-            viewport: nextViewport,
-          },
-        }));
+        // Hot path: do NOT setDocumentState per frame (avoids full scene re-derive).
+        panCommitNeededRef.current = true;
+        applyImperativeViewportTransform(nextViewport);
       }
 
       if (connectingState) {
@@ -11501,7 +12161,9 @@ export default function App() {
       flushPendingPointerMove(event);
       clearPendingBackgroundInteraction();
 
-      if (dragState) {
+      const liveDragState = liveDragStateRef.current ?? dragState;
+      if (liveDragState) {
+        const dragState = liveDragState;
         const deltaX = dragState.current.x - dragState.origin.x;
         const deltaY = dragState.current.y - dragState.origin.y;
         const movedDistance = Math.hypot(deltaX, deltaY);
@@ -11512,8 +12174,8 @@ export default function App() {
         const resolvedTargetNodeId = liveTargets?.nodeId ?? null;
         const resolvedTargetEdgeId = liveTargets?.edgeId ?? null;
         const ambientSubgraphId = shouldReparent
-          ? findSubgraphDropTarget(
-            allSubgraphBlobShapes,
+          ? findSubgraphDropTargetFromEntries(
+            subgraphBlobSpatialIndex.queryPoint(dragState.current, 8),
             dragState.current,
             dragState.kind === 'subgraph' && dragState.entityId ? [dragState.entityId] : [],
           )
@@ -11537,11 +12199,7 @@ export default function App() {
               '已调整附加信息框位置。',
             );
           }
-          setDragState(null);
-          setDragTargetNodeId(null);
-          setDragTargetEdgeId(null);
-          setDragTargetSubgraphId(null);
-          setDragReparentMode(false);
+          endLiveDrag();
           return;
         }
 
@@ -11773,17 +12431,19 @@ export default function App() {
                 : `已在画布中移动 ${dragState.ids.length} 个节点。`,
           );
         }
-        setDragState(null);
-        setDragTargetNodeId(null);
-        setDragTargetEdgeId(null);
-        setDragTargetSubgraphId(null);
-        setDragReparentMode(false);
+        endLiveDrag();
       }
 
       if (boxState) {
         const rect = rectFromPoints(boxState.origin, boxState.current);
-        const nextNodeIds = visibleNodes.filter((node) => intersects(rect, node)).map((node) => node.id);
-        const nextSubgraphIds = subgraphBlobShapes
+        const nextNodeIds = visibleNodeSpatialIndex
+          .queryRect(rect)
+          .map((entry) => entry.item)
+          .filter((node) => intersects(rect, node))
+          .map((node) => node.id);
+        const nextSubgraphIds = subgraphBlobSpatialIndex
+          .queryRect(rect)
+          .map((entry) => entry.item)
           .filter((shape) => subgraphShapeIntersectsRect(shape, rect))
           .map((shape) => shape.id);
 
@@ -11801,23 +12461,10 @@ export default function App() {
                 : { kind: 'subgraph', ids: nextSubgraphIds },
             );
           } else {
-            const nextEdgeIds = visibleEdges
-              .filter((edge) => {
-                const fromNode = edgeEndpointMap.get(edge.from);
-                const toNode = edgeEndpointMap.get(edge.to);
-                if (!fromNode || !toNode) {
-                  return false;
-                }
-
-                const geometry = buildEdgeGeometry(
-                  fromNode,
-                  toNode,
-                  edgeLaneMap.get(edge.id) ?? 0,
-                  edgeEndpointOffsetMap.get(edge.id),
-                );
-                return edgeIntersectsRect(rect, geometry);
-              })
-              .map((edge) => edge.id);
+            const nextEdgeIds = sceneEdgeSpatialIndex
+              .queryRect(rect)
+              .filter((entry) => edgeIntersectsRect(rect, entry.item.geometry))
+              .map((entry) => entry.item.edge.id);
 
             setSelection((current) =>
               nextEdgeIds.length > 0
@@ -11843,6 +12490,9 @@ export default function App() {
             createHistoryEntry('视口已移动', '已调整画布视口位置。'),
             ...current,
           ].slice(0, 40));
+        }
+        if (panCommitNeededRef.current) {
+          commitLiveViewportToDocument();
         }
         setPanState(null);
       }
@@ -11907,12 +12557,11 @@ export default function App() {
     function onPointerCancel() {
       flushPendingPointerMove();
       clearPendingBackgroundInteraction();
-      setDragState(null);
-      setDragTargetNodeId(null);
-      setDragTargetEdgeId(null);
-      setDragTargetSubgraphId(null);
-      setDragReparentMode(false);
+      endLiveDrag();
       setBoxState(null);
+      if (panCommitNeededRef.current) {
+        commitLiveViewportToDocument();
+      }
       setPanState(null);
       setConnectingState(null);
     }
@@ -11949,11 +12598,14 @@ export default function App() {
     dragTargetEdgeId,
     dragTargetNodeId,
     dragTargetSubgraphId,
+    endLiveDrag,
     edgeEndpointMap,
     edgeLaneMap,
     edgeEndpointOffsetMap,
     allSubgraphBlobShapes,
     allSubgraphFrames,
+    applyImperativeViewportTransform,
+    commitLiveViewportToDocument,
     measurePerf,
     perfDebugEnabled,
     recordPerfMetric,
@@ -11962,7 +12614,11 @@ export default function App() {
     panState,
     pointFromClient,
     resolveSubgraphAtPoint,
+    scheduleImperativeDragPreview,
+    sceneEdgeSpatialIndex,
     subgraphBlobShapes,
+    subgraphBlobSpatialIndex,
+    visibleNodeSpatialIndex,
     visibleEdges,
     visibleNodes,
   ]);
@@ -11977,10 +12633,12 @@ export default function App() {
     const deltaScale = event.deltaMode === 1 ? 16 : 1;
 
     if (event.ctrlKey || event.metaKey) {
+      // Continuous pinch/wheel zoom: live path only (no setDocumentState per event).
       zoomViewportAtPoint(
         event.clientX,
         event.clientY,
         Math.exp((-event.deltaY * deltaScale) / WHEEL_PINCH_DIVISOR),
+        { commit: 'live' },
       );
       return;
     }
@@ -11988,11 +12646,12 @@ export default function App() {
     const deltaX = event.deltaX * deltaScale;
     const deltaY = event.deltaY * deltaScale;
 
-    updateViewport((viewport) => ({
-      ...viewport,
-      x: viewport.x - deltaX,
-      y: viewport.y - deltaY,
-    }));
+    // Trackpad pan: live viewport — document commit is debounced.
+    applyLiveViewportUpdate((viewport) => applyWheelPanViewport(
+      viewport as HotPathViewport,
+      deltaX,
+      deltaY,
+    ));
   }
 
   const handleNodePointerInteraction = useCallback((
@@ -12014,7 +12673,7 @@ export default function App() {
     if (pointer.button === 1) {
       setPanState({
         origin: { x: pointer.clientX, y: pointer.clientY },
-        initialViewport: { ...documentState.layout.viewport },
+        initialViewport: seedPanInitialViewport(liveViewportRef.current as HotPathViewport),
       });
       return true;
     }
@@ -12064,7 +12723,7 @@ export default function App() {
 
       const duplicatedIds = duplicatedNodes.map((entry) => entry.id);
       setSelection({ kind: 'node', ids: duplicatedIds });
-      setDragState({
+      beginLiveDrag({
         kind: 'node',
         origin: point,
         current: point,
@@ -12090,7 +12749,7 @@ export default function App() {
         .map((entry) => [entry.id, { x: entry.x, y: entry.y }]),
     );
 
-    setDragState({
+    beginLiveDrag({
       kind: 'node',
       origin: point,
       current: point,
@@ -12099,27 +12758,35 @@ export default function App() {
       entityId: activeIds.length === 1 ? activeIds[0] : null,
     });
     return true;
-  }, [applyCommittedDocument, documentState.layout.viewport, documentState.nodes, editingNodeId, pointFromClient, selection]);
+  }, [applyCommittedDocument, beginLiveDrag, documentState.layout.viewport, documentState.nodes, editingNodeId, pointFromClient, selection]);
 
   const findSceneHitAtPoint = useCallback((point: Point) => {
-    const nodeId = findNodeDropTarget(sceneRenderableNodes, point);
+    const nodeId = findNodeDropTargetFromEntries(
+      visibleNodeSpatialIndex.queryPoint(point, 8),
+      point,
+    );
     if (nodeId) {
       return { kind: 'node' as const, id: nodeId };
     }
 
-    const edgeId = findEdgeDropTarget(
+    const edgeId = findEdgeDropTargetFromEntries(
       point,
-      sceneRenderableEdges.map((entry) => entry.edge),
-      edgeEndpointMap,
-      edgeLaneMap,
-      edgeEndpointOffsetMap,
+      sceneEdgeSpatialIndex.queryPoint(point, 36),
     );
     if (edgeId) {
       return { kind: 'edge' as const, id: edgeId };
     }
 
+    const subgraphId = findSubgraphDropTargetFromEntries(
+      subgraphBlobSpatialIndex.queryPoint(point, 8),
+      point,
+    );
+    if (subgraphId) {
+      return { kind: 'subgraph' as const, id: subgraphId };
+    }
+
     return null;
-  }, [edgeEndpointMap, edgeEndpointOffsetMap, edgeLaneMap, sceneRenderableEdges, sceneRenderableNodes]);
+  }, [sceneEdgeSpatialIndex, subgraphBlobSpatialIndex, visibleNodeSpatialIndex]);
 
   function startBackgroundInteraction(event: ReactPointerEvent<HTMLDivElement>) {
     if (canvasSearchOpen) {
@@ -12130,7 +12797,7 @@ export default function App() {
       event.preventDefault();
       setPanState({
         origin: { x: event.clientX, y: event.clientY },
-        initialViewport: { ...documentState.layout.viewport },
+        initialViewport: seedPanInitialViewport(liveViewportRef.current as HotPathViewport),
       });
       return;
     }
@@ -12144,8 +12811,7 @@ export default function App() {
       return;
     }
 
-    const viewport = documentState.layout.viewport;
-    const point = pointFromClient(event.clientX, event.clientY, viewport);
+    const point = pointFromClient(event.clientX, event.clientY);
     if (!point) {
       return;
     }
@@ -12178,12 +12844,18 @@ export default function App() {
         }
         return;
       }
+
+      if (sceneHit?.kind === 'subgraph') {
+        event.preventDefault();
+        selectSubgraphAtPoint(sceneHit.id, point, event.shiftKey);
+        return;
+      }
     }
 
     if (spacePressed) {
       setPanState({
         origin: { x: event.clientX, y: event.clientY },
-        initialViewport: { ...viewport },
+        initialViewport: seedPanInitialViewport(liveViewportRef.current as HotPathViewport),
       });
       return;
     }
@@ -12250,7 +12922,7 @@ export default function App() {
       event.stopPropagation();
       setPanState({
         origin: { x: event.clientX, y: event.clientY },
-        initialViewport: { ...documentState.layout.viewport },
+        initialViewport: seedPanInitialViewport(liveViewportRef.current as HotPathViewport),
       });
       return;
     }
@@ -12292,7 +12964,7 @@ export default function App() {
     }
 
     setSelection({ kind: 'subgraph', ids: [subgraphId] });
-    setDragState({
+    beginLiveDrag({
       kind: 'subgraph',
       origin: point,
       current: point,
@@ -12684,7 +13356,8 @@ export default function App() {
       return;
     }
 
-    setAiMessages(normalizeStoredAiMessages(activeAiRecord.messages));
+    const nextMessages = normalizeStoredAiMessages(activeAiRecord.messages);
+    setAiMessages((current) => (sameAiMessages(current, nextMessages) ? current : nextMessages));
   }, [activeAiRecord]);
 
   useEffect(() => {
@@ -12700,16 +13373,29 @@ export default function App() {
       return;
     }
 
-    setAiRecords((current) => current.map((record) => (
-      record.id === activeAiRecord.id
-        ? {
-            ...record,
-            title: deriveAiConversationTitle(aiMessages),
-            updatedAt: new Date().toISOString(),
-            messages: aiMessages.slice(-32),
-          }
-        : record
-    )));
+    const nextTitle = deriveAiConversationTitle(aiMessages);
+    const nextMessages = aiMessages.slice(-32);
+    setAiRecords((current) => {
+      let changed = false;
+      const nextRecords = current.map((record) => {
+        if (record.id !== activeAiRecord.id) {
+          return record;
+        }
+
+        if (record.title === nextTitle && sameAiMessages(record.messages, nextMessages)) {
+          return record;
+        }
+
+        changed = true;
+        return {
+          ...record,
+          title: nextTitle,
+          updatedAt: new Date().toISOString(),
+          messages: nextMessages,
+        };
+      });
+      return changed ? nextRecords : current;
+    });
     localStorage.setItem(storageKeys.aiChat, JSON.stringify(aiMessages.slice(-24)));
     localStorage.setItem(storageKeys.aiActiveSession, activeAiRecord.id);
   }, [activeAiRecord, aiMessages]);
@@ -13716,7 +14402,7 @@ export default function App() {
             onClick={() => setHelpDialogOpen(true)}
             type="button"
           >
-            MD
+            LMD
           </button>
         </div>
 
@@ -14608,6 +15294,9 @@ export default function App() {
                   <p className="perf-debug-panel__summary">
                     blob 区域 {perfDebugSummary.snapshot.blobRegionCount} / 原语 {perfDebugSummary.snapshot.blobPrimitiveCount}
                   </p>
+                  <p className="perf-debug-panel__summary">
+                    Canvas {perfDebugSummary.snapshot.canvasNodeCount} 节点 / {perfDebugSummary.snapshot.canvasEdgeCount} 线 · Overlay {perfDebugSummary.snapshot.overlayNodeCount}/{perfDebugSummary.snapshot.overlayEdgeCount}
+                  </p>
                   <p className="perf-debug-panel__summary perf-debug-panel__hint">
                     Shift + Alt + D 切换
                   </p>
@@ -14723,9 +15412,15 @@ export default function App() {
                     transform: `translate(${documentState.layout.viewport.x + canvasBoardBounds.x * documentState.layout.viewport.zoom}px, ${documentState.layout.viewport.y + canvasBoardBounds.y * documentState.layout.viewport.zoom}px) scale(${documentState.layout.viewport.zoom})`,
                   }}
                 >
-                  <svg className="subgraph-blob-layer" aria-hidden="true">
+                  <svg
+                    className="subgraph-blob-layer"
+                    aria-hidden="true"
+                    style={hybridSceneActive ? { pointerEvents: 'none' } : undefined}
+                  >
                     <g transform={`translate(${-canvasBoardBounds.x} ${-canvasBoardBounds.y})`}>
-                      {[...subgraphBlobShapes].sort((left, right) => left.depth - right.depth).map((shape) => {
+                      {[...(hybridSceneActive ? viewportCulledBlobShapes : subgraphBlobShapes)]
+                        .sort((left, right) => left.depth - right.depth)
+                        .map((shape) => {
                         const subgraph = documentState.subgraphs.find((entry) => entry.id === shape.id);
                         if (!subgraph) {
                           return null;
@@ -14782,7 +15477,7 @@ export default function App() {
                                   stroke={withAlpha(outlineStroke, outlineOpacity)}
                                   strokeWidth={outlineWidth}
                                 />
-                                {!shape.collapsed ? (
+                                {!shape.collapsed && !hybridSceneActive ? (
                                   <path
                                     className="subgraph-blob__hit"
                                     d={region.path}
@@ -15021,6 +15716,7 @@ export default function App() {
                           top: frame.y - canvasBoardBounds.y,
                           width: frame.width,
                           height: frame.height,
+                          pointerEvents: hybridSceneActive ? 'none' : undefined,
                           '--depth': String(frame.depth),
                           '--subgraph-fill': subgraphStyle.fill,
                           '--subgraph-fill-soft': withAlpha(subgraphStyle.fill, 0.16),
@@ -15057,18 +15753,16 @@ export default function App() {
                         <marker
                           id={entry.id}
                           key={entry.id}
-                          markerWidth="13.2"
-                          markerHeight="13.2"
-                          refX="10.6"
-                          refY="6.6"
+                          markerWidth="10"
+                          markerHeight="8"
+                          refX="8.5"
+                          refY="4"
                           orient="auto"
                           markerUnits="userSpaceOnUse"
                         >
                           <path
-                            d="M0,0 L13.2,6.6 L0,13.2 z"
+                            d="M0,0.6 L9,4 L0,7.4 Z"
                             fill={entry.color}
-                            stroke={mixColors(entry.color, '#0f172a', 0.22)}
-                            strokeWidth="0.45"
                           />
                         </marker>
                       ))}
@@ -15098,26 +15792,23 @@ export default function App() {
                           ? getEndpointAccentColor(fromNode)
                           : normalizedEdge.strokeColor;
                         const baseStrokeWidth = isGroupEdge
-                          ? normalizedEdge.strokeWidth * 2
+                          ? normalizedEdge.strokeWidth * 1.35
                           : normalizedEdge.strokeWidth;
-                        const visualStrokeWidth = Math.max(baseStrokeWidth, isGroupEdge ? 4.2 : 3.2);
-                        const selectedEdgeStrokeWidth =
-                          isEdgeSelected
-                            ? visualStrokeWidth + 0.9
-                            : visualStrokeWidth;
-                        const displayStroke = withAlpha(edgeBaseColor, 1);
-                        const outlineStroke = mixColors(edgeBaseColor, '#0f172a', isGroupEdge ? 0.56 : 0.5);
-                        const outlineWidth = selectedEdgeStrokeWidth + (isGroupEdge ? 0.34 : 0.26);
-                        const labelBackground = mixColors(
-                          edgeBaseColor,
-                          '#f8fafc',
-                          inheritsSourceColor ? 0.66 : 0.76,
+                        const visualStrokeWidth = Math.max(
+                          baseStrokeWidth,
+                          isGroupEdge ? 2.4 : 1.75,
                         );
+                        const selectedEdgeStrokeWidth = isEdgeSelected
+                          ? visualStrokeWidth + 0.55
+                          : visualStrokeWidth;
+                        const displayStroke = withAlpha(edgeBaseColor, 1);
+                        const dashArray = getEdgeDashArray(normalizedEdge.type);
+                        const labelBackground = mixColors(edgeBaseColor, '#0c0c0e', 0.82);
                         const labelTextColor = getReadableLabelTextColor(
                           labelBackground,
-                          edgeBaseColor,
+                          '#ffffff',
                         );
-                        const labelBorder = withAlpha(edgeBaseColor, isEdgeSelected ? 0.82 : 0.64);
+                        const labelBorder = withAlpha(edgeBaseColor, isEdgeSelected ? 0.95 : 0.75);
                         const labelMetrics = edge.label ? measureEdgeLabelBadge(edge.label) : null;
                         const liveEdgeLabel = editingEdgeId === edge.id ? editingEdgeLabel || ' ' : edge.label;
                         const liveEdgeLabelMetrics = measureEdgeLabelBadge(liveEdgeLabel);
@@ -15125,34 +15816,53 @@ export default function App() {
                         const arrowMarkerId = edge.type === 'line'
                           ? undefined
                           : liveEdgeMarkerIdMap.get(edgeBaseColor);
+                        const isDropTarget = dragTargetEdgeId === edge.id;
 
                         return (
-                          <g key={edge.id}>
+                          <g
+                            key={edge.id}
+                            className={`edge-group${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}${isDropTarget ? ' is-drop-target' : ''}`}
+                          >
                           {isEdgeSelected ? (
                             <path
-                              className={`edge-path edge-path--selection${isGroupEdge ? ' is-group-edge' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
+                              className="edge-path edge-path--selection"
                               d={geometry.path}
                               pointerEvents="none"
-                              stroke={withAlpha(edgeBaseColor, 0.9)}
-                              strokeWidth={selectedEdgeStrokeWidth + (isGroupEdge ? 8 : 7)}
+                              stroke={withAlpha(edgeBaseColor, 0.28)}
+                              strokeWidth={selectedEdgeStrokeWidth + 5}
                             />
                           ) : null}
+                          {/* subtle dark halo */}
                           <path
-                            className={`edge-path edge-path--outline edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
+                            className={`edge-path edge-path--underlay edge-path--${edge.type}`}
                             d={geometry.path}
                             pointerEvents="none"
-                            stroke={outlineStroke}
-                            strokeOpacity={isEdgeSelected ? 0.48 : 0.36}
-                            strokeWidth={outlineWidth}
+                            stroke="rgba(0,0,0,0.72)"
+                            strokeDasharray={dashArray}
+                            strokeWidth={selectedEdgeStrokeWidth + 1.6}
                           />
                           <path
-                            className={`edge-path edge-path--main edge-path--${edge.type}${isGroupEdge ? ' is-group-edge' : ''}${isEdgeSelected ? ' is-selected' : ''}${dragTargetEdgeId === edge.id ? ' is-drop-target' : ''}`}
+                            className={`edge-path edge-path--main edge-path--${edge.type}${isEdgeSelected ? ' is-selected' : ''}${isDropTarget ? ' is-drop-target' : ''}`}
                             d={geometry.path}
                             markerEnd={arrowMarkerId ? `url(#${arrowMarkerId})` : undefined}
                             pointerEvents="none"
                             stroke={displayStroke}
-                            strokeWidth={selectedEdgeStrokeWidth}
+                            strokeDasharray={dashArray}
+                            strokeWidth={
+                              normalizedEdge.type === 'thick'
+                                ? Math.max(selectedEdgeStrokeWidth, 3.2)
+                                : selectedEdgeStrokeWidth
+                            }
                           />
+                          {isDropTarget ? (
+                            <path
+                              className="edge-path edge-path--drop-target"
+                              d={geometry.path}
+                              pointerEvents="none"
+                              stroke={withAlpha('#ff2a6d', 0.55)}
+                              strokeWidth={selectedEdgeStrokeWidth + 4}
+                            />
+                          ) : null}
                           <path
                             className="edge-hitbox"
                             d={geometry.path}
@@ -15243,9 +15953,9 @@ export default function App() {
                                   event.stopPropagation();
                                   selectSingle('edge', edge.id, event.shiftKey);
                                 }}
-                                rx={11}
+                                rx={2}
                                 stroke={labelBorder}
-                                strokeWidth={isEdgeSelected ? 1.6 : 1}
+                                strokeWidth={isEdgeSelected ? 1.4 : 1}
                                 width={labelMetrics?.width ?? 54}
                                 x={-((labelMetrics?.width ?? 54) / 2)}
                                 y={-((labelMetrics?.height ?? 22) / 2)}
@@ -15293,7 +16003,8 @@ export default function App() {
                               const marker = liveEdgeMarkerEntries.find((entry) => entry.color === dragInsertPreview.stroke);
                               return marker ? `url(#${marker.id})` : undefined;
                             })()}
-                            stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
+                            stroke={withAlpha(dragInsertPreview.stroke, 0.9)}
+                            strokeWidth={1.8}
                           />
                           <path
                             className="edge-path edge-path--preview edge-path--insert-preview"
@@ -15302,7 +16013,8 @@ export default function App() {
                               const marker = liveEdgeMarkerEntries.find((entry) => entry.color === dragInsertPreview.stroke);
                               return marker ? `url(#${marker.id})` : undefined;
                             })()}
-                            stroke={withAlpha(dragInsertPreview.stroke, 0.92)}
+                            stroke={withAlpha(dragInsertPreview.stroke, 0.9)}
+                            strokeWidth={1.8}
                           />
                         </>
                       ) : null}
@@ -15332,8 +16044,9 @@ export default function App() {
                           })()}
                           stroke={(() => {
                             const originNode = edgeEndpointMap.get(connectingState.fromId);
-                            return originNode ? withAlpha(originNode.stroke, 0.9) : undefined;
+                            return originNode ? withAlpha(originNode.stroke, 0.9) : '#d6ff3a';
                           })()}
+                          strokeWidth={1.8}
                         />
                       ) : null}
                     </g>

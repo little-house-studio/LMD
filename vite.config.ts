@@ -11,7 +11,7 @@ export default defineConfig({
     reportCompressedSize: false,
   },
   server: {
-    port: 5173,
+    port: 5280,
     host: '0.0.0.0',
   },
 });

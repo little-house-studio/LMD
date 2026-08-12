@@ -2,6 +2,7 @@ import {
   startTransition,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
@@ -10,7 +11,6 @@ import {
   addChildNode,
   addRootNode,
   addSiblingNode,
-  computeMindMapLayout,
   deleteNode,
   deleteNodes,
   getMovableNodeIds,
@@ -23,7 +23,6 @@ import {
   moveNodeUp,
   outdentNode,
   parseOutline,
-  serializeOutline,
   updateNodeColors,
   updateNodeText,
   type DropPosition,
@@ -33,6 +32,10 @@ import {
   type OutlineNode,
   type ParsedOutline,
 } from './lib/outline';
+import {
+  MindMapLayoutCache,
+  OutlineSerializeCache,
+} from './lib/layoutCache';
 
 interface HostConfig {
   platform: 'web' | 'vscode';
@@ -802,6 +805,14 @@ export function LmpApp() {
   const focusedInlineEditorIdRef = useRef<string | null>(null);
   const dragSessionRef = useRef<DragSession | null>(null);
   const lastSentMarkdownRef = useRef('');
+  const layoutCacheRef = useRef<MindMapLayoutCache | null>(null);
+  const serializeCacheRef = useRef<OutlineSerializeCache | null>(null);
+  if (!layoutCacheRef.current) {
+    layoutCacheRef.current = new MindMapLayoutCache();
+  }
+  if (!serializeCacheRef.current) {
+    serializeCacheRef.current = new OutlineSerializeCache();
+  }
   const [canvasState, setCanvasState] = useState<CanvasState>({ width: 1200, height: 780 });
   const [viewport, setViewport] = useState<ViewportState>(INITIAL_VIEWPORT);
   const [status, setStatus] = useState('Canvas ready');
@@ -822,13 +833,27 @@ export function LmpApp() {
   }
 
   const { roots, warnings, layoutMode } = documentState;
-  const renderRoots = inlineEditor
-    ? updateNodeText(roots, inlineEditor.nodeId, inlineEditor.value || ' ')
-    : roots;
-  const layout = computeMindMapLayout(renderRoots, layoutMode);
+  // Live inline edit text only — layout cache key includes text so one recompute while typing is correct.
+  const renderRoots = useMemo(
+    () => (
+      inlineEditor
+        ? updateNodeText(roots, inlineEditor.nodeId, inlineEditor.value || ' ')
+        : roots
+    ),
+    [inlineEditor, roots],
+  );
+  // Pan/zoom/selection must NOT re-run computeMindMapLayout — only outline topology/text/mode.
+  const layout = useMemo(
+    () => layoutCacheRef.current!.get(renderRoots, layoutMode),
+    [layoutMode, renderRoots],
+  );
   const fileTitle = getFileTitle(hostConfigRef.current.fileName);
   const currentNode = activeId ? getNodeById(renderRoots, activeId) : null;
-  const documentText = serializeOutline(roots, { layoutMode });
+  // Serialize committed roots only (not every pan frame).
+  const documentText = useMemo(
+    () => serializeCacheRef.current!.get(roots, layoutMode),
+    [layoutMode, roots],
+  );
   const selectedCount = selectedIds.length;
   const paletteTargets = selectedIds.length > 0 ? selectedIds : activeId ? [activeId] : [];
   const paletteNodes = paletteTargets
@@ -881,7 +906,9 @@ export function LmpApp() {
       options.activeId ?? activeId,
     );
     const revealNodeId = options.editNodeId ?? options.revealNodeId ?? null;
-    const nextLayout = revealNodeId ? computeMindMapLayout(nextRoots, layoutMode) : null;
+    const nextLayout = revealNodeId
+      ? layoutCacheRef.current!.get(nextRoots, layoutMode)
+      : null;
     const revealNode = revealNodeId ? nextLayout?.find((node) => node.id === revealNodeId) ?? null : null;
 
     if (revealNode) {

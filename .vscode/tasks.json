@@ -19,7 +19,7 @@
           "background": {
             "activeOnStart": true,
             "beginsPattern": ".",
-            "endsPattern": "Local:.*127\\.0\\.0\\.1:5173|watching for file changes"
+            "endsPattern": "Local:.*127\\.0\\.0\\.1:(5280|5173)|ready in|watching for file changes"
           }
         }
       ],

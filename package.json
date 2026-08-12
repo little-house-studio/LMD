@@ -43,7 +43,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "dev:webview": "vite --host 127.0.0.1 --port 5173",
+    "dev:webview": "vite --host 127.0.0.1 --port 5280",
     "watch:extension": "tsc -p tsconfig.extension.json -w --preserveWatchOutput",
     "dev:vscode": "concurrently -k -n WEB,EXT -c cyan,magenta \"pnpm run dev:webview\" \"pnpm run watch:extension\"",
     "build:webview": "tsc -b && vite build && /opt/homebrew/bin/node ./scripts/prepare-dist-subdir.mjs",
@@ -52,10 +52,15 @@
     "package:vsix": "pnpm run build:vscode && npx @vscode/vsce package --allow-missing-repository --no-dependencies --out LMD_EDITER.vsix",
     "build": "pnpm run build:webview",
     "lint": "eslint .",
+    "test:lmd": "npx --yes tsx src/lmd/lmd.smoke.test.ts",
+    "test:hotpath": "npx --yes tsx src/lmd/hotpath/sceneHotPath.test.ts && npx --yes tsx lmp/src/lib/layoutCache.test.ts && npx --yes tsx src/lmd/stage/stageHotPath.test.ts",
+    "stress:hotpath": "npx --yes tsx scripts/perf-stress-lmd.mjs && npx --yes tsx scripts/perf-stress-lmp.mjs",
     "preview": "vite preview"
   },
   "type": "module",
   "dependencies": {
+    "@xyflow/react": "^12.11.2",
+    "html-to-image": "^1.11.13",
     "mermaid": "^11.13.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"

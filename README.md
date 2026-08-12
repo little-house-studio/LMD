@@ -63,6 +63,16 @@ pnpm run dev:vscode
 - 属性栏编辑
 - 导出当前画布图片
 
+## LMD 格式解释器
+
+`.lmd` 格式与画布编辑器都在 **`src/lmd/`**（格式层仍与 UI 分文件，但同目录）：
+
+- `parseProjectMarkdown` / `serializeProjectMarkdown` / `standardizeProjectMarkdown`
+- Mermaid flowchart 解析与回写
+- 节点稳定 ID、布局 sidecar、样例数据
+
+入口：`import { ... } from './src/lmd'`（应用内 `from './lmd'`）。说明见 `src/lmd/README.md` 与 `skills/lmd-protocol/`。
+
 ## 本地开发
 
 ```bash
@@ -72,7 +82,7 @@ pnpm dev
 
 默认开发地址：
 
-- `http://127.0.0.1:5173/`
+- `http://127.0.0.1:5280/`
 
 ## 生产构建
 
