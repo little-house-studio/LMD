@@ -7,7 +7,8 @@ deploy/**
 docs/**
 extension-src/**
 node_modules/**
-lmp/node_modules/**
+**/node_modules/**
+lmp/**
 src/**
 safe.html
 index.html
@@ -15,6 +16,7 @@ vite.config.ts
 tsconfig*.json
 *.tsbuildinfo
 *.vsix
+tmp-*.mjs
 eslint.config.js
 pnpm-lock.yaml
 _worker.ts
