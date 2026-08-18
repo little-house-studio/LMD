@@ -1,0 +1,21 @@
+---
+description: 能解耦就拆成低耦高内聚；几何/规则不要写进画布或壳
+alwaysApply: true
+---
+
+# 低耦高内聚
+
+构建或改代码时，发现一块逻辑能独立运行，就立刻拆出去，不要继续堆进大文件。
+
+- **高内聚**：一个文件只做一件事（路由、组框、分栏、绘制、交互各管各的）
+- **低耦合**：通过函数参数和明确出口通信；禁止为了方便去 import 壳 / 引擎 / DOM
+- **纯算法**（位置、换行、解析、诊断）放在 `placement/`、`domain/`、`lmd-kernel/`，用单测锁住
+- **副作用**（rAF、指针、React）留在 `presentation/`，只调用算法，不重写算法
+- 旧路径若还在，只许 re-export，不许再往里加逻辑
+
+```ts
+// ❌ 在 engine.ts 里再写一套往返分道 / 标签夹取
+// ✅ 改 src/lmd/placement/edges.ts，engine 只调用 routeSceneEdges / clampLabelToViewport
+```
+
+拆完补分层或边界测试（如 `layering.test.ts`、`placement-boundary.test.ts`）。不要为拆而拆：只有一处用、且不足 ~30 行的胶水可以留在调用方。

@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "lmd-editer:dev",
+      "type": "shell",
+      "command": "pnpm run dev:vscode",
+      "isBackground": true,
+      "problemMatcher": [
+        {
+          "owner": "typescript",
+          "fileLocation": "absolute",
+          "pattern": {
+            "regexp": "^(.*)$",
+            "file": 1,
+            "location": 1,
+            "message": 1
+          },
+          "background": {
+            "activeOnStart": true,
+            "beginsPattern": ".",
+            "endsPattern": "Local:.*127\\.0\\.0\\.1:(5280|5173)|ready in|watching for file changes"
+          }
+        }
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    }
+  ]
+}
