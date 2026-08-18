@@ -1,7 +1,0 @@
-src/**
-extension-src/**
-node_modules/**
-dist/**/*.map
-tsconfig*.json
-vite.config.ts
-README.md

@@ -8,7 +8,6 @@ docs/**
 extension-src/**
 node_modules/**
 **/node_modules/**
-lmp/**
 src/**
 safe.html
 index.html

@@ -1,0 +1,12 @@
+export const SELECT_STROKE = '#2f80ff';
+export const SCREEN_TITLE_PX = 13;
+export const SCREEN_TITLE_LINE = 17;
+export const SCREEN_DESC_PX = 11;
+export const SCREEN_DESC_LINE = 15;
+export const SCREEN_EDGE_PX = 11;
+export const SCREEN_GROUP_PX = 12;
+export const SCREEN_TITLE_FONT = '"Segoe UI", system-ui, sans-serif';
+export const SCREEN_EDGE_FONT = 'ui-monospace, SF Mono, Consolas, monospace';
+export const NODE_RADIUS = 8;
+export const NAME_MIN_VIEW = 16;
+export const SCENE_BG = '#070708';

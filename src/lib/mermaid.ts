@@ -12,4 +12,4 @@ export {
   syncDocument,
   createDefaultLayout,
   toSidecar,
-} from '../lmd/mermaid';
+} from '../lmd/infrastructure/compat/mermaid';

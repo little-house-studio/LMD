@@ -1,5 +1,5 @@
 /** @deprecated Use `import { ... } from '../lmd'` or `./lmd`. */
-export type { LmdInterpreterHooks } from '../lmd/projectMarkdown';
+export type { LmdInterpreterHooks } from '../lmd/infrastructure/compat/projectMarkdown';
 export {
   setLmdInterpreterHooks,
   buildProjectSuffixMarkdown,
@@ -8,4 +8,4 @@ export {
   standardizeProjectMarkdown,
   serializeProjectMarkdown,
   createProjectMarkdownTemplate,
-} from '../lmd/projectMarkdown';
+} from '../lmd/infrastructure/compat/projectMarkdown';

@@ -1,0 +1,231 @@
+.stage-root {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: #070708;
+  touch-action: none;
+  overscroll-behavior: none;
+}
+
+.stage-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: default;
+}
+
+.stage-root:active .stage-canvas {
+  cursor: grabbing;
+}
+
+.stage-inline-shell {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  pointer-events: none;
+}
+
+.stage-inline-edit {
+  position: absolute;
+  z-index: 8;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  box-shadow: none;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  line-height: 1.25;
+  text-align: center;
+  resize: none;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  caret-color: #2f80ff;
+  pointer-events: auto;
+}
+
+.stage-inline-edit.is-title {
+  padding: 8px 12px 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--node-stroke, #d6ff3a) 28%, transparent);
+  background: color-mix(in srgb, var(--node-stroke, #d6ff3a) 14%, var(--node-fill, #121214));
+  font-weight: 800;
+}
+
+.stage-inline-edit.is-description {
+  padding: 6px 12px 8px;
+  background: color-mix(in srgb, var(--node-fill, #121214) 96%, black 4%);
+  font-weight: 500;
+}
+
+.stage-inline-edit.is-active {
+  box-shadow: inset 0 0 0 1.5px #2f80ff;
+}
+
+.stage-inline-edit.is-multiline {
+  text-align: center;
+}
+
+.stage-inline-edit::placeholder {
+  color: color-mix(in srgb, currentColor 45%, transparent);
+}
+
+.stage-hint {
+  position: absolute;
+  left: 16px;
+  bottom: 18px;
+  z-index: 4;
+  max-width: min(420px, calc(100% - 220px));
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: rgba(110, 110, 118, 0.85);
+  font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.03em;
+  pointer-events: none;
+  user-select: none;
+}
+
+.stage-minimap {
+  position: absolute;
+  right: 6px;
+  bottom: 8px;
+  z-index: 5;
+  padding: 3px 3px 2px;
+  border: 0;
+  border-radius: 7px;
+  background: #2c2c2c;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18), 0 4px 10px rgba(0, 0, 0, 0.24);
+  pointer-events: auto;
+}
+
+.stage-minimap__label {
+  margin-bottom: 2px;
+  color: #8a8a94;
+  font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.stage-minimap__svg {
+  display: block;
+  cursor: crosshair;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.stage-help {
+  position: relative;
+  z-index: 6;
+  width: min(260px, calc(100vw - 24px));
+  max-height: min(44vh, 340px);
+  overflow: auto;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: #2c2c2c;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18), 0 8px 18px rgba(0, 0, 0, 0.32);
+  color: #b8b8be;
+  font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+  font-size: 0.58rem;
+  line-height: 1.35;
+}
+
+.stage-help h4 {
+  margin: 0 0 4px;
+  color: #f4f4f5;
+  font-size: 0.68rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.stage-help ul {
+  margin: 0;
+  padding-left: 1.1em;
+}
+
+.stage-help li {
+  margin: 1px 0;
+}
+
+.stage-search {
+  position: absolute;
+  top: 38px;
+  left: 50%;
+  z-index: 28;
+  width: min(220px, calc(100% - 12px));
+  transform: translateX(-50%);
+  border: 0;
+  border-radius: 7px;
+  background: #2c2c2c;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18), 0 6px 14px rgba(0, 0, 0, 0.28);
+}
+
+.stage-search__input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  border: 0;
+  background: transparent;
+  color: #f4f4f5;
+  font: 700 0.66rem/1.3 ui-monospace, 'SF Mono', Consolas, monospace;
+  outline: none;
+}
+
+.stage-search__list {
+  margin: 0;
+  padding: 0 0 3px;
+  list-style: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  max-height: 120px;
+  overflow: auto;
+}
+
+.stage-search__list button {
+  display: grid;
+  width: 100%;
+  padding: 3px 6px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.stage-search__list button.is-active,
+.stage-search__list button:hover {
+  background: rgba(214, 255, 58, 0.1);
+}
+
+.stage-search__list strong {
+  color: #f4f4f5;
+  font-size: 0.68rem;
+}
+
+.stage-search__list span {
+  color: #8a8a94;
+  font-size: 0.56rem;
+}
+
+.stage-search__empty {
+  padding: 5px 6px 6px;
+  color: #8a8a94;
+  font-size: 0.62rem;
+}
+
+.stage-help__close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  border: 0;
+  background: transparent;
+  color: #8a8a94;
+  cursor: pointer;
+  font: inherit;
+}

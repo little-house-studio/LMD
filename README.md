@@ -1,4 +1,4 @@
-# LTHS_MD
+# LMD
 
 Mermaid 空间编辑协作平台前端原型。
 
@@ -65,13 +65,13 @@ pnpm run dev:vscode
 
 ## LMD 格式解释器
 
-`.lmd` 格式与画布编辑器都在 **`src/lmd/`**（格式层仍与 UI 分文件，但同目录）：
+协议内核在 **`lmd-kernel/`**（`@lths/lmd`）。编辑器在 **`src/lmd/`**，按 DDD 分层（`domain` / `application` / `infrastructure` / `presentation`）：
 
-- `parseProjectMarkdown` / `serializeProjectMarkdown` / `standardizeProjectMarkdown`
-- Mermaid flowchart 解析与回写
-- 节点稳定 ID、布局 sidecar、样例数据
+- 格式 API：`openLmd` / `printLmd` / `printMermaid`；旧 Markdown+Mermaid 打开即迁移
+- 画布：`src/lmd/presentation/canvas/`
+- 文档用例：`src/lmd/application/editing/`
 
-入口：`import { ... } from './src/lmd'`（应用内 `from './lmd'`）。说明见 `src/lmd/README.md` 与 `skills/lmd-protocol/`。
+入口：`import { ... } from './src/lmd'`（应用内 `from './lmd'`）。说明见 `src/lmd/README.md`、`lmd-kernel/ARCHITECTURE.md` 与 `skills/lmd-protocol/`。
 
 ## 本地开发
 

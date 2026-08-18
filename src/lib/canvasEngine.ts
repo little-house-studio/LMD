@@ -1,2 +1,2 @@
-/** @deprecated Use `import { ... } from '../lmd/hotpath/canvasEngine'`. */
-export * from '../lmd/hotpath/canvasEngine';
+/** @deprecated Use `import { ... } from '../lmd/infrastructure/hotpath/canvasEngine'`. */
+export * from '../lmd/infrastructure/hotpath/canvasEngine';

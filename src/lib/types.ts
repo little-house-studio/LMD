@@ -16,9 +16,9 @@ export type {
   ProjectCompatLayer,
   GraphDocument,
   ParsedDocument,
-} from '../lmd/types';
+} from '../lmd/infrastructure/compat/types';
 
-import type { Direction, EdgeType } from '../lmd/types';
+import type { Direction, EdgeType } from '../lmd/infrastructure/compat/types';
 
 /** Editor shell modes (not part of .lmd file format). */
 export type EditorMode = 'canvas' | 'source' | 'history';

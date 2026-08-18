@@ -4,4 +4,4 @@ export {
   extractEntityIdCode,
   deriveEntityTitleFromId,
   buildEntityIdFromTitle,
-} from '../lmd/entityId';
+} from '../lmd/infrastructure/compat/entityId';

@@ -9,6 +9,30 @@ function createNonce() {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 }
 
+const EMPTY_META = '{\n  "v": 1\n}\n';
+
+function siblingMetaUri(documentUri: vscode.Uri) {
+  return vscode.Uri.file(documentUri.fsPath.replace(/\.lmd$/i, '') + '.lths');
+}
+
+async function readMetaText(uri: vscode.Uri) {
+  try {
+    return Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+async function ensureSiblingMeta(documentUri: vscode.Uri) {
+  const uri = siblingMetaUri(documentUri);
+  const existing = await readMetaText(uri);
+  if (existing.trim()) {
+    return { uri, text: existing };
+  }
+  await vscode.workspace.fs.writeFile(uri, Buffer.from(EMPTY_META, 'utf8'));
+  return { uri, text: EMPTY_META };
+}
+
 function toRange(document: vscode.TextDocument) {
   return new vscode.Range(
     document.positionAt(0),
@@ -275,14 +299,21 @@ class LmdEditorProvider implements vscode.CustomTextEditorProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'dist')],
     };
 
-    webviewPanel.webview.html = DEV_SERVER_URL
-      ? this.getDevWebviewHtml(document)
-      : await this.getWebviewHtml(webviewPanel.webview, document);
+    const sibling = document.uri.scheme === 'file'
+      ? await ensureSiblingMeta(document.uri)
+      : undefined;
+    let lastWrittenMeta = sibling?.text ?? '';
 
-    const pushDocument = () => {
+    webviewPanel.webview.html = DEV_SERVER_URL
+      ? this.getDevWebviewHtml(document, lastWrittenMeta)
+      : await this.getWebviewHtml(webviewPanel.webview, document, lastWrittenMeta);
+
+    const pushDocument = async () => {
+      const meta = sibling ? await readMetaText(sibling.uri) : '';
       webviewPanel.webview.postMessage({
         type: 'lmd/document',
         markdown: document.getText(),
+        meta,
         fileName: path.basename(document.uri.fsPath),
       });
     };
@@ -292,11 +323,32 @@ class LmdEditorProvider implements vscode.CustomTextEditorProvider {
         return;
       }
 
-      pushDocument();
+      void pushDocument();
     });
+
+    const metaWatcher = sibling
+      ? vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(path.dirname(document.uri.fsPath), path.basename(sibling.uri.fsPath)),
+      )
+      : undefined;
+    const onMetaFileChange = async () => {
+      if (!sibling) {
+        return;
+      }
+      const text = await readMetaText(sibling.uri);
+      if (text === lastWrittenMeta) {
+        return;
+      }
+      lastWrittenMeta = text;
+      await pushDocument();
+    };
+    metaWatcher?.onDidChange(() => { void onMetaFileChange(); });
+    metaWatcher?.onDidCreate(() => { void onMetaFileChange(); });
+    metaWatcher?.onDidDelete(() => { void onMetaFileChange(); });
 
     webviewPanel.onDidDispose(() => {
       changeSubscription.dispose();
+      metaWatcher?.dispose();
     });
 
     webviewPanel.webview.onDidReceiveMessage(async (message) => {
@@ -305,19 +357,21 @@ class LmdEditorProvider implements vscode.CustomTextEditorProvider {
       }
 
       if (message.type === 'lmd/ready') {
-        pushDocument();
+        await pushDocument();
         return;
       }
 
       if (message.type === 'lmd/updateDocument' && 'markdown' in message && typeof message.markdown === 'string') {
         const nextMarkdown = message.markdown;
-        if (nextMarkdown === document.getText()) {
-          return;
+        if (nextMarkdown !== document.getText()) {
+          const edit = new vscode.WorkspaceEdit();
+          edit.replace(document.uri, toRange(document), nextMarkdown);
+          await vscode.workspace.applyEdit(edit);
         }
-
-        const edit = new vscode.WorkspaceEdit();
-        edit.replace(document.uri, toRange(document), nextMarkdown);
-        await vscode.workspace.applyEdit(edit);
+        if (sibling && 'meta' in message && typeof message.meta === 'string' && message.meta !== lastWrittenMeta) {
+          lastWrittenMeta = message.meta;
+          await vscode.workspace.fs.writeFile(sibling.uri, Buffer.from(message.meta, 'utf8'));
+        }
         return;
       }
 
@@ -340,7 +394,7 @@ class LmdEditorProvider implements vscode.CustomTextEditorProvider {
     });
   }
 
-  private async getWebviewHtml(webview: vscode.Webview, document: vscode.TextDocument) {
+  private async getWebviewHtml(webview: vscode.Webview, document: vscode.TextDocument, initialMeta = '') {
     const distPath = vscode.Uri.joinPath(this.context.extensionUri, 'dist');
     const indexUri = vscode.Uri.joinPath(distPath, 'index.html');
 
@@ -355,6 +409,7 @@ class LmdEditorProvider implements vscode.CustomTextEditorProvider {
     const config = JSON.stringify({
       platform: 'vscode',
       initialMarkdown: document.getText(),
+      initialMeta,
       fileName: path.basename(document.uri.fsPath),
     });
 
@@ -379,11 +434,12 @@ class LmdEditorProvider implements vscode.CustomTextEditorProvider {
     return html;
   }
 
-  private getDevWebviewHtml(document: vscode.TextDocument) {
+  private getDevWebviewHtml(document: vscode.TextDocument, initialMeta = '') {
     const nonce = createNonce();
     const config = JSON.stringify({
       platform: 'vscode',
       initialMarkdown: document.getText(),
+      initialMeta,
       fileName: path.basename(document.uri.fsPath),
     });
     const baseUrl = DEV_SERVER_URL.replace(/\/+$/, '');

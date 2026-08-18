@@ -1,2 +1,2 @@
-/** @deprecated Use `import { ... } from '../lmd/hotpath/sceneHotPath'`. */
-export * from '../lmd/hotpath/sceneHotPath';
+/** @deprecated Use `import { ... } from '../lmd/infrastructure/hotpath/sceneHotPath'`. */
+export * from '../lmd/infrastructure/hotpath/sceneHotPath';

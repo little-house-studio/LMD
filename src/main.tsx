@@ -1,10 +1,10 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { DiagnosticShell, RootErrorBoundary } from './components/BootFallbacks';
-import FlowApp from './lmd/FlowApp';
+import FlowApp from './lmd/presentation/shell/FlowApp';
 import { setLmdInterpreterHooks } from './lmd';
-import { hotPathCounters } from './lmd/hotpath/sceneHotPath';
-import { storageKeys } from './lmd/storage';
+import { hotPathCounters } from './lmd/infrastructure/hotpath/sceneHotPath';
+import { storageKeys } from './lmd/infrastructure/persistence/storage';
 import './styles.css';
 
 // Optional: plug canvas hot-path counters into the independent LMD interpreter.

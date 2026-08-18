@@ -1,24 +1,23 @@
 /**
- * # LMD Format Interpreter
- *
- * Independent module for reading / writing `.lmd` project files:
+ * Editor-facing format re-exports (compat).
+ * Canonical kernel: `@lths/lmd` in `lmd-kernel/`.
  *
  * | Layer | Module | Responsibility |
  * |-------|--------|----------------|
- * | Types | `types` | GraphDocument, nodes/edges/subgraphs, layout sidecar |
+ * | Types | `types` | GraphDocument (legacy, via `@lths/lmd/legacy`) |
  * | Entity IDs | `entityId` | Stable title-derived Mermaid node IDs |
- * | Mermaid | `mermaid` | flowchart parse / serialize / measure / layout defaults |
- * | Project MD | `projectMarkdown` | Full LMD shell: Summary / Diagram / Content / lths-compat |
+ * | Mermaid | `mermaid` | flowchart parse / serialize |
+ * | Project MD | `projectMarkdown` | 旧 Markdown 兼容；新关系文件走 `@lths/lmd` `printLmd` |
  * | Samples | `sample` | Demo & stress fixtures |
  *
- * Protocol docs: `skills/lmd-protocol/`.
+ * Protocol: `lmd-kernel/ARCHITECTURE.md` + `skills/lmd-protocol/`.
  *
  * @example
  * ```ts
- * import { parseProjectMarkdown, serializeProjectMarkdown, createDefaultLayout } from './lmd';
+ * import { parseLmd, printLmd } from '@lths/lmd';
  *
- * const doc = parseProjectMarkdown(raw, 'My Project', createDefaultLayout());
- * const out = serializeProjectMarkdown({ ... });
+ * const opened = parseLmd(raw, { fallbackName: 'My Project' });
+ * const out = printLmd(opened.document);
  * ```
  */
 
@@ -36,7 +35,7 @@ export type {
   ProjectCompatLayer,
   GraphDocument,
   ParsedDocument,
-} from './types';
+} from './infrastructure/compat/types';
 
 // —— Entity IDs ——
 export {
@@ -44,7 +43,7 @@ export {
   extractEntityIdCode,
   deriveEntityTitleFromId,
   buildEntityIdFromTitle,
-} from './entityId';
+} from './infrastructure/compat/entityId';
 
 // —— Mermaid flowchart ——
 export {
@@ -52,6 +51,9 @@ export {
   defaultEdgeStyle,
   normalizeEdgeStyle,
   measureNodeContentSize,
+  layoutNodeContent,
+  wrapNodeText,
+  textUnits,
   isFlowchartSource,
   detectMermaidDiagramType,
   looksLikeStandaloneMermaidSource,
@@ -60,10 +62,10 @@ export {
   syncDocument,
   createDefaultLayout,
   toSidecar,
-} from './mermaid';
+} from './infrastructure/compat/mermaid';
 
 // —— Full .lmd project Markdown ——
-export type { LmdInterpreterHooks } from './projectMarkdown';
+export type { LmdInterpreterHooks, LmdMetaFile } from './infrastructure/compat/projectMarkdown';
 export {
   setLmdInterpreterHooks,
   buildProjectSuffixMarkdown,
@@ -72,13 +74,21 @@ export {
   standardizeProjectMarkdown,
   serializeProjectMarkdown,
   createProjectMarkdownTemplate,
-} from './projectMarkdown';
+  applyMetaToGraph,
+  emptyLmdMeta,
+  extractMetaFromGraph,
+  metaHasNodeLayout,
+  parseLmdMeta,
+  printLmdMeta,
+  siblingMetaPath,
+} from './infrastructure/compat/projectMarkdown';
 
 // —— Fixtures ——
 export {
   sampleMermaidSource,
   sampleProjectMarkdown,
+  sampleLegacyProjectMarkdown,
   defaultStressTestProjectOptions,
   defaultStressTestProjectLabel,
   createStressTestProjectMarkdown,
-} from './sample';
+} from './infrastructure/compat/sample';

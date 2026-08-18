@@ -14,7 +14,26 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    "paths": {
+      "@lths/lmd": ["./lmd-kernel/src/index.ts"],
+      "@lths/lmd/legacy": ["./lmd-kernel/src/compat/legacy/index.ts"],
+      "@lths/lmd/shared": ["./lmd-kernel/src/shared-kernel/index.ts"],
+      "@lths/lmd/spec": ["./lmd-kernel/src/shared-kernel/index.ts"],
+      "@lths/lmd/document": ["./lmd-kernel/src/document/index.ts"],
+      "@lths/lmd/display": ["./lmd-kernel/src/display/index.ts"],
+      "@lths/lmd/editing": ["./lmd-kernel/src/editing/index.ts"],
+      "@lths/lmd/ir": ["./lmd-kernel/src/document/index.ts"],
+      "@lths/lmd/parse": ["./lmd-kernel/src/display/index.ts"],
+      "@lths/lmd/diagnostics": ["./lmd-kernel/src/diagnostics/index.ts"],
+      "@lths/lmd/commands": ["./lmd-kernel/src/editing/index.ts"],
+      "@lths/lmd/layout": ["./lmd-kernel/src/layout/index.ts"],
+      "@lths/lmd/runtime": ["./lmd-kernel/src/runtime/index.ts"],
+      "@lths/lmd/plugin": ["./lmd-kernel/src/plugin/index.ts"],
+      "@lths/lmd/adapters": ["./lmd-kernel/src/composition/adapters/index.ts"],
+      "@lths/lmd/sdk": ["./lmd-kernel/src/composition/sdk/index.ts"],
+      "@lths/lmd/testkit": ["./lmd-kernel/src/composition/testkit/index.ts"]
+    }
   },
   "include": ["src"],
   "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]

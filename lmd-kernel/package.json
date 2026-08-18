@@ -1,0 +1,31 @@
+{
+  "name": "@lths/lmd",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LMD protocol kernel: spec, IR, parse, diagnostics, commands, SDK",
+  "exports": {
+    ".": "./src/index.ts",
+    "./shared": "./src/shared-kernel/index.ts",
+    "./spec": "./src/shared-kernel/index.ts",
+    "./document": "./src/document/index.ts",
+    "./ir": "./src/document/index.ts",
+    "./display": "./src/display/index.ts",
+    "./parse": "./src/display/index.ts",
+    "./diagnostics": "./src/diagnostics/index.ts",
+    "./editing": "./src/editing/index.ts",
+    "./commands": "./src/editing/index.ts",
+    "./layout": "./src/layout/index.ts",
+    "./runtime": "./src/runtime/index.ts",
+    "./plugin": "./src/plugin/index.ts",
+    "./adapters": "./src/composition/adapters/index.ts",
+    "./sdk": "./src/composition/sdk/index.ts",
+    "./testkit": "./src/composition/testkit/index.ts",
+    "./legacy": "./src/compat/legacy/index.ts"
+  },
+  "scripts": {
+    "test": "tsc -p tsconfig.json --noEmit && npx --yes tsx src/display/infrastructure/lmdlang/lmdlang.test.ts && npx --yes tsx src/kernel.test.ts && npx --yes tsx src/layering.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "cli": "npx --yes tsx src/composition/cli.ts"
+  }
+}

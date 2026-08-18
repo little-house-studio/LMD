@@ -1,0 +1,31 @@
+/** @deprecated Import from `src/lmd/placement`. Do not add routing logic here. */
+export {
+  adaptiveStubLength,
+  arrowHeading,
+  buildConnectPreview,
+  buildEdgeGeometry,
+  buildEdgeLaneMap,
+  clampLabelToViewport,
+  cubicToSvgPath,
+  distPointToEdgeSq,
+  distanceToBox,
+  EDGE_LABEL_MIN_SCALE,
+  edgeBounds,
+  estimateLabelSize,
+  faceNormal,
+  facePoint,
+  labelHitRect,
+  nodeCenter,
+  preferredEnterFace,
+  preferredExitFace,
+  routeSceneEdges,
+  snapConnectTarget,
+} from '../../placement';
+export type {
+  ClampLabelOptions,
+  ConnectSnapTarget,
+  EdgeGeometry,
+  EndpointBox,
+  Face,
+  RouteLabelMode,
+} from '../../placement';

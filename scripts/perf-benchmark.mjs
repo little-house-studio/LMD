@@ -1,12 +1,10 @@
 /**
- * Before/after wall-time benchmark for LMD + LMP hot paths (shipped helpers).
+ * Before/after wall-time benchmark for LMD hot paths (shipped helpers).
  * Usage: npx tsx scripts/perf-benchmark.mjs [out.json]
  */
 import { writeFileSync } from 'node:fs';
 
 const scene = await import(new URL('../src/lib/sceneHotPath.ts', import.meta.url).href);
-const layout = await import(new URL('../lmp/src/lib/layoutCache.ts', import.meta.url).href);
-const outline = await import(new URL('../lmp/src/lib/outline.ts', import.meta.url).href);
 
 const {
   BaseSceneCache,
@@ -23,16 +21,6 @@ const {
   runWheelViewportStress,
 } = scene;
 
-const {
-  MindMapLayoutCache,
-  OutlineSerializeCache,
-  resetLmpHotPathCounters,
-  lmpHotPathCounters,
-  runLmpInteractionStress,
-} = layout;
-
-const { computeMindMapLayout, serializeOutline } = outline;
-
 function makeNodes(n) {
   return Array.from({ length: n }, (_, i) => ({
     id: `n${i}`,
@@ -40,25 +28,6 @@ function makeNodes(n) {
     y: Math.floor(i / 50) * 100,
     width: 140,
     height: 56,
-  }));
-}
-
-function makeOutline(roots, children) {
-  return Array.from({ length: roots }, (_, r) => ({
-    id: `r${r}`,
-    text: `Root ${r}`,
-    color: null,
-    children: Array.from({ length: children }, (_, c) => ({
-      id: `r${r}-c${c}`,
-      text: `Child ${r}.${c}`,
-      color: null,
-      children: Array.from({ length: 3 }, (_, g) => ({
-        id: `r${r}-c${c}-g${g}`,
-        text: `Grand ${r}.${c}.${g}`,
-        color: null,
-        children: [],
-      })),
-    })),
   }));
 }
 
@@ -166,36 +135,9 @@ const wheelAfterAvgMs = bench(() => {
   c.commitDocument();
 });
 
-const roots = makeOutline(40, 25);
-const lmpBeforeAvgMs = bench(() => {
-  for (let f = 0; f < 80; f += 1) {
-    computeMindMapLayout(roots, 'balanced');
-    serializeOutline(roots, { layoutMode: 'balanced' });
-  }
-}, 2);
-
-// Cache lives across frames (same as App refs) — measure pan/selection hits only.
-const layoutCache = new MindMapLayoutCache();
-const serCache = new OutlineSerializeCache();
-layoutCache.get(roots, 'balanced');
-serCache.get(roots, 'balanced');
-const lmpAfterAvgMs = bench(() => {
-  for (let f = 0; f < 80; f += 1) {
-    layoutCache.get(roots, 'balanced');
-    serCache.get(roots, 'balanced');
-  }
-}, 5);
-
 resetHotPathCounters();
 const stress = runViewportInteractionStress({ nodeCount: 500, edgeCount: 500, frames: 120 });
 const wheelStress = runWheelViewportStress({ nodeCount: 500, frames: 100 });
-resetLmpHotPathCounters();
-const lmpStress = runLmpInteractionStress({
-  rootCount: 40,
-  childrenPerRoot: 25,
-  panFrames: 120,
-  selectionFrames: 60,
-});
 
 const report = {
   when: new Date().toISOString(),
@@ -203,15 +145,9 @@ const report = {
   wheelBeforeAvgMs: Number(wheelBeforeAvgMs.toFixed(3)),
   wheelAfterAvgMs: Number(wheelAfterAvgMs.toFixed(3)),
   wheelSpeedup: Number((wheelBeforeAvgMs / Math.max(wheelAfterAvgMs, 0.001)).toFixed(2)),
-  lmpBeforeAvgMs: Number(lmpBeforeAvgMs.toFixed(3)),
-  lmpAfterAvgMs: Number(lmpAfterAvgMs.toFixed(3)),
-  lmpSpeedup: Number((lmpBeforeAvgMs / Math.max(lmpAfterAvgMs, 0.001)).toFixed(2)),
-  outlineNodeApprox: 40 + 40 * 25 + 40 * 25 * 3,
   stress,
   wheelStress,
-  lmpStress,
   counters: { ...hotPathCounters },
-  lmpCounters: { ...lmpHotPathCounters },
 };
 
 const out = process.argv[2];
